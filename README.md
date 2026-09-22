@@ -1,5 +1,12 @@
 # NeverEndingQuest
 
+> **⚠️ This is a custom fork.** Experimental playground maintained by
+> [Er3mit4](https://github.com/Er3mit4) — currently adds the **OpenCode Go
+> provider (DeepSeek V4.1 Flash)** and startup-commit fixes. It is used to
+> test new AI endpoints and mechanics; see [FORK.md](FORK.md) for what is
+> implemented and what is planned. Everything else below is the upstream
+> project documentation.
+
 ## Launch the game: React by default
 
 After installation, run these commands from your game folder with its Python
