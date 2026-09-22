@@ -374,7 +374,7 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
     # --- Route to provider, then expose one response/error contract ---
     repaired = None
     try:
-        if request_provider in ("legacy", "openai", "lmstudio"):
+        if request_provider in ("legacy", "openai", "lmstudio", "opencodego"):
             try:
                 raw_response = _openai_completion(
                     messages,
@@ -543,6 +543,16 @@ def _enforce_provider_constraints(provider, model, temperature, kwargs):
         # GPT-5.x (non-mini) with reasoning > none: temperature must be stripped
         elif reasoning and str(reasoning).lower() != "none":
             kwargs["_strip_temperature"] = True
+
+    elif provider == "opencodego":
+        # DeepSeek V4.1 Flash (OpenCode Go): supports low|high|max reasoning
+        # only. A stray "none" from a compatibility profile becomes "low";
+        # temperature is accepted at every effort level, so nothing is stripped.
+        model_lower = model.lower() if model else ""
+        if "deepseek" in model_lower:
+            reasoning = kwargs.get("reasoning_effort")
+            if reasoning and str(reasoning).lower() == "none":
+                kwargs["reasoning_effort"] = "low"
 
     elif provider == "gemini":
         # Gemini ignores temperature -- handled in _gemini_completion
@@ -758,6 +768,30 @@ def _chat_stream_completion(client, call_kwargs, phase_emit):
     )
 
 
+def _opencodego_call_kwargs(messages, model, temperature, response_format, **kwargs):
+    """Assemble the Chat Completions payload for the OpenCode Go endpoint.
+
+    Mirrors the legacy/lmstudio payload shape: temperature passes through
+    unless a constraint stripped it, JSON mode defaults ON (opt-out with an
+    explicit None), and reasoning_effort is forwarded for DeepSeek models.
+    """
+    call_kwargs = {"model": model, "messages": messages}
+    if temperature is not None and not kwargs.pop("_strip_temperature", False):
+        call_kwargs["temperature"] = temperature
+    else:
+        kwargs.pop("_strip_temperature", None)
+
+    if response_format is _UNSET:
+        call_kwargs["response_format"] = {"type": "json_object"}
+    elif response_format is not None:
+        call_kwargs["response_format"] = response_format
+    # else: response_format=None means plain text (no JSON mode)
+
+    # Forward remaining kwargs (reasoning_effort, max_tokens, etc.)
+    call_kwargs.update(kwargs)
+    return call_kwargs
+
+
 def _openai_completion(messages, model, temperature, provider, response_format=_UNSET,
                        phase_emit=None, **kwargs):
     """Execute a completion via the OpenAI-compatible API."""
@@ -808,6 +842,21 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
         return _responses_stream_completion(
             client, messages, model, temperature, strip_temp, response_format,
             phase_emit, **kwargs,
+        )
+
+    if provider == "opencodego":
+        # OpenCode Go serves deepseek-v4.1-flash over Chat Completions only
+        # (the Go endpoint has no Responses surface for this model).
+        # Reasoning effort travels as "reasoning_effort" (OpenAI-compatible
+        # extension understood by the Go gateway); temperature is always
+        # accepted. JSON mode follows the same default-ON contract as
+        # legacy/lmstudio below, with the same explicit-None opt-out.
+        return _chat_stream_completion(
+            client,
+            _opencodego_call_kwargs(
+                messages, model, temperature, response_format, **kwargs
+            ),
+            phase_emit,
         )
 
     call_kwargs = {"model": model, "messages": messages}

@@ -9,6 +9,7 @@ const PROVIDER_OPTIONS: Array<{ value: ProviderValue; label: string }> = [
   { value: 'legacy', label: 'Legacy (GPT-4.1) - Stable baseline' },
   { value: 'openai', label: 'OpenAI (GPT-5.x) - Next-gen, tested per task' },
   { value: 'gemini', label: 'Gemini 3.1 - Alternative provider, tested per task' },
+  { value: 'opencodego', label: 'OpenCode Go (DeepSeek V4.1 Flash) - Low-cost subscription' },
   { value: 'lmstudio', label: 'Local / Custom Server (LM Studio, Ollama, OpenRouter...)' },
 ]
 
@@ -16,6 +17,8 @@ const PROVIDER_HINTS: Record<ProviderValue, string> = {
   legacy: 'Legacy (GPT-4.1): stable baseline, recommended. Uses your OpenAI API key.',
   openai: 'OpenAI (GPT-5.x): next-gen cloud, tested per task. Uses your OpenAI API key.',
   gemini: 'Gemini 3.1: alternative cloud provider, tested per task. Requires a Google API key.',
+  opencodego:
+    'OpenCode Go: low-cost subscription serving DeepSeek V4.1 Flash. Uses your opencode-go key (auto-detected from the OpenCode CLI when present).',
   lmstudio:
     'Local / Custom Server: point at any OpenAI-compatible server below. Zero cost when local.',
 }
@@ -45,6 +48,7 @@ function LocalProviderPanelBody() {
     emitC('get_local_endpoint', undefined)
     emitC('get_openai_key', undefined)
     emitC('get_gemini_key', undefined)
+    emitC('get_opencodego_key', undefined)
   }, [])
 
   // ---- provider select (server confirms via provider_changed) ----
@@ -122,6 +126,7 @@ function LocalProviderPanelBody() {
   // ---- API keys (blank submit keeps the stored key server-side) ----
   const [openaiKey, setOpenaiKey] = useState('')
   const [geminiKey, setGeminiKey] = useState('')
+  const [opencodegoKey, setOpencodegoKey] = useState('')
 
   const saveOpenaiKey = () => {
     emitC('set_openai_key', { api_key: openaiKey })
@@ -130,6 +135,10 @@ function LocalProviderPanelBody() {
   const saveGeminiKey = () => {
     emitC('set_gemini_key', { api_key: geminiKey })
     setGeminiKey('')
+  }
+  const saveOpencodegoKey = () => {
+    emitC('set_opencodego_key', { api_key: opencodegoKey })
+    setOpencodegoKey('')
   }
 
   const keyStatusText = (hasKey: boolean | null) =>
@@ -271,6 +280,30 @@ function LocalProviderPanelBody() {
             autoComplete="off"
           />
           <button type="button" className={smallButtonClass} onClick={saveGeminiKey}>
+            Save Key
+          </button></div>
+        </div>
+      )}
+
+      {provider === 'opencodego' && (
+        <div className={sectionClass}>
+          <div className={sectionTitleClass}>OpenCode Go API Key</div>
+          <p className="neq-settings-help-parity">
+            Needed for the OpenCode Go provider (DeepSeek V4.1 Flash). If you use the OpenCode
+            CLI with a Go subscription on this machine, your saved key is detected automatically
+            -- no need to paste it. Otherwise get a key at https://opencode.ai/auth
+            <span>{keyStatusText(settings.opencodegoHasKey)}</span>
+          </p>
+          <div className="neq-settings-item neq-settings-stack-parity"><input
+            type="password"
+            aria-label="OpenCode Go API key"
+            className={inputClass}
+            value={opencodegoKey}
+            onChange={(e) => setOpencodegoKey(e.target.value)}
+            placeholder="sk-..."
+            autoComplete="off"
+          />
+          <button type="button" className={smallButtonClass} onClick={saveOpencodegoKey}>
             Save Key
           </button></div>
         </div>

@@ -41,6 +41,27 @@ def _provider_socket_options():
 PROVIDER_SOCKET_OPTIONS = tuple(_provider_socket_options())
 
 
+# OpenCode Go subscription endpoint (OpenAI-compatible Chat Completions).
+# deepseek-v4.1-flash and the other Go models live at
+# https://opencode.ai/zen/go/v1/chat/completions (Bearer auth).
+DEFAULT_OPENCODEGO_BASE_URL = "https://opencode.ai/zen/go/v1"
+
+# Stable per-process session id for the Go gateway's x-opencode-session
+# header (routing + prompt-cache optimization). One id per game-process run
+# mirrors how a coding agent scopes one conversation; generated lazily on
+# first OpenCode Go client creation.
+_OPENCODEGO_SESSION_ID = None
+
+
+def _opencodego_session_id():
+    """Return this process's stable OpenCode Go session id, creating it once."""
+    global _OPENCODEGO_SESSION_ID
+    if _OPENCODEGO_SESSION_ID is None:
+        import uuid
+        _OPENCODEGO_SESSION_ID = str(uuid.uuid4())
+    return _OPENCODEGO_SESSION_ID
+
+
 def _provider_http_client():
     """One httpx client shape for every OpenAI-compatible provider."""
     return httpx.Client(
@@ -57,6 +78,7 @@ def get_openai_client(provider=None):
 
     Behavior:
         - If MODEL_PROVIDER == "lmstudio": Connects to localhost:1234 (local LM Studio)
+        - If MODEL_PROVIDER == "opencodego": Connects to opencode.ai/zen/go (DeepSeek)
         - Otherwise: Connects to OpenAI API (requires config.OPENAI_API_KEY)
 
     Usage:
@@ -78,6 +100,29 @@ def get_openai_client(provider=None):
         return OpenAI(
             base_url=ep["base_url"],
             api_key=ep["api_key"] or "not-needed",
+            http_client=_provider_http_client(),
+        )
+    if provider == "opencodego":
+        # OpenCode Go (https://opencode.ai/en/docs/go): OpenAI-compatible
+        # Chat Completions endpoint serving deepseek-v4.1-flash and other open
+        # models behind the Go subscription. Key source priority: a UI-stored
+        # key, then the opencode-go entry the OpenCode CLI persists in
+        # auth.json. Read live per call so a Settings change needs no restart.
+        #
+        # Go requires two extra headers (docs/go/#where-can-i-use-it):
+        #   x-opencode-session -- a stable conversation-scoped session id for
+        #     routing/prompt-cache optimization. One id per game-process run
+        #     keeps all calls of a play session on one stable route.
+        #   User-Agent -- the client identifies itself by name, never as the
+        #     generic SDK user agent.
+        import model_config
+        return OpenAI(
+            base_url=DEFAULT_OPENCODEGO_BASE_URL,
+            api_key=model_config.get_opencodego_key() or "not-needed",
+            default_headers={
+                "x-opencode-session": _opencodego_session_id(),
+                "User-Agent": "NeverEndingQuest/1.0",
+            },
             http_client=_provider_http_client(),
         )
     else:

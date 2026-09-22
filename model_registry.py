@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import Mapping, Optional, Tuple
 
 
-SUPPORTED_PROVIDERS = ("openai", "gemini", "legacy", "lmstudio")
+SUPPORTED_PROVIDERS = ("openai", "gemini", "legacy", "lmstudio", "opencodego")
 SUPPORTED_GPT56_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 EVALUATION_EFFORTS = ("none", "low", "medium", "high")
 
@@ -68,6 +68,24 @@ MODEL_CATALOG: Mapping[str, ModelCatalogEntry] = MappingProxyType(
             shutdown_at=None,
             owned_by="system",
         ),
+        # OpenCode Go (DeepSeek V4.1 Flash). Prices from the OpenCode Go plan
+        # page / model listing fetched on 2026-09-22: $0.15/$0.60 per 1M
+        # in/out, cached input $0.003. Efforts: low|high|max (none unsupported).
+        "deepseek-v4.1-flash": ModelCatalogEntry(
+            model_id="deepseek-v4.1-flash",
+            family="deepseek-v4.1-flash",
+            supported_efforts=("low", "high", "max"),
+            input_usd_per_million=0.15,
+            cached_input_usd_per_million=0.003,
+            output_usd_per_million=0.60,
+            pricing_source_date="2026-09-22",
+            pricing_source_url="https://opencode.ai/en/docs/go",
+            available=True,
+            availability_checked_at="2026-09-22",
+            created_at=None,
+            shutdown_at=None,
+            owned_by="opencode-go",
+        ),
     }
 )
 
@@ -80,20 +98,29 @@ class CallsiteBinding:
     gemini: Tuple[str, ...]
     legacy: Tuple[str, ...]
     lmstudio: Tuple[str, ...]
+    opencodego: Tuple[str, ...] = ()
     note: str = ""
 
     def profiles_for(self, provider: str) -> Tuple[str, ...]:
         if provider not in SUPPORTED_PROVIDERS:
             raise ValueError("Unknown provider %r" % provider)
-        return getattr(self, provider)
+        value = getattr(self, provider)
+        # The opencodego ladder mirrors the openai one unless explicitly
+        # declared: the Go endpoint is OpenAI-compatible, so the same named
+        # profiles resolve there (each *_OPENCODEGO config shadows its
+        # openai namesake in model_config).
+        if provider == "opencodego" and not value:
+            return self.openai
+        return value
 
 
-def _profiles(openai, gemini, legacy, lmstudio):
+def _profiles(openai, gemini, legacy, lmstudio, opencodego=None):
     return {
         "openai": (openai,) if isinstance(openai, str) else tuple(openai),
         "gemini": (gemini,) if isinstance(gemini, str) else tuple(gemini),
         "legacy": (legacy,) if isinstance(legacy, str) else tuple(legacy),
         "lmstudio": (lmstudio,) if isinstance(lmstudio, str) else tuple(lmstudio),
+        "opencodego": (opencodego,) if isinstance(opencodego, str) else tuple(opencodego or ()),
     }
 
 

@@ -36,6 +36,7 @@ def _provider_config():
         "gemini": "CHAR_EFFECTS_GEMINI_FLASH_HIGH",
         "lmstudio": "CHAR_EFFECTS_LMSTUDIO",
         "legacy": "CHAR_EFFECTS_LEGACY",
+        "opencodego": "CHAR_EFFECTS_OPENCODEGO",
     }
     return provider, dict(getattr(config, names[provider]))
 

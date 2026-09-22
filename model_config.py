@@ -182,6 +182,16 @@ DM_MINI_MODEL_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 DM_FULL_MODEL_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 DM_MINI_MODEL_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
+# OpenCode Go (https://opencode.ai/zen/go/v1) -- OpenAI-compatible endpoint
+# serving open models (DeepSeek V4.1 Flash et al.) behind a Go subscription.
+# Transport: Chat Completions streaming via the standard OpenAI client
+# (api_client routes opencodego like legacy/lmstudio, NOT the Responses path).
+# Model: deepseek-v4.1-flash ($0.15/$0.60 per 1M in/out; efforts low|high|max;
+# "none" unsupported -- reasoning_effort is mapped to "low" at the adapter for
+# parity with the game's reasoning-off callsites).
+DM_FULL_MODEL_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
+DM_MINI_MODEL_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
+
 # --- T065 AI Response Validation Model Configs (from capture + manual testing) ---
 # Validation requires reasoning -- gpt-5.2|none is UNUSABLE (0/15 correct).
 # Temperature is 0.1 at callsite (stays there, not in config).
@@ -369,6 +379,10 @@ CHAR_EFFECTS_LEGACY = {"model": "gpt-4.1-2025-04-14"}
 
 # LM Studio (local passthrough)
 CHAR_EFFECTS_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
+
+# OpenCode Go (DeepSeek V4.1 Flash). T078 is an analytical classification
+# task; the cheapest supported reasoning rung (low) is the initial selection.
+CHAR_EFFECTS_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
 
 # ----- T040 Combat Validation -----
 # Validates AI combat responses for D&D rules compliance.
@@ -937,6 +951,11 @@ MINI_UTIL_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 # default), so the shared Local config must not inject a second value.
 MINI_UTIL_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
+# OpenCode Go variant of the shared mini-utility tier (DeepSeek V4.1 Flash via
+# the Go gateway). Accepts temperature at every effort; reasoning_effort "low"
+# is the cheapest supported rung (no "none" on this model).
+MINI_UTIL_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
+
 # --- T031+: DM_MAIN_MODEL callsites (module generation, DM narration, transitions) ---
 # First DM_MAIN_MODEL migration (T031). These dicts will be reused by all 12 DM_MAIN_MODEL callsites.
 # Full-tier. gpt-5.2|none: best creative generation. gemini-pro|low: highest quality at higher cost.
@@ -945,6 +964,7 @@ DM_MAIN_GPT52_NONE = {"model": "gpt-5.2", "reasoning_effort": "none"}
 DM_MAIN_GEMINI_PRO_LOW = {"model": "gemini-3.1-pro-preview", "thinking_level": "low"}
 DM_MAIN_LEGACY = {"model": "gpt-4.1-2025-04-14"}
 DM_MAIN_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
+DM_MAIN_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
 
 # T026 (location batch generation) -- per-callsite selection from the 2026-08-15
 # blind 3-reviewer quality + cost eval (docs/audits/2026-08-15-t026-model-quality-eval.md).
@@ -997,11 +1017,13 @@ NPC_VOICE_T105_OPENAI_LUNA_NONE = copy.deepcopy(OPENAI_GPT56_LUNA_NONE)
 NPC_VOICE_T105_GEMINI_FLASHLITE_LOW = {"model": "gemini-3.1-flash-lite-preview", "thinking_level": "low"}
 NPC_VOICE_T105_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 NPC_VOICE_T105_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
+NPC_VOICE_T105_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
 
 NPC_PROFILE_T107_OPENAI_LUNA_NONE = copy.deepcopy(OPENAI_GPT56_LUNA_NONE)
 NPC_PROFILE_T107_GEMINI_FLASHLITE_LOW = {"model": "gemini-3.1-flash-lite-preview", "thinking_level": "low"}
 NPC_PROFILE_T107_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 NPC_PROFILE_T107_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
+NPC_PROFILE_T107_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
 
 # T108: companion EPISODE extraction (attributed salient facts from full-fidelity
 # encounter text -> canonical episode ledger). Runs at per-location close and at
@@ -1083,9 +1105,9 @@ MULTI_MODEL_CAPTURE = False  # Set True to enable parallel cloud model testing (
 # DEFAULT: "openai" -- the current, cost-optimized GPT-5.x callsite matrix
 #   (gpt-5.6-luna / terra, with gpt-5.4 and gpt-5.2 retained where they win).
 #   Set to "legacy" to run the stable gpt-4.1 / gpt-4.1-mini baseline instead;
-#   "gemini" and "lmstudio" are also available. Switchable at runtime via
-#   Settings -> AI Provider (persists in user_settings.json).
-MODEL_PROVIDER = "openai"  # options: "openai" (default), "legacy", "gemini", "lmstudio"
+#   "gemini", "lmstudio" and "opencodego" are also available. Switchable at
+#   runtime via Settings -> AI Provider (persists in user_settings.json).
+MODEL_PROVIDER = "openai"  # options: "openai" (default), "legacy", "gemini", "lmstudio", "opencodego"
 
 PROVIDER_MODELS = {
     "legacy": {
@@ -1103,6 +1125,10 @@ PROVIDER_MODELS = {
     "lmstudio": {
         "full": "local-model",
         "mini": "local-model",
+    },
+    "opencodego": {
+        "full": "deepseek-v4.1-flash",
+        "mini": "deepseek-v4.1-flash",
     },
 }
 
@@ -1208,6 +1234,7 @@ _SECRET_SETTING_NAMES = {
     "openai_api_key": "openai_api_key",
     "gemini_api_key": "gemini_api_key",
     "local_api_key": "local_api_key",
+    "opencodego_api_key": "opencodego_api_key",
 }
 
 
@@ -1413,6 +1440,86 @@ def persist_gemini_key(api_key):
         _forget_credential("gemini_api_key")
 
 
+# --- OpenCode Go (DeepSeek V4.1 Flash) key management ---
+# Mirrors the Gemini key helpers. Two key sources, in priority order:
+# 1. A key set in the web UI (stored via the OS credential store / JSON fallback)
+# 2. The opencode-go key the OpenCode CLI persists at
+#    %USERPROFILE%/.local/share/opencode/auth.json (POSIX: ~/.local/share/...)
+_OPENCODAGO_KEY_PLACEHOLDER = "your_opencodego_api_key_here"
+_OPENCODE_AUTH_FILE = os.path.join(
+    os.environ.get("USERPROFILE")
+    or os.environ.get("HOME")
+    or os.path.expanduser("~"),
+    ".local", "share", "opencode", "auth.json",
+)
+
+
+def _read_opencode_auth_key():
+    """Best-effort read of the opencode-go key from the OpenCode CLI auth file.
+
+    Returns "" when absent/unreadable -- never raises. The file is JSON whose
+    top-level keys are provider ids; the "opencode-go" entry carries {"key": ...}.
+    """
+    try:
+        with open(_OPENCODE_AUTH_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entry = data.get("opencode-go") or {}
+        key = entry.get("key") if isinstance(entry, dict) else None
+        return key.strip() if isinstance(key, str) else ""
+    except Exception:
+        return ""
+
+
+def persist_opencodego_key(api_key):
+    """Store the OpenCode Go key durably: OS credential store when one exists."""
+    _migrate_plaintext_secrets(_load_user_settings())
+    if api_key:
+        _store_credential("opencodego_api_key", api_key)
+    else:
+        _forget_credential("opencodego_api_key")
+
+
+def has_opencodego_key():
+    """True if a real OpenCode Go key is available (UI-stored or CLI auth file)."""
+    if _read_credential("opencodego_api_key"):
+        return True
+    return bool(_read_opencode_auth_key())
+
+
+def get_opencodego_key():
+    """Return the OpenCode Go key to authenticate with, or "" when none.
+
+    Priority: OS-credential-store/UI key -> OpenCode CLI auth.json entry ->
+    a live config.OPENCODEGO_API_KEY override (skipping the placeholder).
+    """
+    key = _read_credential("opencodego_api_key")
+    if key:
+        return key
+    key = _read_opencode_auth_key()
+    if key:
+        return key
+    import sys
+    config_mod = sys.modules.get("config")
+    if config_mod is not None:
+        value = getattr(config_mod, "OPENCODEGO_API_KEY", "")
+        if isinstance(value, str) and value.strip() and \
+                value.strip() != _OPENCODAGO_KEY_PLACEHOLDER:
+            return value.strip()
+    return ""
+
+
+def apply_persisted_opencodego_key():
+    """Push a stored OpenCode Go key into the live config module so every
+    reader of config.OPENCODEGO_API_KEY uses it with ZERO reader edits.
+    No-op when no key is available (config.py value wins)."""
+    key = get_opencodego_key()
+    if not key:
+        return
+    import sys
+    if "config" in sys.modules:
+        setattr(sys.modules["config"], "OPENCODEGO_API_KEY", key)
+
+
 def has_gemini_key():
     """True if a real (non-placeholder) Gemini key is stored. Never returns the key."""
     key = _read_credential("gemini_api_key")
@@ -1442,6 +1549,7 @@ load_persisted_provider()
 # config_template.py (after config.py defines its default). No-op otherwise.
 apply_persisted_openai_key()
 apply_persisted_gemini_key()
+apply_persisted_opencodego_key()
 
 
 # --- Canonical callsite resolver and capture compatibility view ---
@@ -1505,7 +1613,53 @@ def resolve_callsite_config(task_id, provider=None, attempt=0):
     if attempt_index < 0:
         raise ValueError("attempt must be a non-negative integer")
     profile_name = ladder[min(attempt_index, len(ladder) - 1)]
+    if provider == "opencodego":
+        # The opencodego ladder reuses the openai profile NAMES as the
+        # effort/shape contract; the model itself is always the Go DeepSeek.
+        # See _opencodego_profile_for.
+        return _opencodego_profile_for(profile_name)
     return copy.deepcopy(globals()[profile_name])
+
+
+# OpenCode Go effort translation. deepseek-v4.1-flash supports low|high|max
+# (no "none"), so the game's reasoning-off rungs map onto the cheapest
+# reasoning tier and the heavier rungs step up one level.
+_OPENCODEGO_EFFORT_MAP = {
+    "none": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "max",
+    "xhigh": "max",
+    "max": "max",
+}
+_OPENCODEGO_MODEL = "deepseek-v4.1-flash"
+
+
+def _opencodego_profile_for(profile_name):
+    """Build a detached DeepSeek V4.1 Flash config from an OpenAI profile name.
+
+    The openai profile ladder (CALLSITE_BINDINGS) encodes per-callsite
+    reasoning policy as profile names like OPENAI_GPT56_LUNA_LOW. The Go
+    endpoint serves deepseek-v4.1-flash instead, so the effort suffix is
+    translated onto the supported low|high|max range and the model is
+    substituted. Response schemas are never carried here: the Gemini-only
+    response_schema entries stay on their own provider configs, and Go calls
+    use plain JSON mode like the OpenAI path.
+    """
+    base = globals().get(profile_name)
+    if not isinstance(base, dict) or not base.get("model"):
+        raise ValueError(
+            "opencodego profile references unknown openai profile %s" % profile_name
+        )
+    effort = _OPENCODEGO_EFFORT_MAP.get(
+        str(base.get("reasoning_effort", "low")).lower(), "low"
+    )
+    selected = {"model": _OPENCODEGO_MODEL, "reasoning_effort": effort}
+    # Preserve callsite-owned format overrides (e.g. response_format=None on
+    # plain-text compression callsites).
+    if "response_format" in base:
+        selected["response_format"] = copy.deepcopy(base["response_format"])
+    return selected
 
 
 # Kept for callers/tests importing the historical name.  It is generated from
@@ -1572,6 +1726,22 @@ def get_capture_variants_for_task(task_id):
             variant["response_schema"] = gemini_cfg["response_schema"]
         if "response_format" in gemini_cfg:
             variant["response_format"] = gemini_cfg["response_format"]
+        variants.append(variant)
+
+    # Get OpenCode Go variant (DeepSeek V4.1 Flash, Chat Completions transport).
+    opencodego_cfg = resolve_callsite_config(task_id, "opencodego")
+    if opencodego_cfg:
+        variant = {
+            "provider": "opencodego",
+            "model": opencodego_cfg.get("model"),
+            "label": f"{opencodego_cfg.get('model')}|effort={opencodego_cfg.get('reasoning_effort', 'low')}",
+            # DeepSeek V4.1 Flash accepts temperature at every effort level.
+            "use_caller_temp": True,
+        }
+        if "reasoning_effort" in opencodego_cfg:
+            variant["reasoning_effort"] = opencodego_cfg["reasoning_effort"]
+        if "response_format" in opencodego_cfg:
+            variant["response_format"] = opencodego_cfg["response_format"]
         variants.append(variant)
 
     return variants if variants else None

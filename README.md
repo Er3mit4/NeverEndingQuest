@@ -25,8 +25,9 @@ An AI-powered Dungeon Master for running SRD 5.2.1 compatible tabletop RPG campa
 is now the default; the established legacy player remains an explicit launch option.
 Run the game with the current
 cost-optimized OpenAI GPT-5.x models (**the new default**), the stable GPT-4.1
-baseline (one toggle away), Gemini, or an OpenAI-compatible local or remote
-server.
+baseline (one toggle away), Gemini, the OpenCode Go subscription
+(DeepSeek V4.1 Flash — custom fork feature), or an OpenAI-compatible local or
+remote server.
 
 ---
 
@@ -133,6 +134,11 @@ Open **Settings → AI Provider** and choose one of these modes:
 - **Legacy (GPT-4.1)**: The previous stable baseline, kept as a one-click toggle.
   Requires an OpenAI API key.
 - **Gemini 3.1**: Uses Gemini models selected per call site. Requires a Google AI API key.
+- **OpenCode Go (DeepSeek V4.1 Flash)** *(custom fork)*: Every call site runs on
+  DeepSeek V4.1 Flash through OpenCode Go's OpenAI-compatible endpoint
+  ($10/month subscription). Uses your opencode-go key — auto-detected from the
+  OpenCode CLI when present, or paste it in Settings. See
+  [docs/architecture/opencode-go-provider.md](docs/architecture/opencode-go-provider.md).
 - **Local / Custom Server**: Connects to an OpenAI-compatible endpoint such as
   LM Studio, Ollama, vLLM, OpenRouter, or another remote server.
 
@@ -327,7 +333,7 @@ See [LICENSING.md](LICENSING.md) for complete details, FAQ, and legal informatio
 ### Prerequisites
 - Python 3.9 or higher
 - Node.js LTS (required for the React player; legacy remains available without it)
-- One AI provider: OpenAI, Gemini, or a local OpenAI-compatible server such as LM Studio
+- One AI provider: OpenAI, Gemini, OpenCode Go, or a local OpenAI-compatible server such as LM Studio
 - 4GB+ RAM recommended
 - Modern web browser (Chrome, Firefox, Edge)
 - Windows, macOS, or Linux
@@ -1075,15 +1081,19 @@ AI: "The explosion engulfs three goblins..."
 ### AI Provider and Credentials
 
 Use **Settings → AI Provider** in the web interface instead of assigning a
-single model in `config.py`. Choose OpenAI (default), Legacy, Gemini, or Local /
-Custom Server. The application maintains its tested per-call-site model matrix in
-`model_config.py`, and the active provider persists in `user_settings.json`.
+single model in `config.py`. Choose OpenAI (default), Legacy, Gemini,
+OpenCode Go (custom fork), or Local / Custom Server. The application maintains
+its tested per-call-site model matrix in `model_config.py`, and the active
+provider persists in `user_settings.json`.
 
 - **Default provider is `openai`** (the cost-optimized GPT-5.x call-site matrix).
   Set `MODEL_PROVIDER = "legacy"` in `config.py`, or use the Settings panel, to
   run the GPT-4.1 baseline instead.
 - Legacy and OpenAI require an OpenAI API key.
 - Gemini requires a Google AI API key.
+- OpenCode Go requires an active Go subscription; its key is auto-detected from
+  the OpenCode CLI `auth.json` or can be pasted in Settings (see
+  [docs/architecture/opencode-go-provider.md](docs/architecture/opencode-go-provider.md)).
 - Local endpoints generally do not require a key; hosted compatible endpoints may.
 - Use **Test Connection** after configuring a Local / Custom Server.
 - Never commit `config.py`, `user_settings.json`, API keys, or captured provider traffic.
@@ -1300,7 +1310,7 @@ This is unofficial Fan Content and is not affiliated with, endorsed, sponsored, 
   Nothing was removed — only the default moved. *Please report any call-site
   regression against the OpenAI default (see AI Provider Setup above); Legacy is a
   safe fallback.*
-- **Provider selection in Settings**: Choose OpenAI (default), Legacy GPT-4.1, Gemini, or an OpenAI-compatible Local / Custom Server.
+- **Provider selection in Settings**: Choose OpenAI (default), Legacy GPT-4.1, Gemini, OpenCode Go (custom fork; DeepSeek V4.1 Flash), or an OpenAI-compatible Local / Custom Server.
 - **Per-call-site model matrix**: Narration, combat, validation, summaries, updates,
   and generation use provider-specific model settings selected for their task.
 - **Local endpoint testing**: Save and test LM Studio, Ollama, vLLM, OpenRouter, or other compatible endpoints from the UI.

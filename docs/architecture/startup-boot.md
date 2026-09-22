@@ -1,5 +1,22 @@
 # Startup and Boot
 
+## custom-fork typography/commit-convergence delta (2026-09-22; fork-local)
+
+Model-generated startup responses are normalized at the wire boundary
+(`startup_contract.parse_startup_response` / `parse_startup_review`): known
+typography (em dashes, curly quotes, ellipsis) becomes plain ASCII, so printed
+narration, committed character sheets and disk reads share one string form.
+`save_character_to_module`, `update_party_tracker` and
+`_commit_startup_build`/`_startup_build_ready` sanitize before writing and
+comparing, which makes the write-then-`safe_json_load`-equality contract
+converge for sheets containing typographic characters (the check previously
+could never pass; see the custom-fork CHANGELOG entry). After an identity
+conflict, a finalize proposal carrying the conflicted name is rejected in code
+with a targeted correction instead of looping on model compliance. Provider
+ladders gain an `opencodego` member (see
+[opencode-go-provider.md](opencode-go-provider.md)); nothing here changes the
+checkpoint schema, disk truth rules or lifecycle ownership.
+
 ## #340 console-stream delta (2026-09-09; candidate)
 
 Terminal setup configures UTF-8 in place on Python's original Windows output

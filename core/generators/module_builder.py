@@ -2192,7 +2192,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             # 110 < the 120s thread backstop so the transport reliably closes
             # (and the worker exits with APITimeoutError -> the normal skip
             # path) BEFORE the thread is ever abandoned.
-            if provider in ("openai", "legacy", "lmstudio"):
+            if provider in ("openai", "legacy", "lmstudio", "opencodego"):
                 extra["timeout"] = 110
 
             def _t104_call():

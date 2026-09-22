@@ -6,7 +6,7 @@ transport phase take?" with the same code path the game uses, and prints the
 phase timeline the child reported. Exit code 0 when the answer arrived.
 
 Usage (from the repository root):
-    python utils/provider_health.py [--provider openai|legacy|lmstudio]
+    python utils/provider_health.py [--provider openai|legacy|lmstudio|opencodego]
 """
 import argparse
 import os

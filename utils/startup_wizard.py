@@ -753,6 +753,7 @@ def ai_character_interview(conversation, module):
                        "Follow the current startup response contract.",
     }, ensure_ascii=True)})
     print("\nDungeon Master: Let's build your character together.")
+    conflicted_name = None
     while True:
         scope = open_live_turn_scope()
         try:
@@ -786,6 +787,16 @@ def ai_character_interview(conversation, module):
                             validate(character, safe_json_load("schemas/char_schema.json"))
                         except ValidationError as exc:
                             raise ValueError(exc.message) from exc
+                        if conflicted_name and \
+                                character.get("name", "").strip().lower() == conflicted_name:
+                            # Code-level guard: after an identity conflict the
+                            # model must not re-finalize under the conflicted
+                            # name regardless of what it narrates.
+                            raise ValueError(
+                                "identity conflict unresolved: the name '%s' still "
+                                "collides with an existing character file. Finalize "
+                                "only with a distinct name." % conflicted_name
+                            )
                         proposal["character"] = character
                     review = _review_startup_response(request, proposal, facts, live_scope=scope)
                 except ValueError as exc:
@@ -815,6 +826,7 @@ def ai_character_interview(conversation, module):
                     except FileExistsError as exc:
                         _set_startup_progress(conversation, live_scope=scope, phase="interview",
                                               candidate=None, character_path=None)
+                        conflicted_name = str(proposal["character"].get("name", "")).strip().lower()
                         correction_context.append({"role": "system", "content": (
                             f"Character identity conflict: {exc}. Ask the player for a distinct "
                             "name, retaining the rest of the build. Nothing was overwritten."
@@ -1538,11 +1550,19 @@ def save_character_to_module(character_data, module_name, *, live_scope=None, pr
     """Publish one canonical root sheet, never replace a different identity."""
     from utils.file_operations import atomic_writer
     from utils.capture.live_provider_call import LiveProviderSuperseded
+    from utils.encoding_utils import sanitize_dict
     with _startup_operation(live_scope) as scope:
         _emit_startup_phase("startup_character_commit")
         data = copy.deepcopy(character_data)
         if not preserve_existing:
             data, _ = repair_startup_character_sheet(data)
+        # Align with read-time normalization BEFORE the equality contract:
+        # safe_json_load sanitizes on load (em dashes -> --, curly quotes ->
+        # straight, ellipsis -> ...), so an unsanitized write can never pass
+        # the post-write equality check and the commit loops forever
+        # ("write remains pending" -> "a different character already exists").
+        data = sanitize_dict(data)
+        if not preserve_existing:
             validate(data, safe_json_load("schemas/char_schema.json"))
         path_manager = ModulePathManager(module_name)
         char_file = path_manager.get_character_unified_path(data['name'])
@@ -1626,6 +1646,11 @@ def update_party_tracker(module_name, character_name, *, live_scope=None, starti
         party_data["partyMembers"] = [character_name]
         party_data.setdefault("partyNPCs", [])
         party_data["worldConditions"] = world
+        # Match the read-time sanitization (safe_json_load) or the post-write
+        # equality check can never converge on narration-bearing strings.
+        from utils.encoding_utils import sanitize_dict
+
+        party_data = sanitize_dict(party_data)
         validate(party_data, safe_json_load("schemas/party_schema.json"))
         success = safe_write_json("party_tracker.json", party_data,
                                   commit_guard=lambda: _startup_commit_guard(scope))
@@ -1656,7 +1681,13 @@ def _startup_build_ready(module_name, character):
 
 def _commit_startup_build(conversation, module, character, *, live_scope, preserve_existing=False):
     """Resume approved per-file work; no scene is narrated before disk is ready."""
+    from utils.encoding_utils import sanitize_dict
+
     module_name = module["name"]
+    # One normalization for every consumer below: save_character_to_module
+    # deep-copies+sanitizes internally, and _startup_build_ready compares the
+    # sanitized disk sheet against this in-memory identity.
+    character = sanitize_dict(copy.deepcopy(character))
     while not save_character_to_module(character, module_name, live_scope=live_scope,
                                        preserve_existing=preserve_existing):
         _startup_write_wait(live_scope, "character file")
@@ -1707,6 +1738,7 @@ def get_ai_response(conversation, response_format=None, *, persist_response=True
         "gemini": config.DM_MAIN_GEMINI_PRO_LOW,
         "lmstudio": config.DM_MAIN_LMSTUDIO,
         "legacy": config.DM_MAIN_LEGACY,
+        "opencodego": config.DM_MAIN_OPENCODEGO,
     }[provider]
 
     request_messages = copy.deepcopy(conversation)
@@ -1809,6 +1841,7 @@ def get_ai_starting_location(module, request_provider=None, *, live_scope=None):
         "openai": config.MINI_UTIL_GPT54MINI_NONE,
         "gemini": config.MINI_UTIL_GEMINI_FLASH_LOW,
         "lmstudio": config.MINI_UTIL_LMSTUDIO,
+        "opencodego": config.MINI_UTIL_OPENCODEGO,
     }
     mini_cfg = profiles.get(provider, config.MINI_UTIL_LEGACY)
     module_name = module["moduleName"]

@@ -72,7 +72,7 @@ MODULE_BUILD_OUTCOMES = frozenset(
         "unknown",
     }
 )
-_KNOWN_PROVIDERS = frozenset({"legacy", "openai", "gemini", "lmstudio"})
+_KNOWN_PROVIDERS = frozenset({"legacy", "openai", "gemini", "lmstudio", "opencodego"})
 _KNOWN_INTERFACES = frozenset({"web", "terminal", "toolkit"})
 _TELEMETRY_CONTEXT_LIMITS = {
     "endpoint": _GENERAL_METADATA_LIMIT,

@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Custom Fork: OpenCode Go provider + startup commit fixes (2026-09-22)
+
+This fork adds the **OpenCode Go** subscription service (OpenAI-compatible
+endpoint at `https://opencode.ai/zen/go/v1`) as a first-class provider running
+**DeepSeek V4.1 Flash** on every call site, and fixes a startup-commit defect
+the new model exposed. Full architecture reference:
+[docs/architecture/opencode-go-provider.md](docs/architecture/opencode-go-provider.md).
+
+#### Added
+- **New AI provider `opencodego`** (OpenCode Go / DeepSeek V4.1 Flash):
+  - First-class entry in `SUPPORTED_PROVIDERS`, `PROVIDER_MODELS` and the
+    per-callsite registry (`CALLSITE_BINDINGS` mirrors the OpenAI ladder;
+    `resolve_callsite_config` translates reasoning rungs onto the model's
+    supported `low|high|max` range).
+  - Streaming **Chat Completions** transport via the OpenAI SDK with the two
+    gateway-mandated headers: `x-opencode-session` (stable per-process UUID)
+    and a client `User-Agent` (`NeverEndingQuest/1.0`).
+  - API key resolution order: UI-stored key → OpenCode CLI `auth.json`
+    (`opencode-go` entry, auto-detected) → `config.OPENCODEGO_API_KEY`.
+    Read live per call; Settings changes apply without a restart.
+  - Provider priced in the model catalog ($0.15/$0.60 per 1M off-peak, $0.003
+    cached read, $60/month limit).
+  - Both players (legacy template + React) gain the provider option in
+    Settings → AI Provider with an API-key section; the frontend socket
+    contract adds `get/set_opencodego_key` and `opencodego_key_status`.
+  - Integration points: usage tracker, provider error display names, startup
+    wizard, effects agent, NPC voice/profile services (T105/T107),
+    module builder timeout, story-first generator, live-provider wizard
+    deadline, usage tracker.
+- `deepseek-v4.1-flash` added to the immutable model catalog (pricing snapshot
+  2026-09-22, `owned_by="opencode-go"`).
+
+#### Fixed
+- **Startup character commit could never converge** (exposed by DeepSeek's
+  typographic output; latent in the original code): the commit compared the
+  raw in-memory sheet against `safe_json_load`, which sanitizes read-back
+  strings (em dashes → `--`, curly quotes → straight, ellipsis → `...`). A
+  sheet containing any such character failed the post-write equality check
+  forever, looping `startup_character_commit` → "write remains pending" →
+  `FileExistsError` ("a different character already exists") → rename request
+  → same name → infinite loop. Now:
+  - Model typography is normalized at the startup response boundary
+    (`startup_contract.parse_startup_response`), so narration, sheets and
+    on-disk strings are one canonical form (accents preserved).
+  - `save_character_to_module`, `update_party_tracker` and
+    `_commit_startup_build`/`_startup_build_ready` normalize before writing
+    and comparing; an interrupted equal write resumes instead of conflicting.
+  - After an identity conflict, re-finalizing under the conflicted name is
+    **rejected in code** (deterministic correction), independent of model
+    compliance.
+- React settings panel (`LocalProviderPanel`) updated for the new provider:
+  option, hint, key form, store and socket contract; event-arity contract test
+  updated for the two new client events.
+
+#### Notes for operators
+- OpenCode Go requires an active Go subscription; usage limits and peak-hour
+  pricing are documented in the architecture reference.
+- TTS (tts-1) and image generation (DALL·E) remain OpenAI-only features and
+  still use `OPENAI_API_KEY`.
+
 ### Fixed
 - Legacy character, item, quest, spell and save text now displays literally, including quoted names in NPC and saved-game buttons. Tooltips preserve descriptions without interpreting embedded HTML.
 

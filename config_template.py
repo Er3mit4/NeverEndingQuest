@@ -56,6 +56,12 @@ OPENAI_API_KEY = "your_openai_api_key_here"
 # Get your key at: https://aistudio.google.com/apikey
 GEMINI_API_KEY = "your_gemini_api_key_here"
 
+# OPENCODEGO_API_KEY (Optional): Used for the OpenCode Go provider
+# (DeepSeek V4.1 Flash via https://opencode.ai/zen/go/v1). Leave as-is to use
+# the opencode-go key the OpenCode CLI stores in auth.json automatically; set
+# it here (or via the web UI) only to override with a different key.
+OPENCODEGO_API_KEY = "your_opencodego_api_key_here"
+
 # Local / OpenAI-compatible endpoint (optional): set it from the web UI instead --
 # Settings -> AI Provider -> Local / Custom Server. Non-secret endpoint choices
 # are stored in user_settings.json; credentials use the OS credential store.

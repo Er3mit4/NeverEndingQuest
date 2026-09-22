@@ -1342,7 +1342,9 @@ def call_live_provider(
         frozen_kwargs["timeout"] = _LEVEL_UP_BACKSTOP_SECONDS
     elif completion_required:
         frozen_kwargs["timeout"] = _WATCHDOG_SECONDS
-    elif wizard_task and frozen_kwargs.get("_request_provider") == "openai":
+    elif wizard_task and frozen_kwargs.get("_request_provider") in (
+        "openai", "opencodego"
+    ):
         import httpx
 
         frozen_kwargs["timeout"] = httpx.Timeout(

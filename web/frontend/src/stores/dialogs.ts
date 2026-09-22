@@ -58,6 +58,7 @@ export interface ProviderSettings {
   localEndpoint: ServerEvents['local_endpoint_changed'] | null
   openaiHasKey: boolean | null
   geminiHasKey: boolean | null
+  opencodegoHasKey: boolean | null
   endpointTest: ServerEvents['local_endpoint_test_result'] | null
 }
 
@@ -91,6 +92,7 @@ export interface DialogsState {
   setLocalEndpoint: (payload: ServerEvents['local_endpoint_changed']) => void
   setOpenaiKeyStatus: (payload: ServerEvents['openai_key_status']) => void
   setGeminiKeyStatus: (payload: ServerEvents['gemini_key_status']) => void
+  setOpencodegoKeyStatus: (payload: ServerEvents['opencodego_key_status']) => void
   setEndpointTestResult: (payload: ServerEvents['local_endpoint_test_result']) => void
   updateStarted: () => void
   updateLog: (payload: ServerEvents['update_log']) => void
@@ -124,6 +126,7 @@ export const useDialogs = create<DialogsState>((set) => ({
     localEndpoint: null,
     openaiHasKey: null,
     geminiHasKey: null,
+    opencodegoHasKey: null,
     endpointTest: null,
   },
   update: { running: false, log: [], error: null, complete: null },
@@ -211,6 +214,8 @@ export const useDialogs = create<DialogsState>((set) => ({
     set((s) => ({ settings: { ...s.settings, openaiHasKey: payload.has_key } })),
   setGeminiKeyStatus: (payload) =>
     set((s) => ({ settings: { ...s.settings, geminiHasKey: payload.has_key } })),
+  setOpencodegoKeyStatus: (payload) =>
+    set((s) => ({ settings: { ...s.settings, opencodegoHasKey: payload.has_key } })),
   setEndpointTestResult: (payload) =>
     set((s) => ({ settings: { ...s.settings, endpointTest: payload } })),
   updateStarted: () => set({ update: { running: true, log: ['Starting update...'], error: null, complete: null } }),

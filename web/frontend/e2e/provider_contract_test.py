@@ -48,6 +48,7 @@ def provider_runtime(tmp_path, monkeypatch):
         "handle_get_provider", "handle_set_provider", "handle_get_local_endpoint",
         "handle_set_local_endpoint", "handle_get_openai_key", "handle_set_openai_key",
         "handle_get_gemini_key", "handle_set_gemini_key", "handle_test_local_endpoint",
+        "handle_get_opencodego_key", "handle_set_opencodego_key",
     }
     functions = [node for node in source.body if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in functions} == names
@@ -111,10 +112,13 @@ def test_endpoint_preserves_blank_key_without_echoing_secret(provider_runtime):
     assert synthetic not in (rt.root / "user_settings.json").read_text()
 
 
-@pytest.mark.parametrize("provider", ["openai", "gemini"])
-def test_key_set_and_blank_submit_report_status_only(provider_runtime, provider):
+@pytest.mark.parametrize("provider", ["openai", "gemini", "opencodego"])
+def test_key_set_and_blank_submit_report_status_only(provider_runtime, provider, monkeypatch):
     rt = provider_runtime
     synthetic = f"fixture-only-{provider}-key"
+    if provider == "opencodego":
+        # Isolate the OpenCode Go key path from the developer's real CLI auth file.
+        monkeypatch.setattr(rt.module, "_read_opencode_auth_key", lambda: "")
     rt.handlers[f"handle_set_{provider}_key"]({"api_key": synthetic})
     rt.handlers[f"handle_set_{provider}_key"]({"api_key": ""})
     rt.reload()

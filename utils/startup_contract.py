@@ -10,6 +10,7 @@ import json
 from jsonschema import Draft7Validator
 
 from utils.character_sheet_contract import extract_json_object
+from utils.encoding_utils import sanitize_dict
 
 
 def _object_schema(properties):
@@ -75,6 +76,11 @@ def _parse_object(text, schema):
 def parse_startup_response(text, *, latest_user_index):
     """Check wire shape/reference; the caller supplies its actual user index."""
     value = _parse_object(text, STARTUP_RESPONSE_SCHEMA)
+    # Normalize model typography at the response boundary (em dashes, curly
+    # quotes, ellipsis -> plain ASCII) so every downstream consumer -- printed
+    # narration, committed character sheets, and post-write equality checks
+    # against sanitized disk reads -- sees the same strings.
+    value = sanitize_dict(value)
     confirmation = value["confirmation"]
     index = confirmation["player_message_index"]
     if value["decision"] == "finalize_character":

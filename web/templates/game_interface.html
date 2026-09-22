@@ -4470,6 +4470,7 @@
                                     <option value="legacy">Legacy (GPT-4.1) - Stable baseline</option>
                                     <option value="openai">OpenAI (GPT-5.x) - Next-gen, tested per task</option>
                                     <option value="gemini">Gemini 3.1 - Alternative provider, tested per task</option>
+                                    <option value="opencodego">OpenCode Go (DeepSeek V4.1 Flash) - Low-cost subscription</option>
                                     <option value="lmstudio">Local / Custom Server (LM Studio, Ollama, OpenRouter...)</option>
                                 </select>
                             </div>
@@ -4528,6 +4529,22 @@
                             <input class="settings-select" type="password" id="gemini-key-input"
                                    style="width:100%;" placeholder="AIza...">
                             <button class="settings-btn" id="gemini-key-save-btn">Save Key</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-section" id="opencodego-key-settings" style="display:none;">
+                        <div class="settings-section-title">OpenCode Go API Key</div>
+                        <div class="settings-help">
+                            Needed for the OpenCode Go provider (DeepSeek V4.1 Flash). If you use the
+                            OpenCode CLI with a Go subscription on this machine, your saved key is
+                            detected automatically -- no need to paste it. Otherwise get a key at
+                            https://opencode.ai/auth
+                            <span id="opencodego-key-status-text"></span>
+                        </div>
+                        <div class="settings-item" style="flex-direction:column; align-items:stretch; gap:6px;">
+                            <input class="settings-select" type="password" id="opencodego-key-input"
+                                   style="width:100%;" placeholder="sk-...">
+                            <button class="settings-btn" id="opencodego-key-save-btn">Save Key</button>
                         </div>
                     </div>
                 </div>
@@ -7292,6 +7309,7 @@
                 legacy:   'Legacy (GPT-4.1): stable baseline, recommended. Uses your OpenAI API key.',
                 openai:   'OpenAI (GPT-5.x): next-gen cloud, tested per task. Uses your OpenAI API key.',
                 gemini:   'Gemini 3.1: alternative cloud provider, tested per task. Requires a Google API key.',
+                opencodego: 'OpenCode Go: low-cost subscription serving DeepSeek V4.1 Flash. Uses your opencode-go key (auto-detected from the OpenCode CLI when present).',
                 lmstudio: 'Local / Custom Server: point at any OpenAI-compatible server below. Zero cost when local.'
             };
             function updateProviderHint(p) {
@@ -7305,6 +7323,10 @@
             function toggleGeminiField(p) {
                 const box = document.getElementById('gemini-key-settings');
                 if (box) { box.style.display = (p === 'gemini') ? 'block' : 'none'; }
+            }
+            function toggleOpencodegoField(p) {
+                const box = document.getElementById('opencodego-key-settings');
+                if (box) { box.style.display = (p === 'opencodego') ? 'block' : 'none'; }
             }
 
             // Local/Custom endpoint load + save + test
@@ -7385,6 +7407,21 @@
                 });
             })();
 
+            // OpenCode Go key save + status (CLI auth.json key auto-detected server-side)
+            socket.emit('get_opencodego_key');
+            socket.on('opencodego_key_status', function (d) {
+                var el = document.getElementById('opencodego-key-status-text');
+                if (el) { el.textContent = (d && d.has_key) ? ' (a key is set)' : ' (no key set)'; }
+            });
+            (function () {
+                var b = document.getElementById('opencodego-key-save-btn');
+                if (b) b.addEventListener('click', function () {
+                    var inp = document.getElementById('opencodego-key-input');
+                    socket.emit('set_opencodego_key', { api_key: inp ? inp.value : '' });
+                    if (inp) inp.value = '';  // do not keep the secret in the field
+                });
+            })();
+
             // Fetch current provider from server on page load
             socket.emit('get_model_provider');
 
@@ -7394,6 +7431,7 @@
                 updateProviderHint(provider);
                 toggleLocalFields(provider);
                 toggleGeminiField(provider);
+                toggleOpencodegoField(provider);
                 // Show loading state
                 this.disabled = true;
                 this.style.opacity = '0.6';
@@ -7408,6 +7446,7 @@
                 updateProviderHint(data.provider);
                 toggleLocalFields(data.provider);
                 toggleGeminiField(data.provider);
+                toggleOpencodegoField(data.provider);
                 // Clear loading state
                 providerSelect.disabled = false;
                 providerSelect.style.opacity = '1';

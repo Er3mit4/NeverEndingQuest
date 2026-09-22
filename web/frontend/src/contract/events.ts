@@ -85,12 +85,14 @@ export interface ClientEvents {
   request_module_list: undefined;
   // --- local-edition operator settings (hidden when VITE_EDITION=hosted) ---
   get_model_provider: undefined;
-  set_model_provider: { provider: 'legacy' | 'openai' | 'gemini' | 'lmstudio' };
+  set_model_provider: { provider: 'legacy' | 'openai' | 'gemini' | 'lmstudio' | 'opencodego' };
   get_local_endpoint: undefined;
   set_local_endpoint: { base_url: string; api_key?: string; model: string };
   get_openai_key: undefined;
   set_openai_key: { api_key: string };
   get_gemini_key: undefined;
+  get_opencodego_key: undefined;
+  set_opencodego_key: { api_key?: string };
   set_gemini_key: { api_key: string };
   test_local_endpoint: { base_url: string; api_key?: string; model?: string };
   // --- operator/toolkit scope: NOT bound in the player app (toolkit page owns these) ---
@@ -134,6 +136,8 @@ export const CLIENT_EVENT_ARITY = {
   set_openai_key: 1,
   get_gemini_key: 0,
   set_gemini_key: 1,
+  get_opencodego_key: 0,
+  set_opencodego_key: 1,
   test_local_endpoint: 1,
   start_build: 1,
   cancel_build: 0,
@@ -200,6 +204,7 @@ export interface ServerEvents {
   local_endpoint_changed: { base_url: string; model: string; has_key: boolean };
   openai_key_status: { has_key: boolean };
   gemini_key_status: { has_key: boolean };
+  opencodego_key_status: { has_key: boolean };
   local_endpoint_test_result: { ok: boolean; detail: string };
   image_generated: { image_url: string; prompt: string; request_id?: string; source_message_id?: string };
   image_generation_error: { message: string; request_id?: string; source_message_id?: string };

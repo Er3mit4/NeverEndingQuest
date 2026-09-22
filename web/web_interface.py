@@ -2370,6 +2370,9 @@ def _provider_credentials_available(provider):
 
     if provider == "lmstudio":
         return True
+    if provider == "opencodego":
+        import model_config
+        return bool(model_config.get_opencodego_key())
     if provider in ("legacy", "openai"):
         key = getattr(config, "OPENAI_API_KEY", "")
         placeholder = "your_openai_api_key_here"
@@ -2421,6 +2424,8 @@ def promote_to_bestiary():
             mini_cfg = config.MINI_UTIL_GEMINI_FLASH_LOW
         elif provider_snapshot == "lmstudio":
             mini_cfg = config.MINI_UTIL_LMSTUDIO
+        elif provider_snapshot == "opencodego":
+            mini_cfg = config.MINI_UTIL_OPENCODEGO
         elif provider_snapshot == "legacy":
             mini_cfg = config.MINI_UTIL_LEGACY
         else:
@@ -4556,6 +4561,40 @@ def handle_set_gemini_key(data):
         error(f"Error setting gemini key: {e}", exception=e, category="web_interface")
         emit('error', {'message': "Failed to set Gemini API key"})  # generic: no key leak
 
+@socketio.on('get_opencodego_key')
+def handle_get_opencodego_key():
+    """Report ONLY whether an OpenCode Go key is configured. Never sends the secret."""
+    try:
+        import model_config
+        # has_opencodego_key() also sees the OpenCode CLI auth.json key.
+        emit('opencodego_key_status', {'has_key': model_config.has_opencodego_key()})
+    except Exception as e:
+        error(f"Error getting opencodego key status: {e}", exception=e, category="web_interface")
+        emit('opencodego_key_status', {'has_key': False})
+
+@socketio.on('set_opencodego_key')
+def handle_set_opencodego_key(data):
+    """Set the OpenCode Go key from the UI: update config live AND persist. No echo.
+
+    The OpenAI-compatible client (utils/openai_client.get_openai_client) reads
+    model_config.get_opencodego_key() per call, so a key set in Settings applies
+    to the very next request. Mirrors handle_set_gemini_key.
+    """
+    try:
+        import model_config, config as _cfg
+        api_key = ((data or {}).get('api_key') or '').strip()
+        if not api_key:
+            # Blank submit: do NOT wipe an existing key. Report status only.
+            emit('opencodego_key_status', {'has_key': model_config.has_opencodego_key()})
+            return
+        _cfg.OPENCODEGO_API_KEY = api_key            # live: config readers
+        model_config.persist_opencodego_key(api_key) # survive restart
+        debug("OpenCode Go API key updated via web UI", category="web_interface")
+        emit('opencodego_key_status', {'has_key': model_config.has_opencodego_key()}, broadcast=True)
+    except Exception as e:
+        error(f"Error setting opencodego key: {e}", exception=e, category="web_interface")
+        emit('error', {'message': "Failed to set OpenCode Go API key"})  # generic: no key leak
+
 @socketio.on('test_local_endpoint')
 def handle_test_local_endpoint(data):
     """Isolated liveness probe for the Local/Custom endpoint. Tests POSTED values
@@ -5372,6 +5411,8 @@ def _run_npc_description_job(
             mini_cfg = config.MINI_UTIL_GEMINI_FLASH_LOW
         elif provider_snapshot == "lmstudio":
             mini_cfg = config.MINI_UTIL_LMSTUDIO
+        elif provider_snapshot == "opencodego":
+            mini_cfg = config.MINI_UTIL_OPENCODEGO
         elif provider_snapshot == "legacy":
             mini_cfg = config.MINI_UTIL_LEGACY
         else:

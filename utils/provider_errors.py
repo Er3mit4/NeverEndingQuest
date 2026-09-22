@@ -31,6 +31,7 @@ _PROVIDER_NAMES = {
     "legacy": "OpenAI",
     "gemini": "Gemini (Google AI)",
     "lmstudio": "your local model server",
+    "opencodego": "OpenCode Go",
 }
 
 
