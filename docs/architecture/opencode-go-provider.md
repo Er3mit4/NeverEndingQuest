@@ -34,7 +34,7 @@ OpenCode Go requires two extra headers on every request
 
 | Header | Value | Purpose |
 |---|---|---|
-| `x-opencode-session` | Stable UUID generated once per game-process run | Routing + prompt-cache optimization. One id per process mirrors how a coding agent scopes one conversation. |
+| `x-opencode-session` | UUID created by the game owner for the current conversation and inherited by provider children | Keeps retries and subprocess calls in one conversation while a new game can start a new session. |
 | `User-Agent` | `NeverEndingQuest/1.0` | The client must identify itself by name, never as a generic SDK user agent |
 
 Without the session header the gateway rejects the request with
@@ -59,20 +59,18 @@ request without a restart.
 ## Reasoning-effort mapping
 
 DeepSeek V4.1 Flash supports reasoning efforts **`low | high | max` only**
-(no `none`). The provider's registry ladder mirrors the OpenAI ladder (the
-Go endpoint is OpenAI-compatible, so the same named profiles resolve there),
-and `resolve_callsite_config(task_id, "opencodego")` translates the effort
-suffix of every OpenAI profile name onto the supported range:
+(no `none`). The Go ladder is now explicit and independent of the OpenAI/Codex
+GPT-6 matrix. The earlier effective choices were preserved:
 
-| OpenAI profile rung | Go DeepSeek effort |
+| Task | Go ladder |
 |---|---|
-| `none` | `low` (cheapest supported rung) |
-| `low` | `low` |
-| `medium` | `high` |
-| `high` / `xhigh` / `max` | `max` |
+| Most call sites | `low` |
+| T017 | `high` |
+| T026 | `max` |
+| T097 retries | `low`, `low`, `high` |
 
-`_enforce_provider_constraints` additionally rewrites a stray
-`reasoning_effort: "none"` to `low` at the adapter for compatibility profiles.
+`_enforce_provider_constraints` still rewrites a stray
+`reasoning_effort: "none"` to `low` for older compatibility profiles.
 Temperature is accepted at every effort level and passes through like the
 legacy/lmstudio providers. JSON mode follows the same default-ON contract as
 the legacy path (opt-out with `response_format=None`).
@@ -81,9 +79,10 @@ the legacy path (opt-out with `response_format=None`).
 
 | File | Change |
 |---|---|
-| `model_registry.py` | `opencodego` in `SUPPORTED_PROVIDERS`, `CallsiteBinding` field with OpenAI-mirroring fallback, `deepseek-v4.1-flash` catalog entry |
-| `model_config.py` | Effort-mapping resolver branch, `PROVIDER_MODELS` entry, key persistence/detection helpers, `*_OPENCODEGO` compatibility configs (`DM_MAIN_OPENCODEGO`, `MINI_UTIL_OPENCODEGO`, `CHAR_EFFECTS_OPENCODEGO`, `NPC_VOICE_T105_OPENCODEGO`, `NPC_PROFILE_T107_OPENCODEGO`, `DM_FULL/DM_MINI_MODEL_OPENCODEGO`) |
-| `utils/openai_client.py` | Go client factory: base URL, key resolution, session + user-agent headers |
+| `model_registry.py` | `opencodego` in `SUPPORTED_PROVIDERS`, independent `_GO_SPECIAL_LADDERS`, `deepseek-v4.1-flash` catalog entry |
+| `model_config.py` | Go profiles and independent key persistence/detection helpers |
+| `utils/openai_client.py` | Shared Local/Custom and Go compatible endpoint configuration; Go supplies its own URL, credential, JSON policy and headers |
+| `utils/conversation_identity.py` | Conversation UUID created by the game owner and propagated to provider children |
 | `core/ai/api_client.py` | Routes `opencodego` through the Chat Completions adapter (`_opencodego_call_kwargs`), none→low effort constraint |
 | `utils/provider_errors.py` | Player-facing display name "OpenCode Go" |
 | `utils/openai_usage_tracker.py` | Known-provider telemetry set |
@@ -99,17 +98,17 @@ the legacy path (opt-out with `response_format=None`).
 - Full production boundary: `capture_and_fanout("T013"/"T082", ...)` with
   `_request_provider='opencodego'` resolves the registry ladder to
   `deepseek-v4.1-flash` and completes.
-- `validate_model_registry()` passes with the new provider in
-  `SUPPORTED_PROVIDERS`; `provider_contract_test.py` passes (25/26 — the one
-  failure is the pre-existing missing `flask_socketio` dev dependency).
+- `validate_model_registry()` passes with the provider in
+  `SUPPORTED_PROVIDERS`; the current `provider_contract_test.py` passes all
+  32 tests when run with the project's dependencies and pytest available.
 - React frontend `tsc -b && vite build` passes; vitest suite at its baseline.
 
 ## Known limitations
 
-- **Untested reasoning tiers**: the none→low/medium→high rung mapping is a
-  reasoned baseline, not a blind-evaluated matrix like the OpenAI provider's
-  ladder. Capture testing (`utils/provider_health.py --provider opencodego`)
-  should be run before trusting a specific effort tier for a call site.
+- **Quality of Go reasoning tiers**: the preserved `low`/`high`/`max` matrix
+  has not undergone a new gameplay comparison since the GPT-6 migration.
+  Use `utils/provider_health.py --provider opencodego` to check live transport,
+  then representative gameplay to assess quality.
 - **TTS and image generation** remain OpenAI-only features (DALL·E / tts-1
   endpoints do not exist on the Go gateway); they keep using
   `config.OPENAI_API_KEY` regardless of the selected provider.

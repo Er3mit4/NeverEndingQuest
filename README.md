@@ -4,8 +4,8 @@
 > [Er3mit4](https://github.com/Er3mit4) — currently adds **Codex GPT-6 with
 > ChatGPT login**, the **OpenCode Go provider (DeepSeek V4.1 Flash)**, and startup fixes. It is used to
 > test new AI endpoints and mechanics; see [FORK.md](FORK.md) for what is
-> implemented and what is planned. Everything else below is the upstream
-> project documentation.
+> implemented and what is planned. The base game comes from upstream; provider
+> and setup instructions below describe this fork where noted.
 
 ## Launch the game: React by default
 
@@ -40,7 +40,7 @@ remote server.
 
 ## 🎮 Get Started | 💬 Join the Community
 
-**Ready to play?** → [Quick Start Guide](#quick-start) | [Download Windows Installer](https://raw.githubusercontent.com/MoonlightByte/NeverEndingQuest/main/install_neverendingquest_windows.bat) *(Right-click → Save As)*
+**Ready to play?** → [Quick Start Guide](#quick-start) | [Upstream Windows Installer](https://raw.githubusercontent.com/MoonlightByte/NeverEndingQuest/main/install_neverendingquest_windows.bat) *(installs upstream, without this fork's Codex provider)*
 
 **Need help or want to share your adventures?** → [r/NeverEndingQuest on Reddit](https://www.reddit.com/r/NeverEndingQuest/)
 
@@ -70,9 +70,12 @@ remote server.
 
 ## Quick Start
 
-### 🎯 One-Click Windows Installer (Recommended)
+### 🎯 One-Click Windows Installer (upstream only)
 
-**For non-technical users on Windows:**
+**For non-technical users on Windows:** This installer clones
+`MoonlightByte/NeverEndingQuest`. To use the Codex GPT-6 and OpenCode Go
+providers in this fork, follow [Manual Installation](#manual-installation)
+with the fork clone command below.
 
 1. **Download the installer**: [install_neverendingquest_windows.bat](https://raw.githubusercontent.com/MoonlightByte/NeverEndingQuest/main/install_neverendingquest_windows.bat)
    - **Right-click the link** and select **"Save link as..."** or **"Save target as..."**
@@ -95,17 +98,23 @@ The installer automatically:
 
 ---
 
-### 🛠️ Manual Installation
+### Manual Installation
 
 The launcher handles React setup automatically after the Python environment is
 ready:
 
-1. **Install Python dependencies**: `pip install -r requirements.txt`
-2. **Install Node.js LTS**: Required only for the React player; it includes `npm`
-3. **Create local configuration**: Copy `config_template.py` to `config.py`
-4. **Launch React**: Run `python run_web.py`
-5. **Choose an AI provider**: Open **Settings → AI Provider** in either player
-6. **Start your adventure**: The game guides you through character creation and module selection
+1. **Clone this fork**: `git clone https://github.com/Er3mit4/NeverEndingQuest.git`
+   and enter the `NeverEndingQuest` directory. The upstream installer above
+   downloads a different checkout.
+2. **Install Python dependencies**: `pip install -r requirements.txt`
+3. **Install Node.js LTS**: Required only for the React player; it includes `npm`
+4. **Create local configuration**: Copy `config_template.py` to `config.py`
+5. **Install the official Codex CLI** if you plan to use ChatGPT quota; verify
+   that `codex --version` works in the same terminal that launches the game
+6. **Launch React**: Run `python run_web.py`
+7. **Choose an AI provider**: Open **Settings → AI Provider** in either player;
+   select Codex and sign in with ChatGPT if prompted
+8. **Start your adventure**: The game guides you through character creation and module selection
 
 ### Additional Launch Options
 
@@ -155,9 +164,10 @@ Open **Settings → AI Provider** and choose one of these modes:
 #### GPT-6 model selection
 
 The application binds each registered AI task to a model and reasoning setting.
-The GPT-6 matrix keeps Luna for most tasks and uses Sol at low effort only on
-tasks that previously needed a stronger model. Astra is never selected by the
-automatic matrix; the player can choose it manually in Settings. Codex checks the account's live model catalog
+The GPT-6 matrix uses Luna low for most tasks, Luna medium for T017 and the
+third T097 attempt, and Sol low for T026, T040, T046, T084 and T099. Astra is
+never selected automatically; the player can choose it manually in Settings
+and return to Auto at any time. Codex checks the account's live model catalog
 before every request; unavailable model/effort combinations fail clearly.
 
 These bindings live in `model_registry.py` (`CALLSITE_BINDINGS`) and are the single

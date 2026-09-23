@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Custom Fork: Codex GPT-6 subscription provider (2026-09-22)
+
+- Added `codex` as the default provider for new installations. It uses the
+  official Codex App Server and the player's ChatGPT login/quota; no Codex
+  credential is stored by the game, and failures never switch to API billing.
+- Added an economical GPT-6 matrix for Codex and the separately billed OpenAI
+  API: Luna low for most tasks, Luna medium for T017 and T097's third attempt,
+  and Sol low for T026, T040, T046, T084 and T099. Astra is available only
+  through an explicit player choice in Settings.
+- Added Codex account status, model availability, quota and device-code login
+  in React and legacy Settings, plus a `provider_health.py` check.
+- Refactored Local/Custom and OpenCode Go to share one OpenAI-compatible
+  endpoint configuration. Go retains a separate credential and its previous
+  task ladder; its session identity now originates in the game process and is
+  inherited by provider children.
+- Existing saved provider choices remain active. Text generation can use the
+  Codex subscription; image and TTS features still use their separate API
+  services. See [Codex architecture](docs/architecture/codex-gpt6-provider.md)
+  and [fork setup](FORK.md).
+
 ### Custom Fork: OpenCode Go provider + startup commit fixes (2026-09-22)
 
 This fork adds the **OpenCode Go** subscription service (OpenAI-compatible
@@ -18,11 +38,10 @@ the new model exposed. Full architecture reference:
 #### Added
 - **New AI provider `opencodego`** (OpenCode Go / DeepSeek V4.1 Flash):
   - First-class entry in `SUPPORTED_PROVIDERS`, `PROVIDER_MODELS` and the
-    per-callsite registry (`CALLSITE_BINDINGS` mirrors the OpenAI ladder;
-    `resolve_callsite_config` translates reasoning rungs onto the model's
-    supported `low|high|max` range).
+    per-callsite registry (`CALLSITE_BINDINGS` now keeps its `low|high|max`
+    ladder independent of the OpenAI provider).
   - Streaming **Chat Completions** transport via the OpenAI SDK with the two
-    gateway-mandated headers: `x-opencode-session` (stable per-process UUID)
+    gateway-mandated headers: `x-opencode-session` (stable per-conversation UUID)
     and a client `User-Agent` (`NeverEndingQuest/1.0`).
   - API key resolution order: UI-stored key → OpenCode CLI `auth.json`
     (`opencode-go` entry, auto-detected) → `config.OPENCODEGO_API_KEY`.
