@@ -62,9 +62,9 @@ def gold_model_config(
     model_config_module: Optional[ModuleType] = None,
 ) -> Dict[str, Any]:
     """Return a detached named cloud configuration for one gold-path stage."""
-    if provider not in {"openai", "gemini", "lmstudio", "opencodego"}:
+    if provider not in {"openai", "codex", "gemini", "lmstudio", "opencodego"}:
         raise StoryFirstProviderUnsupportedError(
-            "The story-first gold path requires OpenAI, Gemini, LM Studio, or OpenCode Go."
+            "The story-first gold path requires OpenAI, Codex, Gemini, LM Studio, or OpenCode Go."
         )
     if stage not in _GOLD_STAGE_TASK_IDS:
         raise ValueError(f"unknown story-first model stage: {stage}")

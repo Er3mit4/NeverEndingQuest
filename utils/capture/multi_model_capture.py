@@ -420,6 +420,11 @@ def capture_and_fanout(task_id, primary_fn, messages, **kwargs):
     request_provider = (
         kwargs.get("_request_provider") or model_config.get_provider()
     )
+    if request_provider == "opencodego":
+        # Live provider calls run in fresh Python children. Mint the identity
+        # in the owner process first so every child inherits the same session.
+        from utils.conversation_identity import current_conversation_id
+        current_conversation_id()
 
     # The capture boundary is also the one production boundary shared by every
     # registered T-ID. Resolve the canonical binding here so older callers that
@@ -573,10 +578,15 @@ def capture_and_fanout(task_id, primary_fn, messages, **kwargs):
                 0,
             ) or 0,
         }
-        primary_cost = _calculate_cost(model, primary_token_usage, cfg)
+        # Subscription quota is not an API invoice even if the same GPT-6
+        # model name also has a published API price.
+        primary_cost = (None if request_provider == "codex"
+                        else _calculate_cost(model, primary_token_usage, cfg))
 
         # Get variants (check task_overrides first, then per-callsite configs)
-        variants = [] if live_policy else cfg.get("task_overrides", {}).get(task_id)
+        # Selecting the subscription provider must never fan out paid API
+        # comparisons behind the player's back.
+        variants = [] if live_policy or request_provider == "codex" else cfg.get("task_overrides", {}).get(task_id)
 
         # Then try per-callsite config dicts from model_config.py
         if variants is None:

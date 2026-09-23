@@ -99,8 +99,9 @@ class HeadlessSession:
                 "system",
                 content=(
                     "config.py was created from the template but no "
-                    "OPENAI_API_KEY environment variable was set. Cloud "
-                    "providers will fail until a key is added."))
+                    "OPENAI_API_KEY environment variable was set. Codex uses "
+                    "your Codex CLI ChatGPT login; API-key providers still "
+                    "require their own credentials."))
         copied = bootstrap_mod.prepare_game_dir(
             self.game_dir, self.repo_root, module=module)
         os.chdir(self.game_dir)

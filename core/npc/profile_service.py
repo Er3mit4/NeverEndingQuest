@@ -244,7 +244,10 @@ def _config_for_provider(provider: str) -> Dict[str, Any]:
     # Structured 12-key profile output. OpenAI/legacy use JSON mode + client-side
     # validation; Gemini needs response_schema or it emits the wrong shape.
     # Never attach response_schema on the OpenAI path (would 400).
-    if provider == "openai":
+    if provider == "codex":
+        selected = model_config.resolve_callsite_config("T107", "codex")
+        selected["response_format"] = {"type": "json_object"}
+    elif provider == "openai":
         selected = copy.deepcopy(model_config.NPC_PROFILE_T107_OPENAI_LUNA_NONE)
         selected["response_format"] = {"type": "json_object"}
     elif provider == "gemini":

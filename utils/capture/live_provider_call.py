@@ -789,6 +789,12 @@ def _error_disposition(exc, original, status, error_code=None):
             # Out of funds arrives as a 429 like a rate limit, but no reissue
             # can pay the bill: hand it to the caller so the player is told.
             return "deterministic"
+        if error_code.lower() in {"codex_timeout", "codex_disconnected", "ratelimitexceeded"}:
+            return "retryable_transport"
+        if error_code.startswith("codex_"):
+            # Login, model availability, quota and isolation failures must be
+            # shown to the player, never silently retried as transport loss.
+            return "deterministic"
     if status in {408, 409, 429} or (
         isinstance(status, int) and 500 <= status < 600
     ):
@@ -1049,6 +1055,11 @@ def _terminate_process(process, reader=None):
     """
     try:
         if process.poll() is None:
+            if os.name == "nt":
+                # Codex inference launches a Node App Server below this Python
+                # child. Windows terminate() kills only Python; taskkill /T
+                # reaps the App Server too when a turn is superseded.
+                request_provider_child_tree(process)
             try:
                 process.terminate()
             except OSError:
@@ -1077,6 +1088,20 @@ def _terminate_process(process, reader=None):
         return None
     finally:
         _close_process_streams(process)
+
+
+def request_provider_child_tree(process):
+    """Best-effort Windows process-tree reap for cancelled provider calls."""
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def _feed_request(request_stdin, request_payload):

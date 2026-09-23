@@ -59,6 +59,8 @@ export interface ProviderSettings {
   openaiHasKey: boolean | null
   geminiHasKey: boolean | null
   opencodegoHasKey: boolean | null
+  codexStatus: ServerEvents['codex_status'] | null
+  codexLogin: ServerEvents['codex_login'] | null
   endpointTest: ServerEvents['local_endpoint_test_result'] | null
 }
 
@@ -93,6 +95,9 @@ export interface DialogsState {
   setOpenaiKeyStatus: (payload: ServerEvents['openai_key_status']) => void
   setGeminiKeyStatus: (payload: ServerEvents['gemini_key_status']) => void
   setOpencodegoKeyStatus: (payload: ServerEvents['opencodego_key_status']) => void
+  setCodexStatus: (payload: ServerEvents['codex_status']) => void
+  setCodexLogin: (payload: ServerEvents['codex_login']) => void
+  setCodexModel: (payload: ServerEvents['codex_model_changed']) => void
   setEndpointTestResult: (payload: ServerEvents['local_endpoint_test_result']) => void
   updateStarted: () => void
   updateLog: (payload: ServerEvents['update_log']) => void
@@ -127,6 +132,8 @@ export const useDialogs = create<DialogsState>((set) => ({
     openaiHasKey: null,
     geminiHasKey: null,
     opencodegoHasKey: null,
+    codexStatus: null,
+    codexLogin: null,
     endpointTest: null,
   },
   update: { running: false, log: [], error: null, complete: null },
@@ -216,6 +223,13 @@ export const useDialogs = create<DialogsState>((set) => ({
     set((s) => ({ settings: { ...s.settings, geminiHasKey: payload.has_key } })),
   setOpencodegoKeyStatus: (payload) =>
     set((s) => ({ settings: { ...s.settings, opencodegoHasKey: payload.has_key } })),
+  setCodexStatus: (payload) =>
+    set((s) => ({ settings: { ...s.settings, codexStatus: payload } })),
+  setCodexLogin: (payload) =>
+    set((s) => ({ settings: { ...s.settings, codexLogin: payload } })),
+  setCodexModel: (payload) =>
+    set((s) => ({ settings: { ...s.settings, codexStatus: s.settings.codexStatus
+      ? { ...s.settings.codexStatus, model_choice: payload.model } : null } })),
   setEndpointTestResult: (payload) =>
     set((s) => ({ settings: { ...s.settings, endpointTest: payload } })),
   updateStarted: () => set({ update: { running: true, log: ['Starting update...'], error: null, complete: null } }),

@@ -4468,7 +4468,8 @@
                                 <select class="settings-select" id="model-provider-select"
                                         title="Each AI task uses a model selected specifically for that task type based on quality testing">
                                     <option value="legacy">Legacy (GPT-4.1) - Stable baseline</option>
-                                    <option value="openai">OpenAI (GPT-5.x) - Next-gen, tested per task</option>
+                                    <option value="openai">OpenAI API (GPT-6) - Uses an API key</option>
+                                    <option value="codex">Codex (GPT-6) - Uses your ChatGPT subscription</option>
                                     <option value="gemini">Gemini 3.1 - Alternative provider, tested per task</option>
                                     <option value="opencodego">OpenCode Go (DeepSeek V4.1 Flash) - Low-cost subscription</option>
                                     <option value="lmstudio">Local / Custom Server (LM Studio, Ollama, OpenRouter...)</option>
@@ -4479,6 +4480,20 @@
                                 Legacy is recommended for stability.
                             </div>
                         </div>
+                    </div>
+                    <div class="settings-section" id="codex-settings" style="display:none;">
+                        <div class="settings-section-title">Codex / ChatGPT</div>
+                        <div class="settings-help" id="codex-status-text">Checking Codex login...</div>
+                        <div class="settings-item" style="gap:8px;">
+                            <button class="settings-btn" id="codex-login-btn">Sign in with ChatGPT</button>
+                            <button class="settings-btn" id="codex-refresh-btn">Refresh status</button>
+                        </div>
+                        <div class="settings-help" id="codex-device-text"></div>
+                        <label for="codex-model-choice">Model choice</label>
+                        <select class="settings-select" id="codex-model-choice">
+                            <option value="auto">Automatic: Luna, Sol low for harder tasks</option>
+                            <option value="gpt-6-astra">Astra for all tasks (manual choice)</option>
+                        </select>
                     </div>
                     <div class="settings-section" id="local-endpoint-settings" style="display:none;">
                         <div class="settings-section-title">Local / Custom Server</div>
@@ -4505,7 +4520,7 @@
                         </div>
                     </div>
 
-                    <div class="settings-section" id="openai-key-settings">
+                    <div class="settings-section" id="openai-key-settings" style="display:none;">
                         <div class="settings-section-title">OpenAI API Key</div>
                         <div class="settings-help">
                             Needed for the Legacy and OpenAI providers. Stored locally on this machine.
@@ -7307,7 +7322,8 @@
 
             const PROVIDER_HINTS = {
                 legacy:   'Legacy (GPT-4.1): stable baseline, recommended. Uses your OpenAI API key.',
-                openai:   'OpenAI (GPT-5.x): next-gen cloud, tested per task. Uses your OpenAI API key.',
+                openai:   'OpenAI API (GPT-6): uses your OpenAI API key and API billing.',
+                codex:    'Codex (GPT-6): uses the official Codex login and your ChatGPT service quota.',
                 gemini:   'Gemini 3.1: alternative cloud provider, tested per task. Requires a Google API key.',
                 opencodego: 'OpenCode Go: low-cost subscription serving DeepSeek V4.1 Flash. Uses your opencode-go key (auto-detected from the OpenCode CLI when present).',
                 lmstudio: 'Local / Custom Server: point at any OpenAI-compatible server below. Zero cost when local.'
@@ -7319,6 +7335,10 @@
             function toggleLocalFields(p) {
                 const box = document.getElementById('local-endpoint-settings');
                 if (box) { box.style.display = (p === 'lmstudio') ? 'block' : 'none'; }
+                const codex = document.getElementById('codex-settings');
+                if (codex) { codex.style.display = (p === 'codex') ? 'block' : 'none'; }
+                const openaiKey = document.getElementById('openai-key-settings');
+                if (openaiKey) { openaiKey.style.display = (p === 'codex') ? 'none' : 'block'; }
             }
             function toggleGeminiField(p) {
                 const box = document.getElementById('gemini-key-settings');
@@ -7328,6 +7348,43 @@
                 const box = document.getElementById('opencodego-key-settings');
                 if (box) { box.style.display = (p === 'opencodego') ? 'block' : 'none'; }
             }
+
+            socket.emit('get_codex_status');
+            socket.on('codex_status', function (d) {
+                var el = document.getElementById('codex-status-text');
+                if (el) el.textContent = d.state === 'connected'
+                    ? 'Connected (' + (d.plan || 'ChatGPT') + '). GPT-6: ' + d.models.map(function (m) { return m.model; }).join(', ') + '. 5-hour quota used: ' + ((d.quota || {}).primary || {}).usedPercent + '%.'
+                    : 'Codex: ' + d.state + (d.error ? ' - ' + d.error : '');
+                var login = document.getElementById('codex-login-btn');
+                if (login) login.style.display = d.state === 'connected' ? 'none' : '';
+                if (d.state === 'connected') {
+                    var device = document.getElementById('codex-device-text');
+                    if (device) device.textContent = '';
+                }
+                var choice = document.getElementById('codex-model-choice');
+                if (choice) choice.value = d.model_choice || 'auto';
+            });
+            socket.on('codex_model_changed', function (d) {
+                var choice = document.getElementById('codex-model-choice');
+                if (choice) choice.value = d.model;
+            });
+            socket.on('codex_login', function (d) {
+                var el = document.getElementById('codex-device-text');
+                if (!el) return;
+                if (d.userCode) {
+                    el.textContent = 'Open ' + d.verificationUrl + ' and enter code ' + d.userCode + '.';
+                    var poll = setInterval(function () {
+                        socket.emit('get_codex_status');
+                        var status = document.getElementById('codex-status-text');
+                        if (status && status.textContent.startsWith('Connected')) clearInterval(poll);
+                    }, 5000);
+                } else el.textContent = d.error || 'Already connected.';
+            });
+            document.getElementById('codex-login-btn').addEventListener('click', function () { socket.emit('start_codex_login'); });
+            document.getElementById('codex-refresh-btn').addEventListener('click', function () { socket.emit('get_codex_status'); });
+            document.getElementById('codex-model-choice').addEventListener('change', function () {
+                socket.emit('set_codex_model', { model: this.value });
+            });
 
             // Local/Custom endpoint load + save + test
             socket.emit('get_local_endpoint');

@@ -28,6 +28,25 @@ afterEach(() => {
 })
 
 describe('provider and voice settings behavior', () => {
+  it('keeps Astra behind an explicit Codex model selection', () => {
+    useDialogs.getState().setProvider({ provider: 'codex' })
+    useDialogs.getState().setCodexStatus({
+      state: 'connected', plan: 'plus', model_choice: 'auto', error: null,
+      models: [
+        { model: 'gpt-6-luna', efforts: ['low'] },
+        { model: 'gpt-6-sol', efforts: ['low'] },
+        { model: 'gpt-6-astra', efforts: ['low'] },
+      ],
+      quota: null,
+    })
+    render(<SettingsMenu />)
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    expect(screen.queryByLabelText('OpenAI API key')).toBeNull()
+    const choice = screen.getByLabelText('Model choice') as HTMLSelectElement
+    expect(choice.value).toBe('auto')
+    fireEvent.change(choice, { target: { value: 'gpt-6-astra' } })
+    expect(emitC).toHaveBeenCalledWith('set_codex_model', { model: 'gpt-6-astra' })
+  })
   it('times out an unanswered endpoint probe and accepts a successful retry', () => {
     vi.useFakeTimers()
     useDialogs.getState().setProvider({ provider: 'lmstudio' })

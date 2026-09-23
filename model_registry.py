@@ -6,12 +6,29 @@ Provider-specific schemas remain in :mod:`model_config`; bindings refer to those
 profiles by compatibility name and the resolver returns a detached deep copy.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Mapping, Optional, Tuple
 
 
-SUPPORTED_PROVIDERS = ("openai", "gemini", "legacy", "lmstudio", "opencodego")
+SUPPORTED_PROVIDERS = ("openai", "codex", "gemini", "legacy", "lmstudio", "opencodego")
+_GPT6_SPECIAL_LADDERS = {
+    "T017": ("GPT6_LUNA_MEDIUM",),
+    # Former Luna-high or Terra tasks get Sol-low. Most tasks remain Luna-low.
+    "T026": ("GPT6_SOL_LOW",),
+    "T040": ("GPT6_SOL_LOW",),
+    "T046": ("GPT6_SOL_LOW",),
+    "T084": ("GPT6_SOL_LOW",),
+    "T099": ("GPT6_SOL_LOW",),
+    "T097": ("GPT6_LUNA_LOW", "GPT6_LUNA_LOW", "GPT6_LUNA_MEDIUM"),
+}
+# Frozen from the Go matrix in use on 2026-09-22. This is deliberately
+# independent of the OpenAI names and efforts, which may evolve separately.
+_GO_SPECIAL_LADDERS = {
+    "T017": ("OPENCODEGO_HIGH",),
+    "T026": ("OPENCODEGO_MAX",),
+    "T097": ("OPENCODEGO_LOW", "OPENCODEGO_LOW", "OPENCODEGO_HIGH"),
+}
 SUPPORTED_GPT56_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 EVALUATION_EFFORTS = ("none", "low", "medium", "high")
 
@@ -99,19 +116,13 @@ class CallsiteBinding:
     legacy: Tuple[str, ...]
     lmstudio: Tuple[str, ...]
     opencodego: Tuple[str, ...] = ()
+    codex: Tuple[str, ...] = ()
     note: str = ""
 
     def profiles_for(self, provider: str) -> Tuple[str, ...]:
         if provider not in SUPPORTED_PROVIDERS:
             raise ValueError("Unknown provider %r" % provider)
-        value = getattr(self, provider)
-        # The opencodego ladder mirrors the openai one unless explicitly
-        # declared: the Go endpoint is OpenAI-compatible, so the same named
-        # profiles resolve there (each *_OPENCODEGO config shadows its
-        # openai namesake in model_config).
-        if provider == "opencodego" and not value:
-            return self.openai
-        return value
+        return getattr(self, provider)
 
 
 def _profiles(openai, gemini, legacy, lmstudio, opencodego=None):
@@ -734,7 +745,14 @@ def _build_bindings():
     for binding in _DECLARATIONS:
         if binding.task_id in bindings:
             raise RuntimeError("Duplicate callsite binding: %s" % binding.task_id)
-        bindings[binding.task_id] = binding
+        gpt6 = _GPT6_SPECIAL_LADDERS.get(
+            binding.task_id,
+            ("GPT6_LUNA_LOW",),
+        )
+        go = _GO_SPECIAL_LADDERS.get(binding.task_id, ("OPENCODEGO_LOW",))
+        bindings[binding.task_id] = replace(
+            binding, openai=gpt6, codex=gpt6, opencodego=go,
+        )
     return MappingProxyType(bindings)
 
 

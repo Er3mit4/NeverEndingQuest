@@ -119,8 +119,8 @@ provider router, persisted approval or background comparison is introduced.
 
 ## Flow
 
-1. Import-time settings load reads installation-root `user_settings.json`. An explicit saved provider wins; otherwise OpenAI is selected.
-2. `set_provider` updates `model_config` and already-imported compatibility globals. Supported providers are `openai`, `gemini`, `legacy`, `lmstudio`, and `opencodego`.
+1. Import-time settings load reads installation-root `user_settings.json`. An explicit saved provider wins; otherwise Codex is selected.
+2. `set_provider` updates `model_config` and already-imported compatibility globals. Supported providers are `codex`, `openai`, `gemini`, `legacy`, `lmstudio`, and `opencodego`.
 3. Registry construction rejects duplicate T-IDs. Validation checks the exact inventory, nonempty provider ladders, named profiles, models, and supported reasoning effort.
 4. A callsite builds its messages and callsite-owned schema, format, temperature, and other overlays, then calls `capture_and_fanout(T-ID, api_client.create_completion, ...)`.
 5. The boundary snapshots the provider once so an in-flight UI setting change cannot redirect the call.
@@ -128,7 +128,7 @@ provider router, persisted approval or background comparison is introduced.
 7. For the standard adapter it injects the provider snapshot, task ID, and usage invocation UUID. Raw SDK-compatible functions do not receive private metadata.
 8. A live-selected T-ID freezes request bytes and starts one provider child per generation with a per-generation transport deadline set for every provider (the OpenAI-compatible client applies it as a request option with SDK retries zeroed; Gemini applies it as a per-request `http_options` timeout in milliseconds with no retry options). Polling checks supersession, fully terminates and reaps a stale child, and accepts only an envelope matching operation ID and generation. A child reaped without a reply yields a synthesized retryable envelope for every task (#284).
 9. Outside live transport, primary retry makes up to three physical calls only for typed empty response. Other provider and transport errors propagate immediately.
-10. `create_completion` enforces API compatibility and routes OpenAI, Legacy, LM Studio, and OpenCode Go through the OpenAI-compatible client; Gemini uses `google.genai` and its conversion layer. OpenAI sends streaming Responses requests; OpenCode Go sends streaming Chat Completions to `https://opencode.ai/zen/go/v1` with `x-opencode-session` and a client User-Agent, always serving `deepseek-v4.1-flash` with efforts translated onto `low|high|max`.
+10. `create_completion` routes Codex through the official Codex App Server with ChatGPT login and quota; OpenAI, Legacy, LM Studio, and OpenCode Go use the OpenAI-compatible client; Gemini uses `google.genai`. Codex uses an isolated ephemeral thread per request. OpenAI sends streaming Responses requests; OpenCode Go sends streaming Chat Completions to `https://opencode.ai/zen/go/v1` with `x-opencode-session` and a client User-Agent.
 11. Unexpected provider exceptions become correlated `ProviderCallError`; empty or non-text output is rejected; success is normalized to one OpenAI-shaped response.
 12. Usage recording is independent of capture and failure-isolated. If capture is disabled, the primary response returns immediately.
 13. When both the outer capture gate and JSON `capture_enabled` are true, one successful-primary record is written and enabled nonduplicate OpenAI/Gemini variants may enter the eight-worker pool. Live-selected tasks receive no background variants; LM Studio returns before fanout.

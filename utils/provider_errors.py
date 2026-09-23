@@ -24,6 +24,9 @@ QUOTA_ERROR_CODES = frozenset({
     "insufficient_quota",
     "insufficient_credit",
     "billing_hard_limit_reached",
+    "codex_quota_exhausted",
+    "usage_limit_exceeded",
+    "usagelimitexceeded",
 })
 
 _PROVIDER_NAMES = {
@@ -32,6 +35,7 @@ _PROVIDER_NAMES = {
     "gemini": "Gemini (Google AI)",
     "lmstudio": "your local model server",
     "opencodego": "OpenCode Go",
+    "codex": "Codex (ChatGPT)",
 }
 
 
@@ -202,6 +206,20 @@ def classify_provider_error(exc):
     code_blob = " ".join(codes)
     name_blob = " ".join(names)
     text_blob = " ".join(texts)
+
+    if provider.lower() == "codex":
+        if any(code in code_blob for code in ("codex_quota_exhausted", "usagelimitexceeded")):
+            return {"category": "subscription_quota", "retryable": False,
+                    "player_message": "Codex reached this ChatGPT account's service quota. Your game state is safe; try again after the quota resets.",
+                    "retry_notice": None}
+        if any(code in code_blob for code in ("codex_login_required", "unauthorized")):
+            return {"category": "codex_login", "retryable": False,
+                    "player_message": "Codex needs a ChatGPT login. Open Settings → AI Provider and sign in with ChatGPT.",
+                    "retry_notice": None}
+        if "codex_model_unavailable" in code_blob:
+            return {"category": "codex_model", "retryable": False,
+                    "player_message": "The selected GPT-6 model or effort is unavailable for this ChatGPT account. Choose Auto in Settings or check your Codex access.",
+                    "retry_notice": None}
 
     def matches(*needles):
         return any(

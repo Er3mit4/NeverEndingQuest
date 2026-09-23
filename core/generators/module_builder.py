@@ -2779,16 +2779,8 @@ Return ONLY the JSON object, no explanations or additional text.""" % (
     current_prompt = parsing_prompt
 
     # Select model config per provider (before retry loop)
-    from model_config import MODEL_PROVIDER
-
-    if MODEL_PROVIDER == "openai":
-        summ_config = config.DM_SUMM_GPT54MINI_NONE
-    elif MODEL_PROVIDER == "gemini":
-        summ_config = config.DM_SUMM_GEMINI_FLASH_LOW
-    elif MODEL_PROVIDER == "lmstudio":
-        summ_config = config.DM_SUMM_LMSTUDIO
-    else:  # legacy
-        summ_config = config.DM_SUMM_LEGACY
+    from model_config import MODEL_PROVIDER, resolve_callsite_config
+    summ_config = resolve_callsite_config("T030", MODEL_PROVIDER)
 
     # T030 is constrained at the provider when supported, then checked again by
     # ModuleCreationSpec.  The deterministic check remains authoritative.
@@ -2796,7 +2788,7 @@ Return ONLY the JSON object, no explanations or additional text.""" % (
     _extra = {k: v for k, v in summ_config.items() if k != "model"}
     if MODEL_PROVIDER == "gemini":
         _extra["response_schema"] = _module_spec_gemini_schema(resolved_policy)
-    elif MODEL_PROVIDER in {"openai", "legacy"}:
+    elif MODEL_PROVIDER in {"openai", "legacy", "codex"}:
         _extra["response_format"] = {
             "type": "json_schema",
             "json_schema": {

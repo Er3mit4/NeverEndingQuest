@@ -1,8 +1,8 @@
 # NeverEndingQuest
 
 > **⚠️ This is a custom fork.** Experimental playground maintained by
-> [Er3mit4](https://github.com/Er3mit4) — currently adds the **OpenCode Go
-> provider (DeepSeek V4.1 Flash)** and startup-commit fixes. It is used to
+> [Er3mit4](https://github.com/Er3mit4) — currently adds **Codex GPT-6 with
+> ChatGPT login**, the **OpenCode Go provider (DeepSeek V4.1 Flash)**, and startup fixes. It is used to
 > test new AI endpoints and mechanics; see [FORK.md](FORK.md) for what is
 > implemented and what is planned. Everything else below is the upstream
 > project documentation.
@@ -30,9 +30,9 @@ An AI-powered Dungeon Master for running SRD 5.2.1 compatible tabletop RPG campa
 
 **🚀 NEW: React Player and Multi-Provider AI** - The component-based React player
 is now the default; the established legacy player remains an explicit launch option.
-Run the game with the current
-cost-optimized OpenAI GPT-5.x models (**the new default**), the stable GPT-4.1
-baseline (one toggle away), Gemini, the OpenCode Go subscription
+Run the game with the economical Codex GPT-6 matrix (**default for new installs**),
+the separately billed OpenAI API GPT-6 matrix, the stable GPT-4.1 baseline,
+Gemini, the OpenCode Go subscription
 (DeepSeek V4.1 Flash — custom fork feature), or an OpenAI-compatible local or
 remote server.
 
@@ -136,7 +136,10 @@ the server was explicitly started with `--ui legacy`.
 
 Open **Settings → AI Provider** and choose one of these modes:
 
-- **OpenAI (GPT-5.x)** — *default*: The current, cost-optimized model matrix.
+- **Codex (GPT-6)** — *default for new installations*: Uses the official Codex
+  CLI login and your ChatGPT service quota. Sign in from Settings with a
+  browser/device code when needed; no OpenAI API key is required.
+- **OpenAI API (GPT-6)**: Uses the same GPT-6 task matrix through API billing.
   Requires an OpenAI API key.
 - **Legacy (GPT-4.1)**: The previous stable baseline, kept as a one-click toggle.
   Requires an OpenAI API key.
@@ -149,19 +152,13 @@ Open **Settings → AI Provider** and choose one of these modes:
 - **Local / Custom Server**: Connects to an OpenAI-compatible endpoint such as
   LM Studio, Ollama, vLLM, OpenRouter, or another remote server.
 
-#### Why OpenAI (GPT-5.x) is now the default
+#### GPT-6 model selection
 
-The application no longer points every AI call at a single model. Each of the
-~76 distinct AI call sites (main DM turns, combat refereeing, summaries,
-validation, module generation, NPC coherence, and so on) is individually bound
-to a specific model + reasoning setting that was chosen from blind quality/cost
-evaluations. The default **OpenAI** provider routes the large majority of call
-sites to the cheaper, faster `gpt-5.6-luna` (at the lowest reasoning tier that
-still passed each site's tests), keeps `gpt-5.6-terra` where it measurably won,
-and deliberately **retains the stronger `gpt-5.4` / `gpt-5.2`** on the two call
-sites where the cheaper models regressed (combat refereeing and the initiative
-tracker). The result is a large cost reduction versus the old GPT-5.2-everywhere
-wiring, with no observed quality loss on the tested sites.
+The application binds each registered AI task to a model and reasoning setting.
+The GPT-6 matrix keeps Luna for most tasks and uses Sol at low effort only on
+tasks that previously needed a stronger model. Astra is never selected by the
+automatic matrix; the player can choose it manually in Settings. Codex checks the account's live model catalog
+before every request; unavailable model/effort combinations fail clearly.
 
 These bindings live in `model_registry.py` (`CALLSITE_BINDINGS`) and are the single
 source of truth: every AI call is routed through `resolve_callsite_config(task_id,
@@ -171,13 +168,11 @@ actually used, read the response-derived record in
 `debug/api_captures/api_calls_master.jsonl` (it logs `response.model`) — not a
 pre-call routing snapshot.
 
-**Prefer the old behavior?** Switch **Settings → AI Provider → Legacy (GPT-4.1)**
-(or set `MODEL_PROVIDER = "legacy"` in `config.py`). The full GPT-4.1 /
-GPT-4.1-mini path is unchanged and fully supported — nothing was removed, the
-default just moved.
+Existing saved provider choices remain in effect. Select **Codex (GPT-6)** in
+Settings to migrate an existing installation. Legacy GPT-4.1 remains available.
 
 > ⚠️ **Feedback wanted on the new call-site bindings.** These model choices are
-> new. If you notice a regression on the default OpenAI provider — worse
+> new. If you notice a regression on the Codex provider — worse
 > narration, broken combat math, malformed JSON/updates, a stuck build, or any
 > behavior that improves the moment you toggle back to **Legacy (GPT-4.1)** —
 > please [open an issue](https://github.com/MoonlightByte/NeverEndingQuest/issues)
@@ -1088,14 +1083,16 @@ AI: "The explosion engulfs three goblins..."
 ### AI Provider and Credentials
 
 Use **Settings → AI Provider** in the web interface instead of assigning a
-single model in `config.py`. Choose OpenAI (default), Legacy, Gemini,
-OpenCode Go (custom fork), or Local / Custom Server. The application maintains
+single model in `config.py`. Choose Codex (default for new installs), OpenAI API,
+Legacy, Gemini, OpenCode Go, or Local / Custom Server. The application maintains
 its tested per-call-site model matrix in `model_config.py`, and the active
 provider persists in `user_settings.json`.
 
-- **Default provider is `openai`** (the cost-optimized GPT-5.x call-site matrix).
-  Set `MODEL_PROVIDER = "legacy"` in `config.py`, or use the Settings panel, to
-  run the GPT-4.1 baseline instead.
+- **Default provider is `codex`** for new installs. Existing saved choices remain.
+  Select Codex in Settings to migrate an existing install; sign in to Codex
+  with ChatGPT in the same panel. Codex uses the ChatGPT quota and no API key.
+- The automatic GPT-6 matrix uses Luna for most calls and Sol low for the few
+  tasks previously assigned a stronger model. Astra requires a manual choice.
 - Legacy and OpenAI require an OpenAI API key.
 - Gemini requires a Google AI API key.
 - OpenCode Go requires an active Go subscription; its key is auto-detected from
@@ -1310,14 +1307,8 @@ This is unofficial Fan Content and is not affiliated with, endorsed, sponsored, 
 - **Windows launcher**: `launch_game.bat` defaults to React and forwards arguments, including `--ui legacy`.
 
 #### AI Providers and Local Credentials
-- **Default provider is now OpenAI (GPT-5.x)**: The cost-optimized per-call-site
-  matrix (`gpt-5.6-luna`/`terra`, with `gpt-5.4`/`gpt-5.2` retained where they
-  won) is the new out-of-the-box default. **Legacy (GPT-4.1) remains one toggle
-  away** in Settings → AI Provider, or `MODEL_PROVIDER = "legacy"` in `config.py`.
-  Nothing was removed — only the default moved. *Please report any call-site
-  regression against the OpenAI default (see AI Provider Setup above); Legacy is a
-  safe fallback.*
-- **Provider selection in Settings**: Choose OpenAI (default), Legacy GPT-4.1, Gemini, OpenCode Go (custom fork; DeepSeek V4.1 Flash), or an OpenAI-compatible Local / Custom Server.
+- **Default provider is Codex (GPT-6)** for new installs; a saved provider choice still wins.
+- **Provider selection in Settings**: Choose Codex, OpenAI API, Legacy GPT-4.1, Gemini, OpenCode Go, or a Local / Custom Server.
 - **Per-call-site model matrix**: Narration, combat, validation, summaries, updates,
   and generation use provider-specific model settings selected for their task.
 - **Local endpoint testing**: Save and test LM Studio, Ollama, vLLM, OpenRouter, or other compatible endpoints from the UI.

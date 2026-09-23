@@ -7,10 +7,12 @@ This verifies handlers/persistence, not Socket.IO routing or real model response
 import ast
 import importlib.util
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import shutil
 import sys
+import subprocess
 import threading
 import types
 
@@ -49,6 +51,7 @@ def provider_runtime(tmp_path, monkeypatch):
         "handle_set_local_endpoint", "handle_get_openai_key", "handle_set_openai_key",
         "handle_get_gemini_key", "handle_set_gemini_key", "handle_test_local_endpoint",
         "handle_get_opencodego_key", "handle_set_opencodego_key",
+        "handle_set_codex_model",
     }
     functions = [node for node in source.body if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in functions} == names
@@ -68,7 +71,7 @@ def provider_runtime(tmp_path, monkeypatch):
                                  events=events, root=tmp_path, secrets=secrets)
 
 
-@pytest.mark.parametrize("provider", ["legacy", "openai", "gemini", "lmstudio"])
+@pytest.mark.parametrize("provider", ["legacy", "openai", "codex", "gemini", "lmstudio"])
 def test_provider_round_trip_survives_fresh_module_import(provider_runtime, provider):
     rt = provider_runtime
     rt.handlers["handle_set_provider"]({"provider": provider})
@@ -77,6 +80,98 @@ def test_provider_round_trip_survives_fresh_module_import(provider_runtime, prov
     assert rt.reload().get_provider() == provider
     rt.handlers["handle_get_provider"]()
     assert rt.events[-1] == ("provider_changed", {"provider": provider})
+
+
+def test_codex_auto_matrix_never_selects_astra(provider_runtime):
+    config = provider_runtime.module
+    assert config.get_provider() == "codex"
+    assert config.get_codex_model_choice() == "auto"
+    for task_id, binding in config.CALLSITE_BINDINGS.items():
+        for attempt in range(len(binding.codex)):
+            selected = config.resolve_callsite_config(task_id, "codex", attempt)
+            assert selected["model"] in {"gpt-6-luna", "gpt-6-sol"}
+            if selected["model"] == "gpt-6-sol":
+                assert selected["reasoning_effort"] == "low"
+
+
+def test_astra_choice_requires_explicit_setting(provider_runtime):
+    config = provider_runtime.module
+    with pytest.raises(ValueError):
+        config.persist_codex_model_choice("gpt-6-astra-auto")
+    assert config.get_codex_model_choice() == "auto"
+    config.persist_codex_model_choice("gpt-6-astra")
+    assert provider_runtime.reload().get_codex_model_choice() == "gpt-6-astra"
+    config.persist_codex_model_choice("auto")
+    assert provider_runtime.reload().get_codex_model_choice() == "auto"
+
+
+def test_codex_transport_respects_manual_astra_choice(provider_runtime, monkeypatch):
+    from core.ai import api_client
+    from core.ai import codex_client
+
+    selected = []
+
+    class FakeServer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def complete(self, messages, model, effort, **kwargs):
+            selected.append((model, effort))
+            return {"text": "OK", "model": model, "id": "test-turn", "usage": {
+                "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
+                "cached_tokens": 0, "reasoning_tokens": 0,
+            }}
+
+    monkeypatch.setattr(codex_client, "CodexAppServer", FakeServer)
+    params = {"messages": [{"role": "user", "content": "OK"}], "model": "gpt-6-luna",
+              "reasoning_effort": "low", "response_format": None, "_request_provider": "codex"}
+    assert api_client.create_completion(**params).choices[0].message.content == "OK"
+    assert selected[-1] == ("gpt-6-luna", "low")
+    provider_runtime.handlers["handle_set_codex_model"]({"model": "gpt-6-astra"})
+    assert provider_runtime.events[-1] == ("codex_model_changed", {"model": "gpt-6-astra"})
+    assert api_client.create_completion(**params).model == "gpt-6-astra"
+    assert selected[-1] == ("gpt-6-astra", "low")
+    provider_runtime.handlers["handle_set_codex_model"]({"model": "auto"})
+    assert api_client.create_completion(**params).model == "gpt-6-luna"
+
+
+def test_codex_game_roles_keep_system_instructions_above_user_data():
+    from core.ai.codex_client import _game_messages
+
+    instructions, conversation = _game_messages([
+        {"role": "system", "content": "Game rule"},
+        {"role": "user", "content": "Player action"},
+        {"role": "assistant", "content": "Prior reply"},
+        {"role": "developer", "content": "Output rule"},
+    ])
+    assert "[0 system]\nGame rule" in instructions
+    assert "[3 developer]\nOutput rule" in instructions
+    assert [item["role"] for item in conversation] == ["user", "assistant"]
+    assert [item["index"] for item in conversation] == [1, 2]
+
+
+def test_opencode_session_survives_child_and_stays_separate_from_local_key(provider_runtime, monkeypatch):
+    from utils.conversation_identity import start_new_conversation
+    from utils.openai_client import compatible_connection
+
+    config = provider_runtime.module
+    config.persist_local_endpoint("http://127.0.0.1:1234/v1", "fixture-local-key", "local-model")
+    monkeypatch.setattr(config, "get_opencodego_key", lambda: "fixture-go-key")
+    identity = start_new_conversation()
+    go = compatible_connection("opencodego")
+    local = compatible_connection("lmstudio")
+    assert go["headers"]["x-opencode-session"] == identity
+    assert go["api_key"] == "fixture-go-key"
+    assert local["api_key"] == "fixture-local-key"
+    assert local["headers"] == {}
+    inherited = subprocess.check_output(
+        [sys.executable, "-c", "from utils.conversation_identity import current_conversation_id; print(current_conversation_id())"],
+        cwd=REPO, env=os.environ.copy(), text=True,
+    ).strip()
+    assert inherited == identity
 
 
 def test_invalid_provider_does_not_change_persisted_selection(provider_runtime):

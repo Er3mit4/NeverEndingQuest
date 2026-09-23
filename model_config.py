@@ -191,6 +191,12 @@ DM_MINI_MODEL_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 # parity with the game's reasoning-off callsites).
 DM_FULL_MODEL_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
 DM_MINI_MODEL_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
+OPENCODEGO_LOW = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
+OPENCODEGO_HIGH = {"model": "deepseek-v4.1-flash", "reasoning_effort": "high"}
+OPENCODEGO_MAX = {"model": "deepseek-v4.1-flash", "reasoning_effort": "max"}
+GPT6_LUNA_LOW = {"model": "gpt-6-luna", "reasoning_effort": "low"}
+GPT6_LUNA_MEDIUM = {"model": "gpt-6-luna", "reasoning_effort": "medium"}
+GPT6_SOL_LOW = {"model": "gpt-6-sol", "reasoning_effort": "low"}
 
 # --- T065 AI Response Validation Model Configs (from capture + manual testing) ---
 # Validation requires reasoning -- gpt-5.2|none is UNUSABLE (0/15 correct).
@@ -1102,12 +1108,11 @@ MULTI_MODEL_CAPTURE = False  # Set True to enable parallel cloud model testing (
 
 # --- Provider Selection ---
 # Single setting replaces USE_GPT5_MODELS and USE_LM_STUDIO
-# DEFAULT: "openai" -- the current, cost-optimized GPT-5.x callsite matrix
-#   (gpt-5.6-luna / terra, with gpt-5.4 and gpt-5.2 retained where they win).
+# DEFAULT: "codex" -- the GPT-6 Luna/Sol task matrix on ChatGPT service quota.
 #   Set to "legacy" to run the stable gpt-4.1 / gpt-4.1-mini baseline instead;
-#   "gemini", "lmstudio" and "opencodego" are also available. Switchable at
+#   "openai", "gemini", "lmstudio" and "opencodego" are also available. Switchable at
 #   runtime via Settings -> AI Provider (persists in user_settings.json).
-MODEL_PROVIDER = "openai"  # options: "openai" (default), "legacy", "gemini", "lmstudio", "opencodego"
+MODEL_PROVIDER = "codex"  # ChatGPT subscription via the Codex CLI; persisted user choice wins.
 
 PROVIDER_MODELS = {
     "legacy": {
@@ -1115,8 +1120,12 @@ PROVIDER_MODELS = {
         "mini": "gpt-4.1-mini-2025-04-14",
     },
     "openai": {
-        "full": "gpt-5.2",
-        "mini": "gpt-5-mini",
+        "full": "gpt-6-sol",
+        "mini": "gpt-6-luna",
+    },
+    "codex": {
+        "full": "gpt-6-sol",
+        "mini": "gpt-6-luna",
     },
     "gemini": {
         "full": "gemini-3.1-pro-preview",
@@ -1346,16 +1355,33 @@ def persist_provider(provider_name):
     _save_user_settings(settings)
 
 
+def get_codex_model_choice():
+    """Return the explicit player override, or the economical task matrix."""
+    value = _load_user_settings().get("codex_model_choice")
+    return value if value == "gpt-6-astra" else "auto"
+
+
+def persist_codex_model_choice(value):
+    if value not in ("auto", "gpt-6-astra"):
+        raise ValueError("Codex model choice must be auto or gpt-6-astra")
+    settings = _load_user_settings()
+    if value == "auto":
+        settings.pop("codex_model_choice", None)
+    else:
+        settings["codex_model_choice"] = value
+    _save_user_settings(settings)
+
+
 def load_persisted_provider():
     """Load provider from disk and apply it. Call at startup.
 
     When the user has never explicitly chosen a provider, fall back to the
-    application default "openai" (the cost-optimized GPT-5.x callsite matrix).
+    application default "codex" (the GPT-6 subscription callsite matrix).
     An explicit choice saved via persist_provider() / the Settings panel always
     wins, so existing users who picked Legacy keep Legacy.
     """
     settings = _load_user_settings()
-    provider = settings.get("model_provider", "openai")
+    provider = settings.get("model_provider", "codex")
     if provider in PROVIDER_MODELS:
         set_provider(provider)
 
@@ -1588,6 +1614,7 @@ def validate_model_registry():
                     "high",
                     "xhigh",
                     "max",
+                    "ultra",
                 ):
                     errors.append(
                         "%s/%s profile %s has unsupported effort %s"
@@ -1613,53 +1640,13 @@ def resolve_callsite_config(task_id, provider=None, attempt=0):
     if attempt_index < 0:
         raise ValueError("attempt must be a non-negative integer")
     profile_name = ladder[min(attempt_index, len(ladder) - 1)]
-    if provider == "opencodego":
-        # The opencodego ladder reuses the openai profile NAMES as the
-        # effort/shape contract; the model itself is always the Go DeepSeek.
-        # See _opencodego_profile_for.
-        return _opencodego_profile_for(profile_name)
-    return copy.deepcopy(globals()[profile_name])
-
-
-# OpenCode Go effort translation. deepseek-v4.1-flash supports low|high|max
-# (no "none"), so the game's reasoning-off rungs map onto the cheapest
-# reasoning tier and the heavier rungs step up one level.
-_OPENCODEGO_EFFORT_MAP = {
-    "none": "low",
-    "low": "low",
-    "medium": "high",
-    "high": "max",
-    "xhigh": "max",
-    "max": "max",
-}
-_OPENCODEGO_MODEL = "deepseek-v4.1-flash"
-
-
-def _opencodego_profile_for(profile_name):
-    """Build a detached DeepSeek V4.1 Flash config from an OpenAI profile name.
-
-    The openai profile ladder (CALLSITE_BINDINGS) encodes per-callsite
-    reasoning policy as profile names like OPENAI_GPT56_LUNA_LOW. The Go
-    endpoint serves deepseek-v4.1-flash instead, so the effort suffix is
-    translated onto the supported low|high|max range and the model is
-    substituted. Response schemas are never carried here: the Gemini-only
-    response_schema entries stay on their own provider configs, and Go calls
-    use plain JSON mode like the OpenAI path.
-    """
-    base = globals().get(profile_name)
-    if not isinstance(base, dict) or not base.get("model"):
-        raise ValueError(
-            "opencodego profile references unknown openai profile %s" % profile_name
-        )
-    effort = _OPENCODEGO_EFFORT_MAP.get(
-        str(base.get("reasoning_effort", "low")).lower(), "low"
-    )
-    selected = {"model": _OPENCODEGO_MODEL, "reasoning_effort": effort}
-    # Preserve callsite-owned format overrides (e.g. response_format=None on
-    # plain-text compression callsites).
-    if "response_format" in base:
-        selected["response_format"] = copy.deepcopy(base["response_format"])
+    selected = copy.deepcopy(globals()[profile_name])
+    if provider in ("opencodego", "openai", "codex") and task_id in _PLAIN_TEXT_TASKS:
+        selected["response_format"] = None
     return selected
+
+
+_PLAIN_TEXT_TASKS = frozenset({"T046"})
 
 
 # Kept for callers/tests importing the historical name.  It is generated from

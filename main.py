@@ -1457,16 +1457,8 @@ def generate_transition_narration(transition_prompt, party_tracker_data):
         {"role": "user", "content": transition_prompt},
     ]
     try:
-        from model_config import MODEL_PROVIDER
-
-        if MODEL_PROVIDER == "openai":
-            narration_config = config.DM_MAIN_GPT52_NONE
-        elif MODEL_PROVIDER == "gemini":
-            narration_config = config.DM_MAIN_GEMINI_PRO_LOW
-        elif MODEL_PROVIDER == "lmstudio":
-            narration_config = config.DM_MAIN_LMSTUDIO
-        else:
-            narration_config = config.DM_MAIN_LEGACY
+        from model_config import MODEL_PROVIDER, resolve_callsite_config
+        narration_config = resolve_callsite_config("T013", MODEL_PROVIDER)
         response = capture_and_fanout(
             "T013",
             api_client.create_completion,
@@ -1569,15 +1561,8 @@ def generate_arrival_narration(departure_narration, party_tracker_data, conversa
     ]
 
     try:
-        from model_config import MODEL_PROVIDER
-        if MODEL_PROVIDER == "openai":
-            narr_cfg = config.MINI_UTIL_GPT54MINI_NONE
-        elif MODEL_PROVIDER == "gemini":
-            narr_cfg = config.MINI_UTIL_GEMINI_FLASH_LOW
-        elif MODEL_PROVIDER == "lmstudio":
-            narr_cfg = config.MINI_UTIL_LMSTUDIO
-        else:  # legacy
-            narr_cfg = config.MINI_UTIL_LEGACY
+        from model_config import MODEL_PROVIDER, resolve_callsite_config
+        narr_cfg = resolve_callsite_config("T063", MODEL_PROVIDER)
 
         response = capture_and_fanout("T063", api_client.create_completion,
             _request_provider=MODEL_PROVIDER,
@@ -1676,15 +1661,8 @@ Now, provide the rewritten, seamless narration.
 """
 
     try:
-        from model_config import MODEL_PROVIDER
-        if MODEL_PROVIDER == "openai":
-            narr_cfg = config.MINI_UTIL_GPT54MINI_NONE
-        elif MODEL_PROVIDER == "gemini":
-            narr_cfg = config.MINI_UTIL_GEMINI_FLASH_LOW
-        elif MODEL_PROVIDER == "lmstudio":
-            narr_cfg = config.MINI_UTIL_LMSTUDIO
-        else:  # legacy
-            narr_cfg = config.MINI_UTIL_LEGACY
+        from model_config import MODEL_PROVIDER, resolve_callsite_config
+        narr_cfg = resolve_callsite_config("T064", MODEL_PROVIDER)
 
         response = capture_and_fanout("T064", api_client.create_completion,
             _request_provider=MODEL_PROVIDER,
@@ -3764,7 +3742,10 @@ def validate_ai_response(
     print(f"DEBUG: [MAIN VALIDATION] Exported validation messages to debug/api_captures/main_validation_messages_to_api.json")
     
     # Select per-provider validation model config
-    if _val_provider == "openai":
+    if _val_provider in ("codex", "opencodego"):
+        from model_config import resolve_callsite_config
+        validation_config = resolve_callsite_config("T065", _val_provider)
+    elif _val_provider == "openai":
         validation_config = config.DM_VALIDATION_GPT52_LOW
     elif _val_provider == "gemini":
         validation_config = config.DM_VALIDATION_GEMINI_FLASH_LOW
@@ -4485,15 +4466,8 @@ ACTUAL GAMEPLAY CONVERSATION:
 
 Write a compelling chronicle of these actual events:"""
 
-                from model_config import MODEL_PROVIDER
-                if MODEL_PROVIDER == "openai":
-                    summ_config = config.DM_SUMM_GPT54MINI_NONE
-                elif MODEL_PROVIDER == "gemini":
-                    summ_config = config.DM_SUMM_GEMINI_FLASH_LOW
-                elif MODEL_PROVIDER == "lmstudio":
-                    summ_config = config.DM_SUMM_LMSTUDIO
-                else:  # legacy
-                    summ_config = config.DM_SUMM_LEGACY
+                from model_config import MODEL_PROVIDER, resolve_callsite_config
+                summ_config = resolve_callsite_config("T066", MODEL_PROVIDER)
 
                 response = capture_and_fanout("T066", api_client.create_completion,
                     _request_provider=MODEL_PROVIDER,
@@ -7347,21 +7321,11 @@ def _get_ai_response_impl(
     # routing boolean. (The old "escalate to full model after 4 retries" reassignment
     # of selected_model was removed: it only changed the LOGGED model name, never the
     # real call, and contradicted the no-escalation-ladder rule.)
-    from model_config import MODEL_PROVIDER
-
-    # Select per-provider model config (model string + provider-specific params)
-    if MODEL_PROVIDER == "openai":
-        full_config = config.DM_FULL_MODEL_GPT52_NONE
-        mini_config = config.DM_MINI_MODEL_GPT5MINI_LOW
-    elif MODEL_PROVIDER == "gemini":
-        full_config = config.DM_FULL_MODEL_GEMINI_PRO_LOW
-        mini_config = config.DM_MINI_MODEL_GEMINI_FLASH_LOW
-    elif MODEL_PROVIDER == "lmstudio":
-        full_config = config.DM_FULL_MODEL_LMSTUDIO
-        mini_config = config.DM_MINI_MODEL_LMSTUDIO
-    else:  # legacy
-        full_config = config.DM_FULL_MODEL_LEGACY
-        mini_config = config.DM_MINI_MODEL_LEGACY
+    from model_config import MODEL_PROVIDER, resolve_callsite_config
+    # T067 currently has one production model per provider. Keep the model
+    # displayed in logs aligned with the registry that supplies the request.
+    full_config = resolve_callsite_config("T067", MODEL_PROVIDER)
+    mini_config = full_config
 
     # HIGH-1: select by the boolean routing decision, not a snapshot string
     # compare (which breaks when set_provider() rewrites config.DM_MINI_MODEL).

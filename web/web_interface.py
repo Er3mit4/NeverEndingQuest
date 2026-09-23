@@ -2370,6 +2370,12 @@ def _provider_credentials_available(provider):
 
     if provider == "lmstudio":
         return True
+    if provider == "codex":
+        try:
+            from core.ai.codex_client import get_server
+            return get_server().account_status()["state"] == "connected"
+        except Exception:
+            return False
     if provider == "opencodego":
         import model_config
         return bool(model_config.get_opencodego_key())
@@ -2418,7 +2424,9 @@ def promote_to_bestiary():
         from model_config import get_provider
         provider_snapshot = get_provider()
         import config
-        if provider_snapshot == "openai":
+        if provider_snapshot == "codex":
+            mini_cfg = model_config.resolve_callsite_config("T094", "codex")
+        elif provider_snapshot == "openai":
             mini_cfg = config.MINI_UTIL_GPT54MINI_NONE
         elif provider_snapshot == "gemini":
             mini_cfg = config.MINI_UTIL_GEMINI_FLASH_LOW
@@ -2938,6 +2946,9 @@ def handle_user_input(data):
     if _web_gameplay_paused():
         emit('error', {'message': 'Gameplay is paused. Choose Load, Reset, or Exit.'})
         return
+
+    from utils.conversation_identity import start_new_conversation
+    start_new_conversation()
     user_input = data.get('input', '')
     if not isinstance(user_input, str) or not user_input.strip():
         return
@@ -4403,6 +4414,55 @@ def handle_get_provider():
         emit('provider_changed', {'provider': 'legacy'})  # Safe fallback
 
 
+@socketio.on('get_codex_status')
+def handle_get_codex_status():
+    """Report ChatGPT login, account quota and live GPT-6 availability."""
+    try:
+        from core.ai.codex_client import get_server
+        server = get_server()
+        account = server.account_status()
+        import model_config
+        payload = {**account, 'models': [], 'quota': None, 'error': None,
+                   'model_choice': model_config.get_codex_model_choice()}
+        if account['state'] == 'connected':
+            payload['models'] = server.models()
+            payload['quota'] = server.quota()
+        emit('codex_status', payload)
+    except Exception as exc:
+        import model_config
+        emit('codex_status', {
+            'state': 'unavailable', 'plan': None, 'models': [], 'quota': None,
+            'error': str(exc), 'model_choice': model_config.get_codex_model_choice(),
+        })
+
+
+@socketio.on('set_codex_model')
+def handle_set_codex_model(data):
+    """Persist an explicit Astra choice; auto never chooses it."""
+    try:
+        import model_config
+        choice = (data or {}).get('model', 'auto')
+        with _provider_selection_lock:
+            model_config.persist_codex_model_choice(choice)
+        emit('codex_model_changed', {'model': choice}, broadcast=True)
+    except (ValueError, TypeError) as exc:
+        emit('error', {'message': str(exc)})
+
+
+@socketio.on('start_codex_login')
+def handle_start_codex_login():
+    """Start Codex-managed device login without handling OAuth credentials."""
+    try:
+        from core.ai.codex_client import get_server
+        server = get_server()
+        if server.account_status()['state'] == 'connected':
+            emit('codex_login', {'ok': True, 'already_connected': True})
+        else:
+            emit('codex_login', {'ok': True, **server.start_device_login()})
+    except Exception as exc:
+        emit('codex_login', {'ok': False, 'error': str(exc)})
+
+
 _provider_selection_lock = threading.Lock()
 
 
@@ -5405,7 +5465,10 @@ def _run_npc_description_job(
             )
 
         import config
-        if provider_snapshot == "openai":
+        if provider_snapshot == "codex":
+            import model_config
+            mini_cfg = model_config.resolve_callsite_config("T095", "codex")
+        elif provider_snapshot == "openai":
             mini_cfg = config.MINI_UTIL_GPT54MINI_NONE
         elif provider_snapshot == "gemini":
             mini_cfg = config.MINI_UTIL_GEMINI_FLASH_LOW

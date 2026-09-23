@@ -7,7 +7,8 @@ type ProviderValue = ClientEvents['set_model_provider']['provider']
 
 const PROVIDER_OPTIONS: Array<{ value: ProviderValue; label: string }> = [
   { value: 'legacy', label: 'Legacy (GPT-4.1) - Stable baseline' },
-  { value: 'openai', label: 'OpenAI (GPT-5.x) - Next-gen, tested per task' },
+  { value: 'openai', label: 'OpenAI API (GPT-6) - Uses an API key' },
+  { value: 'codex', label: 'Codex (GPT-6) - Uses your ChatGPT subscription' },
   { value: 'gemini', label: 'Gemini 3.1 - Alternative provider, tested per task' },
   { value: 'opencodego', label: 'OpenCode Go (DeepSeek V4.1 Flash) - Low-cost subscription' },
   { value: 'lmstudio', label: 'Local / Custom Server (LM Studio, Ollama, OpenRouter...)' },
@@ -15,7 +16,8 @@ const PROVIDER_OPTIONS: Array<{ value: ProviderValue; label: string }> = [
 
 const PROVIDER_HINTS: Record<ProviderValue, string> = {
   legacy: 'Legacy (GPT-4.1): stable baseline, recommended. Uses your OpenAI API key.',
-  openai: 'OpenAI (GPT-5.x): next-gen cloud, tested per task. Uses your OpenAI API key.',
+  openai: 'OpenAI API (GPT-6): uses your OpenAI API key and API billing.',
+  codex: 'Codex (GPT-6): uses the official Codex login and your ChatGPT service quota.',
   gemini: 'Gemini 3.1: alternative cloud provider, tested per task. Requires a Google API key.',
   opencodego:
     'OpenCode Go: low-cost subscription serving DeepSeek V4.1 Flash. Uses your opencode-go key (auto-detected from the OpenCode CLI when present).',
@@ -49,7 +51,14 @@ function LocalProviderPanelBody() {
     emitC('get_openai_key', undefined)
     emitC('get_gemini_key', undefined)
     emitC('get_opencodego_key', undefined)
+    emitC('get_codex_status', undefined)
   }, [])
+
+  useEffect(() => {
+    if (!settings.codexLogin?.userCode || settings.codexStatus?.state === 'connected') return undefined
+    const timer = window.setInterval(() => emitC('get_codex_status', undefined), 5000)
+    return () => window.clearInterval(timer)
+  }, [settings.codexLogin?.userCode, settings.codexStatus?.state])
 
   // ---- provider select (server confirms via provider_changed) ----
   const [pendingProvider, setPendingProvider] = useState<ProviderValue | null>(null)
@@ -171,6 +180,54 @@ function LocalProviderPanelBody() {
         </div>
       </div>
 
+      {provider === 'codex' && (
+        <div className={sectionClass}>
+          <div className={sectionTitleClass}>Codex / ChatGPT</div>
+          <p className="neq-settings-help-parity">
+            Status: {settings.codexStatus?.state ?? 'checking'}
+            {settings.codexStatus?.plan ? ` (${settings.codexStatus.plan})` : ''}.
+            {settings.codexStatus?.error ? ` ${settings.codexStatus.error}` : ''}
+          </p>
+          {settings.codexStatus?.state === 'connected' ? (
+            <>
+              <p className="neq-settings-help-parity">
+                GPT-6 available: {settings.codexStatus.models.map((item) => item.model).join(', ') || 'none'}.
+              </p>
+              {settings.codexStatus.quota?.primary && (
+                <p className="neq-settings-help-parity">
+                  5-hour quota used: {settings.codexStatus.quota.primary.usedPercent ?? '?'}%.
+                </p>
+              )}
+            </>
+          ) : (
+            <button type="button" className={smallButtonClass} onClick={() => emitC('start_codex_login', undefined)}>
+              Sign in with ChatGPT
+            </button>
+          )}
+          {settings.codexLogin?.userCode && settings.codexStatus?.state !== 'connected' && (
+            <p className="neq-settings-help-parity" role="status">
+              Open <a href={settings.codexLogin.verificationUrl} target="_blank" rel="noreferrer">
+                {settings.codexLogin.verificationUrl}
+              </a> and enter code <strong>{settings.codexLogin.userCode}</strong>.
+            </p>
+          )}
+          {settings.codexLogin?.error && <p role="alert">{settings.codexLogin.error}</p>}
+          <label htmlFor="codex-model-choice">Model choice</label>
+          <select
+            id="codex-model-choice"
+            className={inputClass}
+            value={settings.codexStatus?.model_choice ?? 'auto'}
+            onChange={(event) => emitC('set_codex_model', { model: event.target.value as 'auto' | 'gpt-6-astra' })}
+          >
+            <option value="auto">Automatic: Luna, with Sol low only for harder tasks</option>
+            <option value="gpt-6-astra">Astra for all tasks (manual choice)</option>
+          </select>
+          <button type="button" className={smallButtonClass} onClick={() => emitC('get_codex_status', undefined)}>
+            Refresh status
+          </button>
+        </div>
+      )}
+
       {provider === 'lmstudio' && (
         <div className={sectionClass}>
           <div className={sectionTitleClass}>Local / Custom Server</div>
@@ -242,7 +299,7 @@ function LocalProviderPanelBody() {
         </div>
       )}
 
-      <div className={sectionClass}>
+      {provider !== 'codex' ? <div className={sectionClass}>
         <div className={sectionTitleClass}>OpenAI API Key</div>
         <p className="neq-settings-help-parity">
           Needed for the Legacy and OpenAI providers. Stored locally on this machine.
@@ -260,7 +317,7 @@ function LocalProviderPanelBody() {
         <button type="button" className={smallButtonClass} onClick={saveOpenaiKey}>
           Save Key
         </button></div>
-      </div>
+      </div> : null}
 
       {provider === 'gemini' && (
         <div className={`${sectionClass} neq-settings-gemini-section-parity`}>

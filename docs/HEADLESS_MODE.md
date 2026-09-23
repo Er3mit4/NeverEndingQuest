@@ -10,9 +10,9 @@ Design background: `docs/plans/2026-08-06-headless-cli-mode-plan.md`.
 ## Quick start
 
 ```bash
-# One-time: bootstrap config (or set OPENAI_API_KEY in the environment and
-# let serve/script create config.py from the template automatically).
-cp config_template.py config.py   # then add your API key
+# One-time: bootstrap config. The default Codex provider uses your Codex CLI
+# ChatGPT login; add an API key only if you select an API-key provider.
+cp config_template.py config.py
 
 # Interactive agent session. Seeding a character skips the startup wizard.
 python run_headless.py serve --module The_Thornwood_Watch --character my_pc.json

@@ -35,6 +35,9 @@ _PROMPT_CONTRACT_VERSION = "first-name-only-v1"
 
 
 def _mini_config_for_provider(provider):
+    if provider in ("codex", "opencodego"):
+        import model_config
+        return model_config.resolve_callsite_config("T087", provider)
     if provider == "openai":
         return config.MINI_UTIL_GPT54MINI_NONE
     if provider == "gemini":
@@ -150,7 +153,9 @@ Return ONLY the first name, nothing else. No quotes, no explanation."""
         provider = request_provider or model_config.get_provider()
         # Keep provider-to-config assignments explicit here: the semantic
         # callsite inventory audits the exact four configs feeding T087.
-        if provider == "openai":
+        if provider in ("codex", "opencodego"):
+            mini_cfg = model_config.resolve_callsite_config("T087", provider)
+        elif provider == "openai":
             mini_cfg = config.MINI_UTIL_GPT54MINI_NONE
         elif provider == "gemini":
             mini_cfg = config.MINI_UTIL_GEMINI_FLASH_LOW

@@ -28,9 +28,11 @@ class EffectsAgentContractError(ValueError):
 
 def _provider_config():
     import config
-    from model_config import get_provider
+    from model_config import get_provider, resolve_callsite_config
 
     provider = get_provider()
+    if provider == "codex":
+        return provider, resolve_callsite_config("T078", provider)
     names = {
         "openai": "CHAR_EFFECTS_GPT52_NONE",
         "gemini": "CHAR_EFFECTS_GEMINI_FLASH_HIGH",

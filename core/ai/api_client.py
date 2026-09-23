@@ -10,7 +10,7 @@ model and params via named config dicts in model_config.py.
 import time
 from uuid import uuid4
 
-from utils.openai_client import get_openai_client
+from utils.openai_client import compatible_connection, get_openai_client
 
 _UNSET = object()  # sentinel: distinguishes "not provided" from "explicitly None"
 
@@ -363,6 +363,7 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
     # Observational transport-phase callback from the live-provider child
     # (#409): never forwarded to a provider, never affects routing.
     _phase_emit = kwargs.pop("_phase_emit", None)
+    connection_override = kwargs.pop("_connection_override", None)
 
     # create_completion() is a thin routing layer. It does NOT inject
     # reasoning_effort, thinking_level, or other params. The callsite
@@ -374,7 +375,11 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
     # --- Route to provider, then expose one response/error contract ---
     repaired = None
     try:
-        if request_provider in ("legacy", "openai", "lmstudio", "opencodego"):
+        if request_provider == "codex":
+            raw_response = _codex_completion(
+                messages, model, _response_format, _phase_emit, **kwargs,
+            )
+        elif request_provider in ("legacy", "openai", "lmstudio", "opencodego"):
             try:
                 raw_response = _openai_completion(
                     messages,
@@ -383,6 +388,7 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
                     request_provider,
                     response_format=_response_format,
                     phase_emit=_phase_emit,
+                    connection_override=connection_override,
                     **kwargs,
                 )
             except Exception as exc:
@@ -396,6 +402,7 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
                     request_provider,
                     response_format=_response_format,
                     phase_emit=_phase_emit,
+                    connection_override=connection_override,
                     **kwargs,
                 )
         else:  # gemini
@@ -426,6 +433,43 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
     if repaired is not None:
         normalized.sent_messages = repaired
     return normalized
+
+
+def _codex_completion(messages, model, response_format, phase_emit, **kwargs):
+    """Use Codex's ChatGPT login and quota through the official App Server."""
+    from core.ai.codex_client import CodexAppServer
+    from model_config import get_codex_model_choice
+
+    effort = kwargs.pop("reasoning_effort", "low")
+    deadline_seconds = kwargs.pop("timeout", None)
+    if kwargs:
+        raise ValueError("Unsupported Codex options: %s" % ", ".join(sorted(kwargs)))
+    choice = get_codex_model_choice()
+    if choice == "gpt-6-astra":
+        model = choice
+    elif model == "gpt-6-astra":
+        raise ValueError("Astra requires an explicit player selection in Settings.")
+    # A server per call keeps turn notifications separate when game tasks run
+    # concurrently. It also makes the provider child's cancellation disposable.
+    with CodexAppServer() as server:
+        result = server.complete(
+            messages, model, effort,
+            response_format=({"type": "json_object"} if response_format is _UNSET
+                             else response_format),
+            phase_emit=phase_emit,
+            timeout=deadline_seconds,
+        )
+    usage = result["usage"]
+    return _AssembledCompletion(
+        result["text"], "stop",
+        _Usage(
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            total_tokens=usage["total_tokens"],
+            cached_tokens=usage["cached_tokens"],
+            reasoning_tokens=usage["reasoning_tokens"],
+        ), result["id"], result["model"],
+    )
 
 
 def normalize_local_template_messages(messages):
@@ -768,18 +812,12 @@ def _chat_stream_completion(client, call_kwargs, phase_emit):
     )
 
 
-def _opencodego_call_kwargs(messages, model, temperature, response_format, **kwargs):
-    """Assemble the Chat Completions payload for the OpenCode Go endpoint.
-
-    Mirrors the legacy/lmstudio payload shape: temperature passes through
-    unless a constraint stripped it, JSON mode defaults ON (opt-out with an
-    explicit None), and reasoning_effort is forwarded for DeepSeek models.
-    """
+def _compatible_chat_kwargs(messages, model, temperature, response_format,
+                            strip_temp=False, **kwargs):
+    """Assemble one Chat Completions payload for Legacy, Local and Go."""
     call_kwargs = {"model": model, "messages": messages}
-    if temperature is not None and not kwargs.pop("_strip_temperature", False):
+    if temperature is not None and not strip_temp:
         call_kwargs["temperature"] = temperature
-    else:
-        kwargs.pop("_strip_temperature", None)
 
     if response_format is _UNSET:
         call_kwargs["response_format"] = {"type": "json_object"}
@@ -792,20 +830,27 @@ def _opencodego_call_kwargs(messages, model, temperature, response_format, **kwa
     return call_kwargs
 
 
+def _opencodego_call_kwargs(messages, model, temperature, response_format, **kwargs):
+    """Compatibility wrapper for callers importing the old Go payload helper."""
+    return _compatible_chat_kwargs(
+        messages, model, temperature, response_format,
+        strip_temp=kwargs.pop("_strip_temperature", False), **kwargs,
+    )
+
+
 def _openai_completion(messages, model, temperature, provider, response_format=_UNSET,
-                       phase_emit=None, **kwargs):
+                       phase_emit=None, connection_override=None, **kwargs):
     """Execute a completion via the OpenAI-compatible API."""
-    client = get_openai_client(provider=provider)
+    client = get_openai_client(provider=provider, endpoint_override=connection_override)
 
     # Issue #120: honor a user-set custom model for the Local/Custom provider
     # WITHOUT touching any of the 67 per-callsite model dicts. Empty => keep the
     # callsite's own model string. Scoped to lmstudio only; no other provider or
     # param is affected (create_completion remains a thin router).
-    if provider == "lmstudio":
-        import model_config
-        _local_model = model_config.get_local_endpoint().get("model")
-        if _local_model:
-            model = _local_model
+    if provider in ("lmstudio", "opencodego"):
+        connection = compatible_connection(provider, connection_override)
+        if connection["model"]:
+            model = connection["model"]
 
         # LM Studio/OpenAI-compatible servers do not agree on support for the
         # OpenAI ``json_object`` response mode. Older LM Studio versions reject
@@ -814,10 +859,10 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
         # and production parsers/retries, so omit only this unsupported mode at
         # the provider adapter. Preserve an explicit json_schema for endpoints
         # that support it, and leave OpenAI/legacy behavior unchanged.
-        if response_format is _UNSET or (
+        if not connection["json_object"] and (response_format is _UNSET or (
             isinstance(response_format, dict)
             and response_format.get("type") == "json_object"
-        ):
+        )):
             response_format = None
 
     # Pop internal flags
@@ -844,36 +889,9 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
             phase_emit, **kwargs,
         )
 
-    if provider == "opencodego":
-        # OpenCode Go serves deepseek-v4.1-flash over Chat Completions only
-        # (the Go endpoint has no Responses surface for this model).
-        # Reasoning effort travels as "reasoning_effort" (OpenAI-compatible
-        # extension understood by the Go gateway); temperature is always
-        # accepted. JSON mode follows the same default-ON contract as
-        # legacy/lmstudio below, with the same explicit-None opt-out.
-        return _chat_stream_completion(
-            client,
-            _opencodego_call_kwargs(
-                messages, model, temperature, response_format, **kwargs
-            ),
-            phase_emit,
-        )
-
-    call_kwargs = {"model": model, "messages": messages}
-
-    # Temperature: pass through unless stripped by constraint enforcement
-    if temperature is not None and not strip_temp:
-        call_kwargs["temperature"] = temperature
-
-    # JSON mode: default ON, opt-out with response_format=None
-    if response_format is _UNSET:
-        call_kwargs["response_format"] = {"type": "json_object"}
-    elif response_format is not None:
-        call_kwargs["response_format"] = response_format
-    # else: response_format=None means plain text (no JSON mode)
-
-    # Forward remaining kwargs (reasoning_effort, max_tokens, etc.)
-    call_kwargs.update(kwargs)
+    call_kwargs = _compatible_chat_kwargs(
+        messages, model, temperature, response_format, strip_temp, **kwargs,
+    )
 
     return _chat_stream_completion(client, call_kwargs, phase_emit)
 

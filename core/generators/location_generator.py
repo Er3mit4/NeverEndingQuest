@@ -525,7 +525,7 @@ def _t026_request_options(
         key: value for key, value in main_cfg.items() if key != "model"
     }
 
-    if provider in {"openai", "legacy"}:
+    if provider in {"openai", "legacy", "codex"}:
         response_format = {
             "type": "json_schema",
             "json_schema": {
@@ -542,6 +542,8 @@ def _t026_request_options(
             preserve_required=True,
             preserve_constraints=True,
         )
+        response_format = {"type": "json_object"}
+    elif provider == "opencodego":
         response_format = {"type": "json_object"}
     elif provider == "lmstudio":
         # Local OpenAI-compatible servers disagree on schema-format support.

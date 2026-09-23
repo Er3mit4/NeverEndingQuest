@@ -379,7 +379,10 @@ def _config_for_provider(provider: str) -> Dict[str, Any]:
     # OpenAI/legacy use plain JSON mode plus client-side response validation.
     # Gemini needs response_schema or it silently drops the enriched fields
     # (T014-class bug). Never attach response_schema on the OpenAI path (400).
-    if provider == "openai":
+    if provider == "codex":
+        selected = model_config.resolve_callsite_config("T105", "codex")
+        selected["response_format"] = {"type": "json_object"}
+    elif provider == "openai":
         selected = copy.deepcopy(model_config.NPC_VOICE_T105_OPENAI_LUNA_NONE)
         selected["response_format"] = {"type": "json_object"}
     elif provider == "gemini":

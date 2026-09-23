@@ -13,6 +13,7 @@ Slim, code-pinned references for the application's functional systems.
 | Startup and boot | [startup-boot.md](startup-boot.md) |
 | Module lifecycle | [module-lifecycle.md](module-lifecycle.md) |
 | Provider routing | [provider-routing.md](provider-routing.md) |
+| Codex GPT-6 provider | [codex-gpt6-provider.md](codex-gpt6-provider.md) |
 | OpenCode Go provider (custom fork) | [opencode-go-provider.md](opencode-go-provider.md) |
 | Progression and leveling | [progression-leveling.md](progression-leveling.md) |
 | Web, headless, and terminal surfaces | [web-headless-surfaces.md](web-headless-surfaces.md) |

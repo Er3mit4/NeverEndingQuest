@@ -1728,18 +1728,12 @@ def get_ai_response(conversation, response_format=None, *, persist_response=True
         LiveProviderSuperseded, finish_live_turn_scope, open_live_turn_scope,
         _interruptible_wait, _delay_for_error,
     )
-    from model_config import MODEL_PROVIDER
+    from model_config import MODEL_PROVIDER, resolve_callsite_config
 
     owned = live_scope is None
     scope = open_live_turn_scope() if owned else live_scope
     provider = MODEL_PROVIDER
-    main_cfg = {
-        "openai": config.DM_MAIN_GPT52_NONE,
-        "gemini": config.DM_MAIN_GEMINI_PRO_LOW,
-        "lmstudio": config.DM_MAIN_LMSTUDIO,
-        "legacy": config.DM_MAIN_LEGACY,
-        "opencodego": config.DM_MAIN_OPENCODEGO,
-    }[provider]
+    main_cfg = resolve_callsite_config("T092", provider)
 
     request_messages = copy.deepcopy(conversation)
     _emit_startup_phase(startup_phase)
@@ -1831,19 +1825,13 @@ def _validate_starting_location(candidate):
 
 def get_ai_starting_location(module, request_provider=None, *, live_scope=None):
     """Have T093 choose an entry from the installed module; never invent IDs."""
-    from model_config import MODEL_PROVIDER
+    from model_config import MODEL_PROVIDER, resolve_callsite_config
     from utils.capture.live_provider_call import (
         LiveProviderSuperseded, _interruptible_wait, _delay_for_error,
     )
 
     provider = request_provider or MODEL_PROVIDER
-    profiles = {
-        "openai": config.MINI_UTIL_GPT54MINI_NONE,
-        "gemini": config.MINI_UTIL_GEMINI_FLASH_LOW,
-        "lmstudio": config.MINI_UTIL_LMSTUDIO,
-        "opencodego": config.MINI_UTIL_OPENCODEGO,
-    }
-    mini_cfg = profiles.get(provider, config.MINI_UTIL_LEGACY)
+    mini_cfg = resolve_callsite_config("T093", provider)
     module_name = module["moduleName"]
     with _startup_operation(live_scope) as scope:
         _emit_startup_phase("startup_location")

@@ -85,7 +85,10 @@ export interface ClientEvents {
   request_module_list: undefined;
   // --- local-edition operator settings (hidden when VITE_EDITION=hosted) ---
   get_model_provider: undefined;
-  set_model_provider: { provider: 'legacy' | 'openai' | 'gemini' | 'lmstudio' | 'opencodego' };
+  set_model_provider: { provider: 'legacy' | 'openai' | 'codex' | 'gemini' | 'lmstudio' | 'opencodego' };
+  get_codex_status: undefined;
+  start_codex_login: undefined;
+  set_codex_model: { model: 'auto' | 'gpt-6-astra' };
   get_local_endpoint: undefined;
   set_local_endpoint: { base_url: string; api_key?: string; model: string };
   get_openai_key: undefined;
@@ -130,6 +133,9 @@ export const CLIENT_EVENT_ARITY = {
   request_module_list: 0,
   get_model_provider: 0,
   set_model_provider: 1,
+  get_codex_status: 0,
+  start_codex_login: 0,
+  set_codex_model: 1,
   get_local_endpoint: 0,
   set_local_endpoint: 1,
   get_openai_key: 0,
@@ -201,6 +207,9 @@ export interface ServerEvents {
   map_data_response: { data: MapDataPayload | null; error?: string; request_id?: string; revision?: number; server_instance_id?: string };
   exit_acknowledged: { message: string };
   provider_changed: { provider: string };
+  codex_status: { state: string; plan: string | null; model_choice: 'auto' | 'gpt-6-astra'; models: Array<{ model: string; efforts: string[] }>; quota: { ordinary_usage_allowed: boolean | null; primary: { usedPercent: number | null; resetsAt: number | null } | null; secondary: { usedPercent: number | null; resetsAt: number | null } | null; rate_limit_reached_type: string | null } | null; error: string | null };
+  codex_login: { ok: boolean; already_connected?: boolean; verificationUrl?: string; userCode?: string; loginId?: string; error?: string };
+  codex_model_changed: { model: 'auto' | 'gpt-6-astra' };
   local_endpoint_changed: { base_url: string; model: string; has_key: boolean };
   openai_key_status: { has_key: boolean };
   gemini_key_status: { has_key: boolean };
