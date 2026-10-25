@@ -17,7 +17,9 @@ export type MessageType =
   | 'info'
   | 'error'
   | 'startup'
-  | 'debug';
+  | 'debug'
+  /** #882: composer text offered by the game; never shown in the log. */
+  | 'input_suggestion';
 export interface GameMessage {
   type: MessageType;
   content: string;
@@ -61,7 +63,14 @@ export type PlayerDataResponse =
     };
 
 // ---------- client -> server (31) ----------
+export interface RulesRollPrompt {
+  id: string; characterName: string; label: string; faces: number;
+  netMode: string; reason: string; submitted: boolean; dc?: number | null;
+  dice?: { name: string; count: number; sides: number }[];
+}
+
 export interface ClientEvents {
+  submit_check_roll: { id: string; faces: number[] | null };
   user_input: { input: string };
   action: {
     action: 'listSaves' | 'saveGame' | 'restoreGame' | 'deleteSave' | 'nuclearReset' | 'recover_startup_handoff';
@@ -113,6 +122,7 @@ export interface ClientEvents {
  * raise a TypeError when handed the latter.
  */
 export const CLIENT_EVENT_ARITY = {
+  submit_check_roll: 1,
   user_input: 1,
   action: 1,
   start_game: 0,
@@ -161,7 +171,28 @@ export interface RestoreResult {
   restart_required?: boolean;
 }
 
+/**
+ * #1271: the typed record of the model call that owns a processing status.
+ * Every field is the server's own state; the client renders it from fixed
+ * maps and never reads the status text.
+ */
+export interface WaitRecord {
+  kind: 'provider_call';
+  purpose: 'character_setup' | 'adventure_choice' | 'starting_location' | 'level_up' | 'combat' | 'turn' | string;
+  taskId: string;
+  provider: string | null;
+  providerName: string | null;
+  /** The attempt in progress, or during a retry wait the next one. */
+  attempt: number;
+  maxAttempts: number | null;
+  elapsedMs: number;
+  phase: string | null;
+  lastActivityMs: number | null;
+  retryInMs: number | null;
+}
+
 export interface ServerEvents {
+  roll_prompt: { prompt: RulesRollPrompt | null };
   connected: {
     data: string;
     capabilities?: UiProtocolCapabilities;
@@ -172,17 +203,19 @@ export interface ServerEvents {
   game_resumed: { is_processing: boolean; message: string };
   game_output: GameMessage;
   debug_output: { type: 'debug'; content: string; timestamp: string };
-  status_update: { message: string; is_processing: boolean; recovery_required?: boolean };
+  status_update: { message: string; is_processing: boolean; recovery_required?: boolean; wait?: WaitRecord | null };
   startup_status: { status: 'in_progress' | 'ready' | 'failed'; phase: string; startupAttemptId?: string };
   game_started: { message: string };
   startup_recovery_response: { status: string; error?: string; retryAfterSeconds?: number; expectedStartupAttemptId?: string };
   ui_state_snapshot: {
+    roll_prompt?: RulesRollPrompt | null;
     request_id?: string;
     revision: number;
     server_instance_id: string;
     game_running: boolean;
     is_processing: boolean;
     status_message: string;
+    wait?: WaitRecord | null;
     startup?: { status: 'idle' | 'in_progress' | 'ready' | 'failed'; phase: string; startupAttemptId?: string };
     operations?: {
       restore?: RestoreResult | null;
@@ -196,6 +229,8 @@ export interface ServerEvents {
   save_list_response: Array<Record<string, unknown>>;
   restore_complete: RestoreResult;
   reset_complete: { message: string };
+  /** #1285: setup reset another adventure's save; its lines leave the log. */
+  message_log_cleared: Record<string, never>;
   player_data_response: PlayerDataResponse;
   location_data_response: { data: { currentLocation: string; currentArea: string; currentLocationId: string; currentAreaId: string; time: string; day: number | string; month: string; year: number | string } | null; error?: string; request_id?: string; revision?: number; server_instance_id?: string };
   npc_details_response: { npcName: string; data: Record<string, unknown> | null; modalType: 'saves' | 'skills' | 'spells'; error?: string };
@@ -211,15 +246,30 @@ export interface ServerEvents {
   codex_login: { ok: boolean; already_connected?: boolean; verificationUrl?: string; userCode?: string; loginId?: string; error?: string };
   codex_model_changed: { model: 'auto' | 'gpt-6-astra' };
   local_endpoint_changed: { base_url: string; model: string; has_key: boolean };
-  openai_key_status: { has_key: boolean };
+  /** keychain=false: a saved key lives in user_settings.json (#1399 G3). */
+  openai_key_status: { has_key: boolean; keychain?: boolean };
+  /** #1399 G1: the typed result of checking a saved key; never the key or provider text. */
+  openai_key_check: {
+    result: 'checking' | 'no_new_key' | 'accepted' | 'rejected' | 'rate_limited' | 'denied' | 'no_quota' | 'unreachable';
+    has_key?: boolean; wait_seconds?: number | null; restart_needed?: boolean;
+  };
   gemini_key_status: { has_key: boolean };
   opencodego_key_status: { has_key: boolean };
   local_endpoint_test_result: { ok: boolean; detail: string };
   image_generated: { image_url: string; prompt: string; request_id?: string; source_message_id?: string };
   image_generation_error: { message: string; request_id?: string; source_message_id?: string };
-  token_update: { tpm: number; rpm: number; total_tokens: number };
+  token_update: {
+    tpm: number; rpm: number; total_tokens: number;
+    /** #1388: the session cost line, typed numbers only (absent on the fallback emit). */
+    spend?: {
+      calls: number; usd: number; prompt: number; cached: number; completion: number;
+      turn_calls: number; turn_usd: number; unpriced: number; possibly_billed: number;
+      portraits: number; voice: number; priced_at: string;
+      provider_kind: 'openai' | 'gemini' | 'local'; available: boolean;
+    };
+  };
   /** #214 D-214-4=A: background startup-welcome liveness (never input-locking). */
-  welcome_progress: { message: string };
+  welcome_progress: { message: string; kind?: 'opening_scene' | 'resume' };
   compression_start: { total_sections: number };
   compression_progress: { completed: number; total: number; from_cache: boolean };
   compression_complete: { reduction_percentage: number; original_size: number; compressed_size: number };

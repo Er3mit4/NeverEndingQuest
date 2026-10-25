@@ -81,7 +81,11 @@ def _react_bundle_is_usable(dist):
 
 
 def _replace_frontend_file(source, target):
-    """Sharing violations are busy, not a failed installation (#193 B2)."""
+    """Sharing violations are busy, not a failed installation (#193 B2).
+
+    The wait is shown once, then once every 10 seconds (#826).
+    """
+    started = next_report = None
     while True:
         try:
             os.replace(source, target)
@@ -89,7 +93,16 @@ def _replace_frontend_file(source, target):
         except OSError as exc:
             if getattr(exc, "winerror", None) not in {32, 33}:
                 raise
-            print("[SETUP] Waiting for the browser files to become available...")
+            now = time.monotonic()
+            if started is None:
+                started, next_report = now, now + 10
+                print("[SETUP] Waiting for the browser files to become available...")
+            elif now >= next_report:
+                next_report = now + 10
+                print(
+                    "[SETUP] Still waiting for the browser files (%d s); "
+                    "another program is using them." % (now - started)
+                )
             time.sleep(0.25)
 
 
@@ -279,21 +292,17 @@ def main(ui="react", toolkit=False):
         print("\nFirst-time setup detected...")
         
         try:
-            # Copy config_template.py to config.py
+            # Copy config_template.py to config.py and keep running (#1399 G5):
+            # the browser's Settings panel takes the key from here. The
+            # template's placeholder key is kept; no environment value is
+            # written into the file.
             shutil.copy('config_template.py', 'config.py')
+            try:
+                os.chmod('config.py', 0o600)
+            except OSError:
+                pass
             print("\n[OK] Created config.py from template")
-            print("\n" + "="*60)
-            print("AI Provider Setup")
-            print("="*60)
-            print("\nYour local config.py has been created.")
-            print("Run the game again, then use Settings -> AI Provider to choose:")
-            print("  - Legacy/OpenAI (OpenAI API key)")
-            print("  - Gemini (Gemini API key)")
-            print("  - Local (LM Studio or another compatible endpoint; no cloud key)")
-            print("\nYou may also edit config.py directly before restarting.")
-            print("\n" + "="*60)
-            input("\nPress Enter to exit...")
-            return
+            print("First start: open the game in your browser and add your OpenAI API key in Settings (the gear icon).")
         except Exception as e:
             print(f"[ERROR] Failed to create config.py: {e}")
             print("Please manually copy config_template.py to config.py")

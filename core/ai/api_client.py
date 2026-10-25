@@ -8,6 +8,7 @@ create_completion() is a thin routing layer. Callsites own their
 model and params via named config dicts in model_config.py.
 """
 import time
+from core.ai import history_markers as hm
 from uuid import uuid4
 
 from utils.openai_client import compatible_connection, get_openai_client
@@ -348,6 +349,8 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
     # --- Pop wrapper-only params (never forwarded to provider) ---
     task_id = kwargs.pop("task_id", None)
     request_provider = kwargs.pop("_request_provider", None)
+    # Private live-request snapshot; never an SDK payload or capture option.
+    local_endpoint = kwargs.pop("_request_local_endpoint", None)
     usage_invocation_id = kwargs.pop("_usage_invocation_id", None)
     if not isinstance(usage_invocation_id, str) or not usage_invocation_id.strip():
         usage_invocation_id = str(uuid4())
@@ -364,6 +367,9 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
     # (#409): never forwarded to a provider, never affects routing.
     _phase_emit = kwargs.pop("_phase_emit", None)
     connection_override = kwargs.pop("_connection_override", None)
+    # Per-callsite output ceiling (OpenAI only; set by the capture layer from
+    # model_registry.OPENAI_OUTPUT_CEILING_CHARS). Never forwarded to a provider.
+    _output_ceiling = kwargs.pop("_output_ceiling_chars", None)
 
     # create_completion() is a thin routing layer. It does NOT inject
     # reasoning_effort, thinking_level, or other params. The callsite
@@ -380,6 +386,11 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
                 messages, model, _response_format, _phase_emit, **kwargs,
             )
         elif request_provider in ("legacy", "openai", "lmstudio", "opencodego"):
+            local_options = (
+                {"local_endpoint": local_endpoint}
+                if request_provider == "lmstudio" and local_endpoint is not None
+                else {}
+            )
             try:
                 raw_response = _openai_completion(
                     messages,
@@ -389,6 +400,8 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
                     response_format=_response_format,
                     phase_emit=_phase_emit,
                     connection_override=connection_override,
+                    output_ceiling=_output_ceiling,
+                    **local_options,
                     **kwargs,
                 )
             except Exception as exc:
@@ -403,6 +416,8 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
                     response_format=_response_format,
                     phase_emit=_phase_emit,
                     connection_override=connection_override,
+                    output_ceiling=_output_ceiling,
+                    **local_options,
                     **kwargs,
                 )
         else:  # gemini
@@ -531,7 +546,9 @@ def _local_template_repair(provider, messages, exc):
     Reactive by design: a lenient local model that accepts the raw shape is never
     reshaped and its request stays byte-identical. Only a COMPLETED rejection
     (the server answered with a status) qualifies; a transport failure is not a
-    shape problem. The status code itself is not authority -- #179 observed the
+    shape problem. Authentication, access and payment refusals (401/402/403)
+    cannot be repaired by reshaping messages and must hand back immediately.
+    Other completed statuses retain the existing policy -- #179 observed the
     template error as a 500 and #389 observed the same error as a 400 from a
     newer LM Studio -- and provider prose is never parsed. If the reshape leaves
     the array unchanged the rejection was not about shape, and the caller
@@ -539,7 +556,7 @@ def _local_template_repair(provider, messages, exc):
     """
     if provider != "lmstudio" or not isinstance(messages, list):
         return None
-    if _completed_http_status(exc) is None:
+    if _completed_http_status(exc) in {None, 401, 402, 403}:
         return None
     repaired = normalize_local_template_messages(messages)
     if repaired == messages:
@@ -632,6 +649,67 @@ class ResponsesStreamFailed(Exception):
         super().__init__("%s: %s" % (code, message))
 
 
+# A degenerate stream: the model keeps emitting whitespace and nothing else.
+# Observed 2026-09-28 (T067, gpt-5.6-luna): a malformed JSON string followed by
+# 170 KB of tabs and spaces, 128,000 output tokens over 15 minutes, until the
+# provider's own output cap ended it. Every delta counted as liveness progress,
+# so the inactivity backstop never fired. No real answer, JSON or prose, carries
+# this much whitespace in a row; the stream is closed and the generation is
+# reissued through the existing retry path (code below is retryable).
+RUNAWAY_WHITESPACE_CHARS = 4096
+RUNAWAY_STREAM_CODE = "runaway_output"
+
+
+class _RunawayGuard:
+    """Counts the trailing run of whitespace-only output across stream deltas,
+    and the total output against the callsite's ceiling.
+
+    ``ceiling`` is the per-callsite output ceiling in characters
+    (model_registry.OPENAI_OUTPUT_CEILING_CHARS: four times the 95th
+    percentile of the callsite's captured answers). An answer past it is
+    aberrant by measurement, never a longer-than-usual real answer, and is
+    abandoned so the identical request is reissued (prompt cache intact).
+    """
+
+    def __init__(self, limit=RUNAWAY_WHITESPACE_CHARS, ceiling=None):
+        self.limit = limit
+        self.ceiling = ceiling if isinstance(ceiling, int) and ceiling > 0 else None
+        self.run = 0
+        self.total = 0
+        self.why = None
+
+    def feed(self, text):
+        """Return True when the stream has become a runaway."""
+        if not text:
+            return False
+        self.total += len(text)
+        stripped = text.rstrip()
+        if stripped:
+            self.run = len(text) - len(stripped)
+        else:
+            self.run += len(text)
+        if self.run >= self.limit:
+            self.why = "%d whitespace characters in a row after %d characters of output" % (
+                self.run, self.total)
+            return True
+        if self.ceiling is not None and self.total > self.ceiling:
+            self.why = "%d characters of output, past the callsite ceiling of %d" % (
+                self.total, self.ceiling)
+            return True
+        return False
+
+
+def _abandon_runaway(stream, guard, phase_emit):
+    _phase(phase_emit, "runaway", guard.total)
+    close = getattr(stream, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+    raise ResponsesStreamFailed(RUNAWAY_STREAM_CODE, guard.why or "runaway output")
+
+
 def _phase(phase_emit, phase, detail=None):
     if phase_emit is None:
         return
@@ -669,8 +747,34 @@ def _responses_text_format(response_format):
     return dict(response_format)
 
 
+def _answer_item(index, phases):
+    """Whether an output item's text belongs to the answer (#961).
+
+    GPT-6 models may stream a ``commentary`` message before the
+    ``final_answer`` message; joining both yields two JSON objects back to
+    back. When the model labels a final answer, only that text is the answer;
+    unlabelled output (older models) is kept whole."""
+    if "final_answer" not in phases.values():
+        return True
+    return phases.get(index) == "final_answer"
+
+
+def _final_answer_text(final):
+    """The answer text read from a completed Responses object, by the same rule
+    as the streamed deltas: final_answer messages when labelled, else all."""
+    messages = [item for item in (getattr(final, "output", None) or [])
+                if getattr(item, "type", None) == "message"]
+    if not messages:
+        return getattr(final, "output_text", "") or ""
+    if any(getattr(item, "phase", None) == "final_answer" for item in messages):
+        messages = [item for item in messages if getattr(item, "phase", None) == "final_answer"]
+    return "".join(getattr(part, "text", "") or "" for item in messages
+                   for part in (getattr(item, "content", None) or [])
+                   if getattr(part, "type", None) == "output_text")
+
+
 def _responses_stream_completion(client, messages, model, temperature, strip_temp,
-                                 response_format, phase_emit, **kwargs):
+                                 response_format, phase_emit, output_ceiling=None, **kwargs):
     """One streamed Responses request assembled into a ChatCompletion-shaped
     answer. The stream is consumed here only for liveness (D-PROVIDER-
     LIVENESS): nothing partial leaves this function.
@@ -704,8 +808,10 @@ def _responses_stream_completion(client, messages, model, temperature, strip_tem
     _phase(phase_emit, "endpoint", "responses")
     stream = client.responses.create(**call_kwargs)
     parts = []
+    phases = {}  # output_index -> message phase ("commentary" / "final_answer"), when the model labels it
     final = None
     last_receiving = 0.0
+    runaway = _RunawayGuard(ceiling=output_ceiling)
     for event in stream:
         kind = getattr(event, "type", "")
         if kind == "response.created":
@@ -713,11 +819,20 @@ def _responses_stream_completion(client, messages, model, temperature, strip_tem
         elif kind == "response.output_text.delta":
             # Every delta is progress; report it at most once a second so a
             # long answer keeps refreshing the last-progress clock without a
-            # frame per token (audit F2).
+            # frame per token (audit F2). A delta that only extends a run of
+            # whitespace is not an answer arriving: past the bound the
+            # stream is abandoned and reissued.
+            if runaway.feed(event.delta):
+                _abandon_runaway(stream, runaway, phase_emit)
             if not parts or time.monotonic() - last_receiving >= 1.0:
                 _phase(phase_emit, "receiving")
                 last_receiving = time.monotonic()
-            parts.append(event.delta)
+            parts.append((getattr(event, "output_index", None), event.delta))
+        elif kind == "response.output_item.added":
+            item = getattr(event, "item", None)
+            if getattr(item, "type", None) == "message" and getattr(item, "phase", None):
+                phases[getattr(event, "output_index", None)] = item.phase
+            _phase(phase_emit, "working", kind)
         elif kind in ("response.completed", "response.incomplete"):
             final = event.response
         elif kind == "response.failed":
@@ -733,11 +848,11 @@ def _responses_stream_completion(client, messages, model, temperature, strip_tem
             _phase(phase_emit, "working", kind)
     if final is None:
         raise ResponsesStreamFailed("stream_ended", "no terminal response event")
-    content = "".join(parts)
+    content = "".join(delta for index, delta in parts if _answer_item(index, phases))
     if not content:
         # A completed Responses answer whose text is not in the deltas
         # (defensive read of the final object; same text, never a second value).
-        content = getattr(final, "output_text", "") or ""
+        content = _final_answer_text(final)
     finish_reason = "stop"
     details = getattr(final, "incomplete_details", None)
     if getattr(final, "status", "") == "incomplete":
@@ -759,7 +874,7 @@ def _responses_stream_completion(client, messages, model, temperature, strip_tem
     )
 
 
-def _chat_stream_completion(client, call_kwargs, phase_emit):
+def _chat_stream_completion(client, call_kwargs, phase_emit, output_ceiling=None):
     """One streamed Chat Completions request (legacy OpenAI models, LM Studio
     and other OpenAI-compatible servers) assembled into the completed answer.
     The first chunk is the acknowledgment; content deltas are progress."""
@@ -775,6 +890,7 @@ def _chat_stream_completion(client, call_kwargs, phase_emit):
     reported_model = ""
     acknowledged = False
     last_receiving = 0.0
+    runaway = _RunawayGuard(ceiling=output_ceiling)
     for chunk in stream:
         if not acknowledged:
             _phase(phase_emit, "acknowledged")
@@ -790,6 +906,8 @@ def _chat_stream_completion(client, call_kwargs, phase_emit):
         delta = getattr(choice, "delta", None)
         text = getattr(delta, "content", None) if delta is not None else None
         if text:
+            if runaway.feed(text):
+                _abandon_runaway(stream, runaway, phase_emit)
             if not parts or time.monotonic() - last_receiving >= 1.0:
                 _phase(phase_emit, "receiving")
                 last_receiving = time.monotonic()
@@ -815,7 +933,13 @@ def _chat_stream_completion(client, call_kwargs, phase_emit):
 def _compatible_chat_kwargs(messages, model, temperature, response_format,
                             strip_temp=False, **kwargs):
     """Assemble one Chat Completions payload for Legacy, Local and Go."""
-    call_kwargs = {"model": model, "messages": messages}
+    # Chat Completions receives each history message as stored; the game's
+    # own fields are not part of the provider's message shape.
+    call_kwargs = {"model": model, "messages": [
+        {k: v for k, v in message.items() if k not in hm.GAME_FIELDS}
+        if isinstance(message, dict) else message
+        for message in messages
+    ]}
     if temperature is not None and not strip_temp:
         call_kwargs["temperature"] = temperature
 
@@ -839,16 +963,19 @@ def _opencodego_call_kwargs(messages, model, temperature, response_format, **kwa
 
 
 def _openai_completion(messages, model, temperature, provider, response_format=_UNSET,
-                       phase_emit=None, connection_override=None, **kwargs):
+                       phase_emit=None, connection_override=None, output_ceiling=None,
+                       local_endpoint=None, **kwargs):
     """Execute a completion via the OpenAI-compatible API."""
-    client = get_openai_client(provider=provider, endpoint_override=connection_override)
+    endpoint_override = (connection_override if connection_override is not None
+                         else local_endpoint)
+    client = get_openai_client(provider=provider, endpoint_override=endpoint_override)
 
     # Issue #120: honor a user-set custom model for the Local/Custom provider
     # WITHOUT touching any of the 67 per-callsite model dicts. Empty => keep the
     # callsite's own model string. Scoped to lmstudio only; no other provider or
     # param is affected (create_completion remains a thin router).
     if provider in ("lmstudio", "opencodego"):
-        connection = compatible_connection(provider, connection_override)
+        connection = compatible_connection(provider, endpoint_override)
         if connection["model"]:
             model = connection["model"]
 
@@ -886,14 +1013,14 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
         # Chat Completions cannot give.
         return _responses_stream_completion(
             client, messages, model, temperature, strip_temp, response_format,
-            phase_emit, **kwargs,
+            phase_emit, output_ceiling=output_ceiling, **kwargs,
         )
 
     call_kwargs = _compatible_chat_kwargs(
         messages, model, temperature, response_format, strip_temp, **kwargs,
     )
 
-    return _chat_stream_completion(client, call_kwargs, phase_emit)
+    return _chat_stream_completion(client, call_kwargs, phase_emit, output_ceiling=output_ceiling)
 
 
 # ---------------------------------------------------------------------------

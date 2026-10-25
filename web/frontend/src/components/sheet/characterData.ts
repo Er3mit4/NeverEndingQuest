@@ -120,7 +120,9 @@ export function proficientSkills(data: Record<string, unknown>): string[] {
 
 /**
  * Skill bonus: prefer the stored bonus (old object format); otherwise
- * ability modifier plus proficiency bonus when proficient.
+ * ability modifier plus proficiency bonus when proficient, or twice the
+ * proficiency bonus for a skill in the typed expertise list (#1307; the
+ * repository's rule in core/nql/stats.py).
  */
 export function skillBonus(
   skill: string,
@@ -133,9 +135,10 @@ export function skillBonus(
     if (direct !== null) return direct
   }
   const mod = abilityModifier(abilityScores(data)[ability])
-  return proficientSkills(data).includes(skill)
-    ? mod + num(data['proficiencyBonus'], 2)
-    : mod
+  const pb = num(data['proficiencyBonus'], 2)
+  const expertise = strings(data['expertise']).map((s) => s.toLowerCase())
+  if (expertise.includes(skill.toLowerCase())) return mod + 2 * pb
+  return proficientSkills(data).includes(skill) ? mod + pb : mod
 }
 
 // ---------- saving throws ----------
@@ -195,6 +198,18 @@ export function skillRows(data: Record<string, unknown>): SkillRow[] {
     return rows
   }
   return []
+}
+
+/** All eighteen skills A-Z with bonus and proficiency, for the player sheet's Skills list. */
+export function allSkillRows(data: Record<string, unknown>): Array<SkillRow & { proficient: boolean }> {
+  const proficient = proficientSkills(data)
+  return Object.entries(SKILL_MAP)
+    .flatMap(([abilityLabel, skills]) => skills.map((name) => ({
+      name,
+      proficient: proficient.includes(name),
+      bonus: skillBonus(name, abilityLabel.toLowerCase() as AbilityName, data),
+    })))
+    .sort((a, b) => a.name.localeCompare(b.name))
 }
 
 // ---------- hit points ----------

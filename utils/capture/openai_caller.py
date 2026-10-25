@@ -6,8 +6,7 @@ and other supported request options are copied from the real request.
 """
 
 import time
-
-from openai import OpenAI
+from core.ai import history_markers as hm
 
 
 _client = None
@@ -18,7 +17,9 @@ def _get_client():
     if _client is None:
         import config
 
-        _client = OpenAI(api_key=config.OPENAI_API_KEY)
+        from utils.openai_client import openai_api_client
+
+        _client = openai_api_client(api_key=config.OPENAI_API_KEY)
     return _client
 
 
@@ -26,7 +27,11 @@ def build_openai_params(
     variant, messages, caller_temperature=None, caller_kwargs=None
 ):
     """Build detached SDK kwargs without changing the callsite contract."""
-    params = {"model": variant["model"], "messages": messages}
+    # The game's own fields are not part of the provider's message shape.
+    params = {"model": variant["model"], "messages": [
+        {k: v for k, v in m.items() if k not in hm.GAME_FIELDS} if isinstance(m, dict) else m
+        for m in messages
+    ]}
 
     if variant.get("reasoning_effort") is not None:
         params["reasoning_effort"] = variant["reasoning_effort"]

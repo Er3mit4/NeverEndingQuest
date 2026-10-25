@@ -80,6 +80,7 @@ The system uses modules as self-contained adventures with hub-and-spoke conversa
 - `module_builder.py` = ORCHESTRATOR (manages workflow, calls generators)
 - `module_generator.py` = WORKER (actual implementation, area connections, location IDs)
 - **Always fix bugs in module_generator.py, NOT module_builder.py**
+- Exception: the module declaration emitter (`ModuleBuilder.emit_module_declaration`) runs in the orchestrator, after publication id normalization.
 
 #### 3. Manager Pattern Implementation
 Major subsystems use dedicated managers:
@@ -134,7 +135,7 @@ GPT5_MINI_MODEL = "gpt-5-mini-2025-08-07"         # GPT-5 mini
 GPT5_FULL_MODEL = "gpt-5-2025-08-07"              # GPT-5 full
 
 # Intelligent routing based on action complexity
-ENABLE_INTELLIGENT_ROUTING = True                  # Action-based model selection
+ENABLE_INTELLIGENT_ROUTING = False                 # Legacy T082 routing; off by default since D-COST-1
 USE_COMPRESSED_COMBAT = True                       # Compressed combat prompts
 ```
 

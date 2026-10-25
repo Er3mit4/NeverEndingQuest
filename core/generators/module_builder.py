@@ -36,13 +36,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 # Import all generators - handle both direct execution and module import
 try:
     # Try relative imports first (when imported as module)
-    from .module_generator import ModuleGenerator
+    from .module_generator import ModuleGenerator, get_location_prefix, registered_location_prefixes
     from .plot_generator import PlotGenerator
     from .location_generator import LocationGenerator
     from .area_generator import AreaGenerator, AreaConfig
 except ImportError:
     # Fall back to absolute imports (when run directly)
-    from core.generators.module_generator import ModuleGenerator
+    from core.generators.module_generator import ModuleGenerator, get_location_prefix, registered_location_prefixes
     from core.generators.plot_generator import PlotGenerator
     from core.generators.location_generator import LocationGenerator
     from core.generators.area_generator import AreaGenerator, AreaConfig
@@ -57,13 +57,13 @@ from core.ai.module_creation_contract import (
     GAME_MODULE_POLICY,
     MODULE_ADVENTURE_TYPES,
     MODULE_SPEC_FIELDS,
+    ModuleCreationBusyError,
     ModuleCreationCancelledError,
     ModuleCreationContractError,
     ModuleCreationFailedError,
     ModuleCreationPolicy,
     ModuleCreationRecoveryRequiredError,
     ModuleCreationSpec,
-    extract_labeled_module_values,
     extract_typed_module_overrides,
     get_module_creation_policy,
 )
@@ -102,6 +102,33 @@ _STORY_FIRST_PROVIDER_FALLBACK_MESSAGE = (
 )
 
 
+def _publication_step(prepare_candidate, builder_holder):
+    """The one publication step every entry path runs on its hidden candidate,
+    before the commit rename (utils/module_publish.publish_module_atomic).
+
+    Order matters: ids are normalized first (the caller's prepare_candidate,
+    i.e. the stitcher, when one is supplied), then the module declaration is
+    written. The stitcher re-prefix is positional and rewrites only the files
+    it knows, so a declaration written before it would keep stale ids. The
+    returned value is prepare_candidate's registry bytes, unchanged (None when
+    there is no prepare_candidate, as before: no registry write).
+    """
+    def step(candidate_path, final_name):
+        registry_bytes = None
+        if prepare_candidate is not None:
+            registry_bytes = prepare_candidate(candidate_path, final_name)
+        builder = builder_holder.get("builder")
+        if builder is not None and builder.emit_module_declaration():
+            from core.generators.module_declaration import load_declared_world, reach_check
+
+            verdict = load_declared_world(candidate_path, final_name)
+            verdict.update(reach_check(candidate_path, final_name))
+            builder.record_engine_verdict(verdict)
+        return registry_bytes
+
+    return step
+
+
 def _run_managed_module_build(
     *,
     requested_name,
@@ -115,23 +142,51 @@ def _run_managed_module_build(
 
     Runs story-first once, then safely dials down to the compatible generator on
     a bounded set of model-format exhaustion errors. Each attempt gets a FRESH
-    temp workspace via ``publish_module_atomic``; an ordinary build failure
-    removes its workspace best-effort and NEVER touches ``modules/<name>``. A
-    hard process crash can leave only a hidden, ignored workspace for P2c's
-    orphan sweep. A failed build is a failed action, not a broken or corrupted
-    game (fail-forward). Local durability, authentication, cancellation, and
-    interruption failures deliberately bypass this fallback.
+    reserved temp workspace; an ordinary build failure removes its workspace
+    best-effort and NEVER touches ``modules/<name>``. A hard process crash can
+    leave only a hidden workspace, which keeps its name reserved (the next
+    build of that name gets a value suffix). A failed build is a failed action,
+    not a broken or corrupted game (fail-forward). Local durability,
+    authentication, cancellation, and interruption failures deliberately
+    bypass this fallback.
+
+    module_refresh_lock is held only to reserve the name and to publish, not
+    while the attempt generates (issue #708), so Save, Load and travel do not
+    wait for a build's model calls.
     """
-    from utils.module_publish import publish_module_atomic
+    from utils.module_publish import (
+        discard_reservation,
+        publish_reserved,
+        reserve_build_workspace,
+    )
     from utils.module_refresh_lock import module_refresh_lock
 
     def run(candidate):
-        return publish_module_atomic(
-            requested_name,
-            candidate,
-            modules_dir="modules",
-            prepare_registry_fn=prepare_registry_fn,
-        )
+        # Reserve: short, and before anything is spent, so a lock that stays
+        # busy still refuses, as before.
+        with module_refresh_lock() as acquired:
+            if not acquired:
+                raise ModuleCreationBusyError(
+                    "Module creation is busy; no game state was changed. "
+                    "Please retry shortly."
+                )
+            reservation = reserve_build_workspace(
+                requested_name, modules_dir="modules"
+            )
+        try:
+            # Generate without the lock, into the private workspace.
+            candidate(reservation.candidate_path, reservation.module_name)
+            # Publish: the registry preparation, the occupancy guard, the
+            # rename and the registry write stay serialized. The build is
+            # already paid for, so a busy lock is waited for, never refused.
+            with _build_refresh_wait(_progress_wait_reporter(progress_callback)):
+                return publish_reserved(
+                    reservation,
+                    prepare_registry_fn=prepare_registry_fn,
+                )
+        except BaseException:
+            discard_reservation(reservation)
+            raise
 
     def _build_and_publish():
         if not use_story_first:
@@ -172,19 +227,54 @@ def _run_managed_module_build(
             )
         return run(compatible_candidate)
 
-    # SHARED orchestration lock. The former ManagedModuleBuilder.run() acquired
-    # module_refresh_lock for EVERY build entry point (in-game, toolkit, headless,
-    # interactive); publish_module_atomic only ASSERTS ownership, so the lock must
-    # be taken HERE -- the one boundary all callers funnel through -- or the
-    # toolkit/headless/interactive callers fail the ownership assert. Reentrant:
-    # the in-game path already holds it (thread-local depth), so this nests safely.
-    with module_refresh_lock() as acquired:
-        if not acquired:
-            raise ModuleCreationFailedError(
-                "Module creation is busy; no game state was changed. "
-                "Please retry shortly."
-            )
-        return _build_and_publish()
+    # SHARED orchestration boundary. Every build entry point (in-game, toolkit,
+    # headless, interactive) funnels through here, and run() takes
+    # module_refresh_lock itself around the reserve and the publish (the
+    # publish helpers only ASSERT ownership). Reentrant: a caller that still
+    # holds the lock nests safely, but then generates under it.
+    return _build_and_publish()
+
+
+_BUILD_REFRESH_WAIT_LINE = (
+    "Waiting for other game work to finish before continuing your module "
+    "(%d seconds)."
+)
+
+
+def _build_refresh_wait(on_wait=None):
+    """Hold module refresh inside a build that has already spent model calls.
+
+    Waits instead of refusing (issue #708): a Save, a departure or another
+    build's publish can hold the lock for a while, and dropping a paid build
+    for that would waste it. ``on_wait(line)`` passes the waiting line to the
+    build's progress callback; that callback raising (an operator cancel)
+    ends the wait.
+    """
+    from utils.module_refresh_lock import wait_for_module_refresh
+
+    return wait_for_module_refresh(
+        lambda seconds: _BUILD_REFRESH_WAIT_LINE % seconds,
+        on_wait=on_wait,
+    )
+
+
+def _progress_wait_reporter(progress_callback):
+    """``on_wait`` for a build's web-shaped progress callback."""
+    if not progress_callback:
+        return None
+
+    def on_wait(line):
+        progress_callback(
+            {
+                "stage": 8,
+                "total_stages": 9,
+                "stage_name": "Waiting",
+                "percentage": 88,
+                "message": line,
+            }
+        )
+
+    return on_wait
 
 
 def _is_auth_error(exc):
@@ -212,28 +302,6 @@ def _is_auth_error(exc):
             "unauthorized",
         )
     )
-
-
-def _flag_unknown_plot_ids(plot_hooks, valid_ids):
-    """Return the set of PP###/SQ### IDs referenced in plot_hooks but not in valid_ids.
-
-    MED-5 (#127): T029 can bake hallucinated plot-point IDs into per-location
-    plotHooks. This scans the hook strings and reports unknown IDs so the builder
-    can warn (we do NOT silently drop the hook text -- it may be valid prose).
-    """
-    referenced = set()
-    for hook in (plot_hooks or []):
-        if isinstance(hook, str):
-            referenced.update(re.findall(r"\b(?:PP|SQ)\d{3}\b", hook))
-    return referenced - set(valid_ids or [])
-
-
-def _looks_like_npc_name(value: Any) -> bool:
-    """Reject prose paragraphs without trying to invent a replacement name."""
-    if not isinstance(value, str):
-        return False
-    candidate = " ".join(value.split())
-    return bool(candidate) and len(candidate) <= 120 and len(candidate.split()) <= 18
 
 
 def _project_locations_into_context(context, area_id: str, locations) -> None:
@@ -274,6 +342,51 @@ def _useful_string(value, field):
     return value.strip()
 
 
+# D-COST-5 F2: the one definition of T028's fields. The validator and the
+# strict request schema both read these, so they cannot drift.
+_T028_ROOT_FIELDS = (
+    "plotTitle", "mainObjective", "plotPoints", "activeQuests",
+    "completedQuests", "failedQuests", "worldEvents", "dmNotes",
+)
+_T028_PLOT_POINT_FIELDS = (
+    "id", "title", "description", "location", "nextPoints", "status",
+    "plotImpact", "sideQuests",
+)
+_T028_SIDE_QUEST_FIELDS = (
+    "id", "title", "description", "involvedLocations", "status", "plotImpact",
+)
+
+
+def _t028_schema(area_ids: List[str]) -> Dict[str, Any]:
+    """T028's reply schema with typed area IDs, pinned to the contract fields."""
+    def obj(fields, props):
+        assert tuple(props) == fields
+        return {"type": "object", "properties": props,
+                "required": list(fields), "additionalProperties": False}
+
+    area_enum = {"type": "string", "enum": list(area_ids)}
+    text = {"type": "string"}
+    side_quest = obj(_T028_SIDE_QUEST_FIELDS, {
+        "id": text, "title": text, "description": text,
+        "involvedLocations": {"type": "array", "items": area_enum},
+        "status": text, "plotImpact": text,
+    })
+    plot_point = obj(_T028_PLOT_POINT_FIELDS, {
+        "id": text, "title": text, "description": text, "location": area_enum,
+        "nextPoints": {"type": "array", "items": text},
+        "status": text, "plotImpact": text,
+        "sideQuests": {"type": "array", "items": side_quest},
+    })
+    string_list = {"type": "array", "items": text}
+    return obj(_T028_ROOT_FIELDS, {
+        "plotTitle": text, "mainObjective": text,
+        "plotPoints": {"type": "array", "items": plot_point},
+        "activeQuests": string_list, "completedQuests": string_list,
+        "failedQuests": string_list, "worldEvents": string_list,
+        "dmNotes": string_list,
+    })
+
+
 def _validate_unified_plot_contract(
     value: Any,
     area_ids: List[str],
@@ -281,10 +394,7 @@ def _validate_unified_plot_contract(
     expected_side_quests: int,
 ) -> Dict[str, Any]:
     """Validate T028 identities/references before the unified plot is saved."""
-    root_fields = {
-        "plotTitle", "mainObjective", "plotPoints", "activeQuests",
-        "completedQuests", "failedQuests", "worldEvents", "dmNotes",
-    }
+    root_fields = set(_T028_ROOT_FIELDS)
     if not isinstance(value, dict) or set(value) != root_fields:
         raise ValueError("T028 requires the exact unified-plot root fields")
     _useful_string(value["plotTitle"], "plotTitle")
@@ -304,10 +414,7 @@ def _validate_unified_plot_contract(
     valid_areas = set(area_ids)
     side_quest_ids = []
     for pp in plot_points:
-        required = {
-            "id", "title", "description", "location", "nextPoints", "status",
-            "plotImpact", "sideQuests",
-        }
+        required = set(_T028_PLOT_POINT_FIELDS)
         if set(pp) != required:
             raise ValueError(f"T028 {pp.get('id')} has missing or extra fields")
         _useful_string(pp["title"], f"{pp['id']}.title")
@@ -326,10 +433,7 @@ def _validate_unified_plot_contract(
             raise ValueError(f"T028 {pp['id']}.sideQuests must be an array")
 
         for sq in pp["sideQuests"]:
-            sq_fields = {
-                "id", "title", "description", "involvedLocations", "status",
-                "plotImpact",
-            }
+            sq_fields = set(_T028_SIDE_QUEST_FIELDS)
             if not isinstance(sq, dict) or set(sq) != sq_fields:
                 raise ValueError("T028 side quest has missing or extra fields")
             side_quest_ids.append(sq["id"])
@@ -352,7 +456,12 @@ def _validate_unified_plot_contract(
 
 
 def _validate_plot_hook_updates(value, area_data, valid_plot_ids):
-    """Validate T029's exact location and plot references before merging."""
+    """Validate T029's exact location and plot references before merging.
+
+    The plot points and side quests a location's hooks use come back typed in
+    referencedIds and are checked against the ids the rules engine declares
+    for this module (utils/quest_record.declare); the hook text is never
+    scanned for ids (keyword program GEN-5)."""
     if not isinstance(value, dict) or set(value) != {"plotHookUpdates"}:
         raise ValueError("T029 requires exactly plotHookUpdates")
     updates = value["plotHookUpdates"]
@@ -365,8 +474,12 @@ def _validate_plot_hook_updates(value, area_data, valid_plot_ids):
     }
     seen = set()
     for update in updates:
-        if not isinstance(update, dict) or set(update) != {"locationId", "plotHooks"}:
-            raise ValueError("T029 update requires exactly locationId and plotHooks")
+        if not isinstance(update, dict) or set(update) != {
+            "locationId", "plotHooks", "referencedIds"
+        }:
+            raise ValueError(
+                "T029 update requires exactly locationId, plotHooks and referencedIds"
+            )
         location_id = update["locationId"]
         if location_id not in valid_locations or location_id in seen:
             raise ValueError("T029 update has an unknown or duplicate locationId")
@@ -376,7 +489,12 @@ def _validate_plot_hook_updates(value, area_data, valid_plot_ids):
             isinstance(hook, str) and hook.strip() for hook in hooks
         ):
             raise ValueError("T029 plotHooks must contain useful strings")
-        unknown = _flag_unknown_plot_ids(hooks, valid_plot_ids)
+        referenced = update["referencedIds"]
+        if not isinstance(referenced, list) or not all(
+            isinstance(ident, str) for ident in referenced
+        ):
+            raise ValueError("T029 referencedIds must be an array of IDs")
+        unknown = set(referenced) - set(valid_plot_ids)
         if unknown:
             raise ValueError(f"T029 references unknown plot IDs: {sorted(unknown)}")
     return updates
@@ -407,6 +525,16 @@ class ModuleBuilder:
         self.context = ModuleContext()
         self.progress_callback = None  # For progress reporting
         self.per_area_locations = None  # For custom locations per area
+        # Location ID prefixes already given to this build's areas, so a later
+        # area never repeats an earlier one's prefix (#612).
+        self._assigned_location_prefixes = set()
+        # T104's validated identity decisions (Step 7.5), held by position so
+        # they survive publication id normalization; the module declaration
+        # is written from them after the stitcher re-prefix.
+        self.npc_identity_decisions = []
+        # How create_party_tracker chose the start: "entry" (the story's typed
+        # entry ids) or "first-location" (the first location of the first area).
+        self.party_start_source = None
         
         # Initialize generators
         self.module_gen = ModuleGenerator()
@@ -438,7 +566,147 @@ class ModuleBuilder:
             raise OSError(f"Could not save generated module file: {relative_filename}")
         self.log(f"Saved: {relative_filename}")
         return True
-    
+
+    def record_engine_verdict(self, verdict) -> None:
+        """Record the build-time engine load's verdict (load_declared_world) as
+        validation_report.json's `engine` object, in the candidate before the
+        commit rename. A record, never a gate: a failure here is logged and the
+        module publishes."""
+        from utils.file_operations import safe_read_json
+
+        try:
+            path = os.path.join(self.config.output_directory, "validation_report.json")
+            report = safe_read_json(path)
+            if not isinstance(report, dict) or not isinstance(verdict, dict):
+                return
+            report["engine"] = verdict
+            # No .bak beside it: the candidate is published as it stands.
+            if not safe_write_json(path, report, create_backup=False):
+                raise OSError("could not save validation_report.json")
+        except Exception as exc:
+            warning(f"MODULE_DECLARATION: engine verdict not recorded ({exc})", category="module_creation")
+
+    # Classifications whose occurrences are one being (owner ruling Q3).
+    ONE_BEING = ("same_mobile_person", "deliberate_attitude_change")
+
+    def emit_module_declaration(self) -> bool:
+        """Write module_declaration.json: the typed facts the build already holds
+        and the roster world would otherwise rebuild from the area files.
+
+        Runs on the candidate AFTER publication id normalization: the stitcher
+        re-prefix rewrites only the files it knows, by position, so anything
+        written before it would keep the old ids. Every id is a bare
+        module-relative id ("G04", never "loc:<Module>/G04"), so a later
+        re-prefix that rewrites the module's ids by exact value rewrites these.
+        Declares one entry per being T104 typed as one figure across areas, the
+        party start with how it was chosen, the location-level cross-area
+        links, and each link's time (`routes`, one T123 call; left out when the
+        call fails). Nothing is read from prose by code. An entry that does not resolve
+        against the written files is left out and logged; the module then
+        derives it as before. Never raises: on any failure no file is written
+        and the module derives as before.
+        """
+        try:
+            from utils.file_operations import safe_read_json
+            from utils.roster_conversion import slug
+
+            out = self.config.output_directory
+            areas = {}
+            for path in sorted(Path(out, "areas").glob("*.json")):
+                if path.name.endswith("_BU.json"):
+                    continue
+                area = safe_read_json(os.fspath(path))
+                if isinstance(area, dict) and isinstance(area.get("areaId"), str):
+                    areas[area["areaId"]] = area
+            location_ids = {
+                loc.get("locationId")
+                for area in areas.values()
+                for loc in area.get("locations") or []
+                if isinstance(loc, dict) and loc.get("locationId")
+            }
+            context = safe_read_json(os.path.join(out, "module_context.json")) or {}
+            people = list((context.get("npcs") or {}).values())
+
+            beings = []
+            for decision in self.npc_identity_decisions:
+                if decision.get("classification") not in self.ONE_BEING:
+                    continue
+                resolved = []
+                for occ in decision["occurrences"]:
+                    locations = (areas.get(occ["areaId"]) or {}).get("locations") or []
+                    if occ["locationIndex"] >= len(locations):
+                        break
+                    location = locations[occ["locationIndex"]]
+                    named = [n for n in location.get("npcs") or []
+                             if isinstance(n, dict) and (n.get("name") or "").strip() == occ["name"]]
+                    if len(named) != 1:
+                        break
+                    resolved.append(dict(occ, locationId=location.get("locationId")))
+                primary = [o for o in resolved
+                           if o["occurrenceId"] == decision.get("primaryOccurrenceId")]
+                if len(resolved) != len(decision["occurrences"]) or len(primary) != 1:
+                    self.log("Module declaration: identity decision not resolved "
+                             "after normalization; its NPCs derive as before")
+                    continue
+                name = primary[0]["name"]
+                entries = [p for p in people if isinstance(p, dict) and (
+                    p.get("name") == name or name in (p.get("aliases") or []))]
+                aliases, seen = [], {slug(name)}
+                for alias in (entries[0].get("aliases") or []) if len(entries) == 1 else []:
+                    if isinstance(alias, str) and alias.strip() and slug(alias) not in seen:
+                        seen.add(slug(alias))
+                        aliases.append(alias.strip())
+                beings.append({
+                    "name": name,
+                    "home": primary[0]["locationId"],
+                    "appearances": [o["locationId"] for o in resolved],
+                    "aliases": aliases,
+                    "identity": decision["classification"],
+                })
+
+            start = None
+            tracker = safe_read_json(os.path.join(out, "party_tracker.json")) or {}
+            conditions = tracker.get("worldConditions") or {}
+            area_id, location_id = conditions.get("currentAreaId"), conditions.get("currentLocationId")
+            area_locations = {loc.get("locationId")
+                              for loc in (areas.get(area_id) or {}).get("locations") or []}
+            if self.party_start_source and location_id in area_locations:
+                start = {"areaId": area_id, "locationId": location_id,
+                         "source": self.party_start_source}
+            else:
+                self.log("Module declaration: party start not resolved; none declared")
+
+            gateways = []
+            for area in areas.values():
+                for loc in area.get("locations") or []:
+                    for target in loc.get("areaConnectivityId") or []:
+                        if loc.get("locationId") in location_ids and target in location_ids:
+                            gateways.append({"from": loc["locationId"], "to": target})
+                        else:
+                            self.log(f"Module declaration: gateway {loc.get('locationId')} -> "
+                                     f"{target} names an unknown location; left out")
+
+            declaration = {
+                "format": "neq-module-declaration",
+                "version": 1,
+                "module": self.config.module_name,
+                "beings": beings,
+                "start": start,
+                "gateways": gateways,
+            }
+            # N5: each link's time, typed by one T123 call over the final ids;
+            # none (the travel time table) when the call fails.
+            from core.generators.module_declaration import type_routes
+            routes = type_routes(out, self.config.module_name)
+            if routes:
+                declaration["routes"] = routes
+            self._atomic_save_json("module_declaration.json", declaration)
+            return True
+        except Exception as exc:
+            self.log(f"Module declaration not written (non-fatal; the module derives "
+                     f"as before): {exc}")
+            return False
+
     def create_context_header(self, party_members: List[str]) -> str:
         """Create a context header to prepend to all generator prompts"""
         header = """
@@ -799,22 +1067,10 @@ MODULE INDEPENDENCE RULES:
         """
         self.log("Injecting main antagonist into climactic location...")
 
-        # 1. Identify the main antagonist from the module data
-        antagonist_name = self.module_data.get("mainPlot", {}).get("antagonist")
+        # 1. Identify the main antagonist by the worker's typed name field
+        antagonist_name = self.module_data.get("mainPlot", {}).get("antagonistName")
         if not antagonist_name:
-            self.log("  - WARNING: No antagonist found in module data. Skipping injection.")
-            return
-        if not _looks_like_npc_name(antagonist_name):
-            warning(
-                "Antagonist placement skipped because the antagonist field is "
-                "paragraph-shaped rather than name-shaped; model-authored area "
-                "content was left unchanged.",
-                category="module_generation",
-            )
-            self.log(
-                "  - WARNING: Antagonist field is paragraph-shaped. "
-                "Skipping automatic NPC injection without rewriting it."
-            )
+            self.log("  - WARNING: No antagonist name found in module data. Skipping injection.")
             return
 
         # 2. Identify the climactic area by reading the unified plot file
@@ -909,8 +1165,8 @@ MODULE INDEPENDENCE RULES:
             danger_level = region.get("dangerLevel", "Medium")
             recommended_level = region.get("recommendedLevel", 1)
 
-            # Determine area type based on region description
-            area_type = self.determine_area_type(region)
+            # The worker's region carries the model-authored area type
+            area_type = region["areaType"]
             
             # Use custom per-area locations if provided, otherwise use default
             if self.per_area_locations and i < len(self.per_area_locations):
@@ -925,7 +1181,9 @@ MODULE INDEPENDENCE RULES:
                 complexity="moderate",
                 danger_level=danger_level,
                 recommended_level=recommended_level,
-                num_locations=num_locations_for_area
+                num_locations=num_locations_for_area,
+                climate=region["climate"],
+                terrain=region["terrain"],
             )
 
             # Add area to context
@@ -943,9 +1201,6 @@ MODULE INDEPENDENCE RULES:
                 prefix=prefix
             )
             
-            # Validate area consistency after generation
-            self.validate_area_consistency(area_data, self.module_data)
-            
             self.areas_data[area_id] = area_data
             self._atomic_save_json(f"areas/{area_id}.json", area_data)
 
@@ -957,44 +1212,6 @@ MODULE INDEPENDENCE RULES:
             self.context.add_area(area_id, region_name, area_data.get("areaType", area_type))
 
             self.log(f"Generated area: {region_name} ({area_id})")
-    
-    def determine_area_type(self, region: Dict[str, Any]) -> str:
-        """Determine area type based on region description with better pattern matching"""
-        description = region.get("regionDescription", "").lower()
-        name = region.get("regionName", "").lower()
-        
-        # Enhanced pattern matching
-        if any(word in description + name for word in ["mine", "cave", "dungeon", "ruins", "tomb", "underground", "depths"]):
-            return "dungeon"
-        elif any(word in description + name for word in ["town", "city", "village", "settlement", "hollow", "borough"]):
-            return "town"
-        elif any(word in description + name for word in ["forest", "woods", "wilds", "grove", "emerald", "woodland"]):
-            return "wilderness"
-        elif any(word in description + name for word in ["mountain", "peaks", "marches", "highlands", "cliffs"]):
-            return "wilderness" 
-        elif any(word in description + name for word in ["swamp", "marsh", "bog", "mire"]):
-            return "wilderness"
-        else:
-            return "mixed"
-    
-    def validate_area_consistency(self, area_data: Dict[str, Any], module_data: Dict[str, Any]):
-        """Validate area descriptions match their names and themes"""
-        area_name = area_data.get("areaName", "").lower()
-        climate = area_data.get("climate", "")
-        terrain = area_data.get("terrain", "")
-        
-        # Fix obvious mismatches
-        if any(word in area_name for word in ["emerald", "wilds", "forest", "woods"]):
-            if climate == "desert" or "desert" in terrain:
-                self.log(f"WARNING: Fixed climate mismatch for {area_data['areaName']}")
-                area_data["climate"] = "temperate"
-                area_data["terrain"] = "dense forest with clearings and groves"
-        
-        if any(word in area_name for word in ["frostward", "marches", "winter", "ice"]):
-            if climate == "temperate":
-                self.log(f"WARNING: Fixed climate mismatch for {area_data['areaName']}")
-                area_data["climate"] = "cold"
-                area_data["terrain"] = "frozen tundra and icy peaks"
     
     def get_party_members(self):
         """Get list of existing character names to avoid conflicts"""
@@ -1257,23 +1474,29 @@ The area ID {area_id} is not a location ID and must never be used in those field
             errors = []
             plot_data = None
             for attempt in range(2):
-                attempt_context = area_specific_context
-                if errors:
-                    attempt_context += (
-                        "\nPREVIOUS PLOT VALIDATION ERRORS:\n- "
-                        + "\n- ".join(errors)
-                        + "\nRegenerate the complete plot. Correct every error and "
-                        "use only the exact valid location IDs listed above.\n"
-                    )
-
-                plot_data = self.plot_gen.generate_plot(
-                    self.module_data,
-                    area_data,
-                    location_data,
-                    f"Create a plot specifically for {area_data['areaName']}, a {area_data.get('areaType', 'region')} area",
-                    context=self.context,
-                    context_header=attempt_context,
+                # D-COST-5: the retry is a targeted repair of the previous
+                # plot from its validation errors, with typed location IDs.
+                repair = (
+                    {"previous": plot_data, "errors": errors}
+                    if errors and plot_data else None
                 )
+                try:
+                    plot_data = self.plot_gen.generate_plot(
+                        self.module_data,
+                        area_data,
+                        location_data,
+                        f"Create a plot specifically for {area_data['areaName']}, a {area_data.get('areaType', 'region')} area",
+                        context=self.context,
+                        context_header=area_specific_context,
+                        valid_location_ids=valid_location_ids,
+                        repair=repair,
+                    )
+                except ValueError as exc:
+                    # An unparseable reply leaves nothing to repair.
+                    plot_data = None
+                    errors = [str(exc)]
+                    self.log(f"Plot generation failed for {area_id} (attempt {attempt + 1}/2): {exc}")
+                    continue
 
                 # MP-C2: reject dangling references before they reach disk.
                 # One bounded semantic retry repairs ordinary model slips;
@@ -1288,6 +1511,9 @@ The area ID {area_id} is not a location ID and must never be used in those field
                     f"Plot validation failed for {area_id} "
                     f"(attempt {attempt + 1}/2): {'; '.join(errors)}"
                 )
+
+            if plot_data is None:
+                raise ValueError(f"Plot generation failed for {area_id}: {'; '.join(errors)}")
 
             if errors:
                 # Last resort before discarding a fully generated module:
@@ -1440,22 +1666,46 @@ IMPORTANT:
             else:  # legacy
                 main_cfg = config.DM_MAIN_LEGACY
 
+            # D-COST-5: typed area IDs under a schema pinned to the contract;
+            # LM Studio keeps json_object with the IDs in the prompt.
+            t028_extra = {k: v for k, v in main_cfg.items() if k != "model"}
+            t028_format = {"type": "json_object"}
+            t028_schema = _t028_schema(list(self.areas_data))
+            if MODEL_PROVIDER in ("openai", "legacy"):
+                t028_format = {"type": "json_schema", "json_schema": {
+                    "name": "t028_unified_plot", "strict": True, "schema": t028_schema}}
+            elif MODEL_PROVIDER == "gemini":
+                from model_config import convert_to_gemini_schema
+                t028_extra["response_schema"] = convert_to_gemini_schema(
+                    t028_schema, preserve_required=True, preserve_constraints=True)
+
             last_error = None
+            last_reply = None
             unified_plot = None
             for attempt in range(2):
+                attempt_prompt = prompt
+                if last_error is not None:
+                    # A targeted repair: the previous reply and its contract
+                    # error, not the identical prompt again.
+                    attempt_prompt += (
+                        "\n\nREPAIR: your previous response failed validation.\n"
+                        f"ERROR: {last_error}\nPREVIOUS RESPONSE:\n{last_reply}\n"
+                        "Return the complete JSON again, changing only what the error names."
+                    )
                 response = capture_and_fanout("T028", api_client.create_completion,
                     _request_provider=MODEL_PROVIDER,
                     messages=[
                         {"role": "system", "content": "You are an expert 5th edition module designer specializing in creating coherent, engaging adventure narratives."},
-                        {"role": "user", "content": prompt}
+                        {"role": "user", "content": attempt_prompt}
                     ],
                     model=main_cfg["model"],
                     temperature=0.7,
-                    response_format={"type": "json_object"},
-                    **{k: v for k, v in main_cfg.items() if k != "model"})
+                    response_format=t028_format,
+                    **t028_extra)
+                last_reply = response.choices[0].message.content
                 try:
                     unified_plot = _validate_unified_plot_contract(
-                        json.loads(response.choices[0].message.content),
+                        json.loads(last_reply),
                         list(self.areas_data),
                         len(all_plot_points),
                         len(all_side_quests),
@@ -1603,17 +1853,14 @@ IMPORTANT:
         relevant_plot_points = []
         relevant_side_quests = []
 
-        # MED-5 (#127): collect every known plot-point/side-quest ID across the
-        # whole unified plot so we can warn on hallucinated references later.
-        valid_plot_ids = set()
-        for pp in unified_plot.get("plotPoints", []):
-            pp_id = pp.get("id")
-            if pp_id:
-                valid_plot_ids.add(pp_id)
-            for sq in pp.get("sideQuests", []):
-                sq_id = sq.get("id")
-                if sq_id:
-                    valid_plot_ids.add(sq_id)
+        # MED-5 (#127): T029's typed referencedIds must be quests the rules
+        # engine declares for this module (D-KW-8: the engine's own reading of
+        # the plot, not a copy of it).
+        from utils import quest_record
+
+        valid_plot_ids = set(
+            quest_record.declare(self.config.module_name, unified_plot, []).keys()
+        )
 
         for pp in unified_plot.get("plotPoints", []):
             if pp.get("location") == area_id:
@@ -1641,7 +1888,8 @@ IMPORTANT:
                 area_id,
                 original_area_data,
                 relevant_plot_points,
-                relevant_side_quests
+                relevant_side_quests,
+                valid_plot_ids,
             )
             
             if not updated_hooks:
@@ -1654,7 +1902,7 @@ IMPORTANT:
         
         # STEP 6: Deep merge updates with original data (ATOMIC OPERATION)
         try:
-            updated_area_data = self._deep_merge_area_updates(area_backup, updated_hooks, valid_plot_ids)
+            updated_area_data = self._deep_merge_area_updates(area_backup, updated_hooks)
             
             # STEP 7: Validate critical fields preserved
             if not self._validate_area_integrity(area_backup, updated_area_data, area_id):
@@ -1680,7 +1928,9 @@ IMPORTANT:
             except:
                 self.log(f"Critical error: Could not restore {area_id} from backup")
     
-    def _generate_enhanced_plot_hooks(self, area_id, area_data, plot_points, side_quests):
+    def _generate_enhanced_plot_hooks(
+        self, area_id, area_data, plot_points, side_quests, valid_plot_ids
+    ):
         """Generate enhanced plot hooks that reference specific plot points and side quests"""
         from core.ai import api_client
         import config
@@ -1710,8 +1960,8 @@ TASK: Update the existing plot hooks to specifically reference the unified plot 
 
 REQUIREMENTS:
 1. Keep the essence and style of existing plot hooks
-2. Add specific references to plot point IDs (PP001, PP002, etc.) where appropriate
-3. Add references to side quest IDs (SQ001, SQ002, etc.) where appropriate
+2. Name the plot points and side quests a hook leads to by their titles in the hook text
+3. List the IDs of the plot points and side quests each location's hooks lead to in "referencedIds" (an empty list when none)
 4. Maintain the narrative tone and area atmosphere
 5. Make hooks actionable for DMs
 6. Only update plot hooks - do NOT change other area data
@@ -1723,16 +1973,17 @@ Return a JSON object with this structure:
     {{
       "locationId": "R01",
       "plotHooks": [
-        "Enhanced hook that mentions PP001 or SQ001 specifically...",
-        "Another enhanced hook referencing the unified plot..."
-      ]
+        "Enhanced hook that leads to a named plot point or side quest...",
+        "Another enhanced hook tied to the unified plot..."
+      ],
+      "referencedIds": ["PP001", "SQ001"]
     }}
   ]
 }}
 
 IMPORTANT: 
 - Only include locations that need plot hook updates
-- Reference specific plot point/side quest IDs where it makes narrative sense
+- Put plot point and side quest IDs only in "referencedIds", never in the hook text
 - Preserve the existing hook style and tone
 - Make hooks more specific and actionable"""
 
@@ -1759,11 +2010,6 @@ IMPORTANT:
                 **{k: v for k, v in main_cfg.items() if k != "model"})
 
             result = json.loads(response.choices[0].message.content)
-            valid_plot_ids = {
-                item.get("id")
-                for item in [*plot_points, *side_quests]
-                if isinstance(item, dict) and item.get("id")
-            }
             return _validate_plot_hook_updates(
                 result, area_data, valid_plot_ids
             )
@@ -1772,7 +2018,7 @@ IMPORTANT:
             self.log(f"Error in AI plot hook generation: {e}")
             return []
     
-    def _deep_merge_area_updates(self, original_data, hook_updates, valid_plot_ids=None):
+    def _deep_merge_area_updates(self, original_data, hook_updates):
         """Deep merge plot hook updates into area data, preserving all other data"""
         import copy
         result = copy.deepcopy(original_data)
@@ -1789,15 +2035,6 @@ IMPORTANT:
             location_id = location.get("locationId")
             if location_id in location_updates:
                 location["plotHooks"] = location_updates[location_id]
-                # MED-5 (#127): warn on hallucinated plot IDs (non-destructive)
-                if valid_plot_ids is not None:
-                    try:
-                        unknown_ids = _flag_unknown_plot_ids(location["plotHooks"], valid_plot_ids)
-                        if unknown_ids:
-                            warning(f"T029: location {location_id} references unknown plot IDs: "
-                                    f"{sorted(unknown_ids)}", category="module_creation")
-                    except Exception:
-                        pass
 
         return result
     
@@ -1876,8 +2113,10 @@ IMPORTANT:
                     "explicit party start location is missing or ambiguous"
                 )
             first_location = matches[0]
+            self.party_start_source = "entry"
         else:
             # Use the first area as the starting location
+            self.party_start_source = "first-location"
             first_area_id = list(self.areas_data.keys())[0]
             first_area = self.areas_data[first_area_id]
 
@@ -1915,7 +2154,6 @@ IMPORTANT:
                 "weatherConditions": "",
                 "lastCompletedEncounter": "",
             },
-            "activeQuests": [],
         }
 
         if explicit_start:
@@ -2016,15 +2254,22 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         reconciler.path_manager.module_dir = self.config.output_directory
         reconciler.context_path = context_path
 
+        # Lock order is module_refresh -> context. The build no longer holds
+        # module_refresh while it generates (issue #708), so each locked step
+        # takes it here, waiting rather than dropping a paid build. T088 runs
+        # in the reconciler's standalone mode, which holds both locks only to
+        # snapshot and to commit, never while the model works.
+        on_wait = self._refresh_wait_reporter()
+
+        def refresh_lock():
+            return _build_refresh_wait(on_wait)
+
         if expected_context is not None:
             from core.generators.story_first.compatibility import (
                 validate_reconciled_context,
             )
-            from utils.module_refresh_lock import module_refresh_lock
 
-            with module_refresh_lock() as refresh_acquired:
-                if not refresh_acquired:
-                    raise OSError("Module refresh is busy during story-first context")
+            with refresh_lock():
                 with path_transaction_lock(context_path):
                     recovery = reconciler._recover_pending_transaction()
                     if recovery:
@@ -2038,9 +2283,11 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                             "Could not publish module context before NPC reconciliation"
                         )
 
-                    self.log("Step 6.5: Reconciling NPC names for consistency...")
-                    if not reconciler._reconcile_all_areas_unlocked():
-                        raise OSError("NPC identity reconciliation did not commit")
+            self.log("Step 6.5: Reconciling NPC names for consistency...")
+            if not reconciler.reconcile_all_areas(refresh_lock=refresh_lock):
+                raise OSError("NPC identity reconciliation did not commit")
+            with refresh_lock():
+                with path_transaction_lock(context_path):
                     self.context = ModuleContext.load(context_path)
                     self.log("Step 7: Validating module consistency...")
                     self.validate_module()
@@ -2053,15 +2300,10 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         # Lock order MUST be module_refresh -> context, matching the story-first
         # branch above. The reconciler's locked reconcile_all_areas() refuses a
         # caller that holds the context lock without refresh (a refresh->context
-        # inversion, npc_reconciler.py:731-738), so a legacy build that took only
-        # the context lock here would abort every time with "did not commit".
-        # Acquire refresh first, then context, then call the UNLOCKED helper that
-        # expects both locks already held.
-        from utils.module_refresh_lock import module_refresh_lock
-
-        with module_refresh_lock() as refresh_acquired:
-            if not refresh_acquired:
-                raise OSError("Module refresh is busy during NPC reconciliation")
+        # inversion, npc_reconciler.py:731-738), so each step here takes refresh
+        # first, then context, and reconcile_all_areas() is called holding
+        # neither: it takes them itself in the same order.
+        with refresh_lock():
             with path_transaction_lock(context_path):
                 # Resolve a prior interrupted T088 before considering the builder's
                 # in-memory snapshot. Overwriting a staged target first would turn
@@ -2091,10 +2333,12 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                             "Could not publish module context before NPC reconciliation"
                         )
 
-                self.log("Step 6.5: Reconciling NPC names for consistency...")
-                if not reconciler._reconcile_all_areas_unlocked():
-                    raise OSError("NPC identity reconciliation did not commit")
+        self.log("Step 6.5: Reconciling NPC names for consistency...")
+        if not reconciler.reconcile_all_areas(refresh_lock=refresh_lock):
+            raise OSError("NPC identity reconciliation did not commit")
 
+        with refresh_lock():
+            with path_transaction_lock(context_path):
                 # T088 owns a separate ModuleContext instance. Refresh the builder
                 # before validation so Step 7 cannot overwrite its identity merge.
                 self.context = ModuleContext.load(context_path)
@@ -2107,6 +2351,13 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         # failure leaves the reconciled module intact and NEVER aborts the build
         # (heal-forward -- a module is always produced).
         self._apply_npc_coherence(context_path)
+
+    def _refresh_wait_reporter(self):
+        """``on_wait`` for this builder's own (status, message) progress callback."""
+        callback = self.progress_callback
+        if not callback:
+            return None
+        return lambda line: callback("finalizing", line)
 
     def _apply_npc_coherence(self, context_path):
         """Issue #160: reconcile same-name NPCs recurring across areas via one
@@ -2191,9 +2442,14 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             # fail-closed skip path (module published unchanged post-T088).
             # 110 < the 120s thread backstop so the transport reliably closes
             # (and the worker exits with APITimeoutError -> the normal skip
-            # path) BEFORE the thread is ever abandoned.
+            # path) BEFORE the thread is ever abandoned. Connect is bounded per
+            # resolved address, as in live_provider_call._CONNECT_SECONDS: a
+            # bare 110 also bounds each connect, so silent first addresses
+            # outlast the backstop before any request (#667).
             if provider in ("openai", "legacy", "lmstudio", "opencodego"):
-                extra["timeout"] = 110
+                import httpx
+
+                extra["timeout"] = httpx.Timeout(110, connect=5.0)
 
             def _t104_call():
                 return capture_and_fanout(
@@ -2237,9 +2493,45 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 self._atomic_save_json(f"areas/{aid}.json", area)
             self.context = ModuleContext.from_artifacts(out, base_context=self.context)
             safe_write_json(context_path, self.context.to_dict())
+            self.npc_identity_decisions = self._identity_positions(parsed, packet, patched)
             self.log(f"Step 7.5: NPC coherence applied to {n_groups} group(s)")
         except Exception as exc:
             self.log(f"Step 7.5: NPC coherence skipped (non-fatal): {exc}")
+
+    @staticmethod
+    def _identity_positions(response, packet, areas):
+        """T104's validated decisions with each occurrence held as (areaId,
+        location index, exact NPC name) in the written areas. The stitcher
+        re-prefix keeps area ids and location order, so these still resolve
+        after normalization. A decision with an occurrence that cannot be
+        placed is left out (its NPCs derive as before)."""
+        index = packet.get("_occurrence_index") or {}
+        decisions = []
+        for dec in response.get("decisions") or []:
+            occurrences = []
+            for repair in dec.get("repairs") or []:
+                occ = index.get(repair.get("occurrenceId"))
+                positions = []
+                if occ is not None:
+                    locations = (areas.get(occ["area_id"]) or {}).get("locations") or []
+                    positions = [i for i, loc in enumerate(locations)
+                                 if loc.get("locationId") == occ["location_id"]]
+                if len(positions) != 1:
+                    occurrences = []
+                    break
+                occurrences.append({
+                    "occurrenceId": repair["occurrenceId"],
+                    "areaId": occ["area_id"],
+                    "locationIndex": positions[0],
+                    "name": (occ["npc"].get("name") or "").strip(),
+                })
+            if occurrences:
+                decisions.append({
+                    "classification": dec.get("classification"),
+                    "primaryOccurrenceId": dec.get("primaryOccurrenceId"),
+                    "occurrences": occurrences,
+                })
+        return decisions
 
     def validate_module(self):
         """Validate module consistency and save results"""
@@ -2318,56 +2610,11 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         self.log(f"Created {backup_count} _BU.json backup files for reset functionality")
     
     def get_location_prefix(self, area_index: int) -> str:
-        """Get a globally unique prefix for location IDs by checking existing modules"""
-        from utils.encoding_utils import safe_json_load
-        import os
-        
-        # Load world registry to check existing location IDs
-        used_prefixes = set()
-        world_registry_path = "modules/world_registry.json"
-        
-        if os.path.exists(world_registry_path):
-            registry = safe_json_load(world_registry_path)
-            if registry:
-                # Check all areas in all modules for used location prefixes
-                for area_id, area_info in registry.get('areas', {}).items():
-                    module_name = area_info.get('module')
-                    if module_name:
-                        # Load the actual area file to get location IDs
-                        area_path = f"modules/{module_name}/areas/{area_id}.json"
-                        if os.path.exists(area_path):
-                            area_data = safe_json_load(area_path)
-                            if area_data and 'locations' in area_data:
-                                for loc in area_data['locations']:
-                                    loc_id = loc.get('locationId', '')
-                                    if loc_id:
-                                        # Extract prefix (letters before numbers)
-                                        import re
-                                        match = re.match(r'^([A-Z]+)\d+', loc_id)
-                                        if match:
-                                            used_prefixes.add(match.group(1))
-        
-        # Generate a unique prefix not in use
-        candidate_index = area_index
-        while True:
-            if candidate_index < 26:
-                prefix = chr(65 + candidate_index)  # A-Z
-            else:
-                first_letter = chr(65 + (candidate_index // 26) - 1)
-                second_letter = chr(65 + (candidate_index % 26))
-                prefix = first_letter + second_letter
-            
-            if prefix not in used_prefixes:
-                self.log(f"Assigned unique location prefix '{prefix}' for area {area_index}")
-                return prefix
-            
-            candidate_index += 1
-            if candidate_index > 702:  # Safety limit (26 + 26*26 = 702 possible prefixes)
-                # Fallback to module-specific prefix
-                import random
-                prefix = f"M{self.config.module_name[:3].upper()}{random.randint(1,99)}"
-                self.log(f"Warning: Using fallback prefix '{prefix}' due to exhausted standard prefixes")
-                return prefix
+        """Get a prefix for location IDs not used by a registered module or an earlier area of this build"""
+        used_prefixes = registered_location_prefixes() | self._assigned_location_prefixes
+        prefix = get_location_prefix(area_index, used_prefixes, self.config.module_name, self.log)
+        self._assigned_location_prefixes.add(prefix)
+        return prefix
     
     
     def _create_bidirectional_connection(self, area_files: Dict[str, Any], from_area: str, to_area: str) -> bool:
@@ -2490,7 +2737,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 issues.append(f"expected gateway {a}<->{b} not realized reciprocally ({sorted(links)})")
         for pair in phys:
             if pair not in expected_pairs:
-                issues.append(f"spurious cross-area link {tuple(pair)} not in plot edge set")
+                issues.append(f"spurious cross-area link {tuple(sorted(pair))} not in plot edge set")
         return issues
 
     def finalize_locations_and_connections(self):
@@ -2758,13 +3005,14 @@ Return this exact JSON structure:
 }
 
 CRITICAL RULES:
+- When the narrative states a value with its label (for example "Module Name: Shadow_Pass_Mystery" or "Level Range: 5-7"), return exactly that value for that field
 - module_name MUST use underscores, not spaces
 - num_areas MUST be a number (not a string)
 - num_areas MUST be %d-%d
 - locations_per_area MUST be %d-%d (default 6 when allowed)
 - level_range MUST have both "min" and "max" as numbers
 - adventure_type MUST be lowercase: "dungeon", "wilderness", "urban", "nautical", or "mixed"
-- plot_themes must be useful 3-40 word text containing 1-3 comma-separated goals
+- plot_themes must be useful non-empty text; name the main goals (usually 1-3), separated by commas
 
 Return ONLY the JSON object, no explanations or additional text.""" % (
         resolved_policy.min_areas,
@@ -2896,10 +3144,10 @@ def _resolve_module_creation_spec(
     params: Dict[str, Any],
     policy: Any,
 ) -> ModuleCreationSpec:
-    """Resolve labels and inference into one validated specification."""
+    """Resolve typed toolkit values and T030 inference into one specification."""
 
     resolved_policy = get_module_creation_policy(policy)
-    explicit = extract_labeled_module_values(narrative, resolved_policy)
+    explicit = {}
 
     typed_fields = MODULE_SPEC_FIELDS.intersection(params)
     if typed_fields and resolved_policy.name != "toolkit":
@@ -2965,8 +3213,8 @@ def _ai_driven_module_creation_impl(
                 "A module concept or narrative is required."
             )
 
-        # Resolve labeled values before inference.  A complete explicit block
-        # skips T030; otherwise validated explicit values override inference.
+        # Typed toolkit values come before inference; a complete typed set
+        # skips T030. Only T030 reads the narrative (D-KW-7).
         if progress_callback:
             progress_callback(
                 {
@@ -3033,6 +3281,10 @@ def _ai_driven_module_creation_impl(
             category="module_creation",
         )
 
+        # The builder of the candidate being published, for the publication
+        # step's module declaration (set per attempt by build_candidate).
+        builder_holder: Dict[str, Any] = {}
+
         def build_candidate(
             candidate_path: Path,
             final_name: str,
@@ -3068,6 +3320,7 @@ def _ai_driven_module_creation_impl(
                     }
                 )
             builder = ModuleBuilder(config)
+            builder_holder["builder"] = builder
             if per_area_locations is not None:
                 builder.per_area_locations = list(per_area_locations)
 
@@ -3190,7 +3443,7 @@ def _ai_driven_module_creation_impl(
                 final_name,
                 story_first_path=False,
             ),
-            prepare_registry_fn=prepare_candidate,
+            prepare_registry_fn=_publication_step(prepare_candidate, builder_holder),
             use_story_first=use_story_first,
             progress_callback=progress_callback,
         )
@@ -3215,7 +3468,11 @@ def _ai_driven_module_creation_impl(
 
         return True, module_name
 
-    except (ModuleCreationRecoveryRequiredError, ModuleCreationCancelledError):
+    except (
+        ModuleCreationRecoveryRequiredError,
+        ModuleCreationCancelledError,
+        ModuleCreationBusyError,
+    ):
         raise
     except Exception as e:
         print(

@@ -145,7 +145,6 @@ The codebase follows a clean, organized structure with logical separation of con
 │   ├── save_game_manager.py       # Save/load operations
 │   ├── update_character_info.py   # Character data updates
 │   ├── update_encounter.py        # Encounter state updates
-│   ├── update_party_tracker.py    # Party tracker updates
 │   └── update_world_time.py       # World time progression
 ├── web/                   # Web interface (1 file)
 │   ├── web_interface.py           # Flask server and SocketIO handlers
@@ -383,6 +382,7 @@ modules/[module_name]/
 ├── monsters/           # Module-specific creatures
 ├── encounters/         # Combat encounters
 ├── module_plot.json    # Plot progression and quests
+├── module_items.json   # Typed loot items for lootItems (optional)
 ├── party_tracker.json  # Party state for this module
 └── [module_name]_module.json  # Module metadata
 ```

@@ -1,0 +1,264 @@
+{
+  "format": "neq-module-declaration",
+  "version": 1,
+  "module": "The_Thornwood_Watch",
+  "beings": [],
+  "start": null,
+  "gateways": [],
+  "dispositions": [
+    {
+      "location": "NC02",
+      "name": "Thorn-Touched Dryad Sylara",
+      "index": 0,
+      "disposition": "hostile"
+    },
+    {
+      "location": "NC03",
+      "name": "The Withered Hart",
+      "index": 0,
+      "disposition": "indifferent"
+    },
+    {
+      "location": "NC04",
+      "name": "Ranger Thane",
+      "index": 0,
+      "disposition": "indifferent"
+    },
+    {
+      "location": "NC05",
+      "name": "Malarok the Corruptor",
+      "index": 0,
+      "disposition": "hostile"
+    },
+    {
+      "location": "RO01",
+      "name": "Ranger Elen",
+      "index": 0,
+      "disposition": "indifferent"
+    },
+    {
+      "location": "RO01",
+      "name": "Ranger Marcus",
+      "index": 0,
+      "disposition": "indifferent"
+    },
+    {
+      "location": "RO01",
+      "name": "Scout Kira",
+      "index": 0,
+      "disposition": "friendly"
+    },
+    {
+      "location": "RO01",
+      "name": "Messenger Tom",
+      "index": 0,
+      "disposition": "friendly"
+    },
+    {
+      "location": "RO01",
+      "name": "Rusk",
+      "index": 0,
+      "disposition": "hostile"
+    },
+    {
+      "location": "RO02",
+      "name": "Quartermaster Brann",
+      "index": 0,
+      "disposition": "indifferent"
+    },
+    {
+      "location": "RO02",
+      "name": "Dock Worker Finn",
+      "index": 0,
+      "disposition": "friendly"
+    },
+    {
+      "location": "RO02",
+      "name": "Merchant Vera",
+      "index": 0,
+      "disposition": "friendly"
+    },
+    {
+      "location": "RO02",
+      "name": "Apprentice Jeb",
+      "index": 0,
+      "disposition": "friendly"
+    },
+    {
+      "location": "RO03",
+      "name": "Trader Sila",
+      "index": 0,
+      "disposition": "indifferent"
+    },
+    {
+      "location": "RO03",
+      "name": "Merchant Gareth",
+      "index": 0,
+      "disposition": "indifferent"
+    },
+    {
+      "location": "RO03",
+      "name": "Trader Mila",
+      "index": 0,
+      "disposition": "friendly"
+    },
+    {
+      "location": "RO03",
+      "name": "Caravan Guard Bex",
+      "index": 0,
+      "disposition": "indifferent"
+    },
+    {
+      "location": "TW04",
+      "name": "Spirit-Touched Hermit Maelo",
+      "index": 0,
+      "disposition": "friendly"
+    },
+    {
+      "location": "TW05",
+      "name": "Bandit Captain Gorvek",
+      "index": 0,
+      "disposition": "hostile"
+    },
+    {
+      "location": "TW06",
+      "name": "Ranger Gareth",
+      "index": 0,
+      "disposition": "friendly"
+    },
+    {
+      "location": "TW06",
+      "name": "Merchant Kael",
+      "index": 0,
+      "disposition": "friendly"
+    }
+  ],
+  "routes": [
+    {
+      "from": "NC01",
+      "to": "NC02",
+      "ticks": 300,
+      "both": true
+    },
+    {
+      "from": "NC01",
+      "to": "NC03",
+      "ticks": 300,
+      "both": true
+    },
+    {
+      "from": "NC01",
+      "to": "TW05",
+      "ticks": 5400,
+      "both": true
+    },
+    {
+      "from": "NC02",
+      "to": "NC04",
+      "ticks": 300,
+      "both": true
+    },
+    {
+      "from": "NC02",
+      "to": "NC05",
+      "ticks": 480,
+      "both": true
+    },
+    {
+      "from": "NC03",
+      "to": "NC04",
+      "ticks": 300,
+      "both": true
+    },
+    {
+      "from": "NC03",
+      "to": "NC05",
+      "ticks": 480,
+      "both": true
+    },
+    {
+      "from": "RO01",
+      "to": "RO02",
+      "ticks": 300,
+      "both": true
+    },
+    {
+      "from": "RO01",
+      "to": "RO03",
+      "ticks": 300,
+      "both": true
+    },
+    {
+      "from": "RO01",
+      "to": "RO04",
+      "ticks": 300,
+      "both": true
+    },
+    {
+      "from": "RO02",
+      "to": "RO04",
+      "ticks": 300,
+      "both": false
+    },
+    {
+      "from": "RO03",
+      "to": "RO05",
+      "ticks": 480,
+      "both": true
+    },
+    {
+      "from": "RO03",
+      "to": "RO06",
+      "ticks": 480,
+      "both": true
+    },
+    {
+      "from": "RO06",
+      "to": "TW01",
+      "ticks": 3600,
+      "both": true
+    },
+    {
+      "from": "TW01",
+      "to": "TW02",
+      "ticks": 300,
+      "both": true
+    },
+    {
+      "from": "TW01",
+      "to": "TW04",
+      "ticks": 600,
+      "both": true
+    },
+    {
+      "from": "TW01",
+      "to": "TW06",
+      "ticks": 900,
+      "both": false
+    },
+    {
+      "from": "TW02",
+      "to": "TW03",
+      "ticks": 480,
+      "both": true
+    },
+    {
+      "from": "TW02",
+      "to": "TW05",
+      "ticks": 720,
+      "both": true
+    },
+    {
+      "from": "TW03",
+      "to": "TW04",
+      "ticks": 600,
+      "both": true
+    },
+    {
+      "from": "TW06",
+      "to": "TW04",
+      "ticks": 720,
+      "both": false
+    }
+  ]
+}

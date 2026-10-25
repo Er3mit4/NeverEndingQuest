@@ -18,7 +18,12 @@ interface SaveEntry {
   module: string
   location: string
   description: string
+  autoBackup: string
 }
+
+// #1376: the typed save_metadata kind of the save the game takes before the
+// Effects V2 conversion. Only this field labels it; the description is never read.
+const EFFECTS_BACKUP_KIND = 'effects_v2_preconversion'
 
 function asString(value: unknown): string {
   if (typeof value === 'string') return value
@@ -38,6 +43,7 @@ function toSaveEntry(raw: Record<string, unknown>): SaveEntry {
     module: asString(raw['module']) || 'Unknown Module',
     location: asString(gameState['current_location']) || 'Unknown Location',
     description: asString(raw['description']),
+    autoBackup: asString(raw['auto_backup']),
   }
 }
 
@@ -124,7 +130,7 @@ function LoadDialogBody() {
     if (!selected || busy.current || !useSession.getState().connected || !saveExists(selected)) return
     setRestoreError('')
     if (ember) setConfirmation({ kind, folder: selected })
-    else if (window.confirm(kind === 'load' ? 'This will restore the selected save and restart the server. Your current progress will be lost. Continue?' : 'Delete this save? This cannot be undone.')) {
+    else if (window.confirm(kind === 'load' ? 'Load this save point? Anything that happened after it was saved will be lost.' : 'Delete this save? This cannot be undone.')) {
       if (kind === 'load') void performLoad(selected)
       else deleteSelected(selected)
     }
@@ -156,11 +162,17 @@ function LoadDialogBody() {
                         {entry.mode}
                       </span>
                     )}
+                    {entry.autoBackup === EFFECTS_BACKUP_KIND && (
+                      <span className="neq-save-mode-badge-parity auto-backup">Auto backup</span>
+                    )}
                   </div>
                   <div>
                     <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">Date:</span><span className="neq-save-detail-value-parity date">{entry.date}</span></div>
                     <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">Module:</span><span className="neq-save-detail-value-parity module">{entry.module}</span></div>
                     <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">Location:</span><span className="neq-save-detail-value-parity location">{entry.location}</span></div>
+                    {entry.autoBackup === EFFECTS_BACKUP_KIND && (
+                      <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">Backup:</span><span className="neq-save-detail-value-parity auto-backup">Taken before the effects upgrade. Loading it returns to before that upgrade and its module setup.</span></div>
+                    )}
                     {entry.description && (
                       <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">Notes:</span><span className="neq-save-detail-value-parity description">{entry.description}</span></div>
                     )}
@@ -200,7 +212,7 @@ function LoadDialogBody() {
         </div>
         {confirmation && <ConfirmDialog
           title={confirmation.kind === 'load' ? 'Restore Saved Game' : 'Delete Saved Game'}
-          message={confirmation.kind === 'load' ? 'This will restore the selected save and restart the server. Your current progress will be lost. Continue?' : 'Delete this save? This cannot be undone.'}
+          message={confirmation.kind === 'load' ? 'Load this save point? Anything that happened after it was saved will be lost.' : 'Delete this save? This cannot be undone.'}
           confirmLabel={confirmation.kind === 'load' ? 'Restore Game' : 'Delete Save'}
           pending={restoring} error={restoreError} disabled={!connected} onCancel={cancelConfirmation}
           onConfirm={() => confirmation.kind === 'load' ? void performLoad(confirmation.folder) : deleteSelected(confirmation.folder)}

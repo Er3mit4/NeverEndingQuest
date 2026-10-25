@@ -24,6 +24,7 @@ except:
     def track_response(r): pass
 from utils.module_path_manager import ModulePathManager
 from utils.enhanced_logger import debug, info, warning, error, set_script_name
+from utils.transient_filesystem import raise_if_save_stopped
 
 # Set script name for logging
 set_script_name("update_encounter")
@@ -194,11 +195,10 @@ Remember to only update monster information and leave player and NPC data unchan
                         print(f"ERROR: Failed to sync player data from {player_file}: {str(e)}")
                         
                 elif creature["type"] == "npc":
-                    # Import the fuzzy matching function
-                    from updates.update_character_info import find_character_file_fuzzy
-                    
-                    # Use fuzzy matching to find the correct NPC file
-                    matched_name = find_character_file_fuzzy(creature['name'])
+                    # The NPC's own sheet: its recorded sourceRef, else its exact name
+                    from updates.update_character_info import resolve_npc_sheet_id
+
+                    matched_name = resolve_npc_sheet_id(creature['name'], encounter_info, creature)
                     if matched_name:
                         npc_file = path_manager.get_character_path(matched_name)
                         try:
@@ -215,7 +215,7 @@ Remember to only update monster information and leave player and NPC data unchan
                         except Exception as e:
                             print(f"ERROR: Failed to sync NPC data from {npc_file}: {str(e)}")
                     else:
-                        print(f"WARNING: Could not find NPC file for '{creature['name']}' using fuzzy matching")
+                        print(f"WARNING: Could not find NPC file for '{creature['name']}' (exact names only)")
 
             # Normalize creature statuses before validation
             # Map invalid statuses to valid ones
@@ -243,6 +243,7 @@ Remember to only update monster information and leave player and NPC data unchan
             info(f"SUCCESS: Encounter update - PASS", category="encounter_updates")
 
             # Save the updated encounter info
+            raise_if_save_stopped()
             with open(f"modules/encounters/encounter_{encounter_id}.json", "w") as file:
                 json.dump(encounter_info, file, indent=2)
 

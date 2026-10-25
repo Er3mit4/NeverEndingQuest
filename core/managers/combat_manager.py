@@ -111,6 +111,7 @@ Combat Logging System:
 # while maintaining strict 5e rule compliance through AI validation.
 # ============================================================================
 
+import copy
 import json
 import os
 import time
@@ -140,13 +141,8 @@ except Exception as e:
     print(f"[COMBAT_MANAGER] OpenAI usage tracking not available: {e}")
     def track_response(r): pass
     def get_usage_stats(): return {}
-# Import model configurations from config.py
-from config import (
-    OPENAI_API_KEY,
-)
 from updates.update_character_info import update_character_info, normalize_character_name
 import updates.update_encounter as update_encounter
-import updates.update_party_tracker as update_party_tracker
 # Import the preroll generator
 from core.generators.generate_prerolls import generate_prerolls
 from core.managers.combat_state import (
@@ -154,14 +150,20 @@ from core.managers.combat_state import (
     all_party_resolved,
     all_hostiles_resolved,
     combat_provenance,
+    combat_resolved,
     combatant_by_id,
     combatant_presentation_name,
+    display_status,
     ensure_combat_state,
     expected_automatic_actor_ids,
     expected_player_window_ids,
+    initiative_eligible_ids,
     is_down,
+    is_party_member,
+    normalize_status,
     recovery_action,
     resolve_creature_controller,
+    round_events,
     valid_pending_delivery,
 )
 from core.combat.down_scene import (
@@ -175,7 +177,7 @@ from core.combat.down_scene import (
 )
 from core.managers.combat_orchestrator import CombatTurnPaused, execute_agentic_turn
 from core.combat.invocation import InvocationSupersededError
-from utils.capture.live_provider_call import LiveProviderSuperseded
+from utils.capture.live_provider_call import LiveProviderCompletedError, LiveProviderSuperseded
 
 
 def _require_current_combat_invocation(invocation_claim):
@@ -188,6 +190,50 @@ def _require_current_combat_invocation(invocation_claim):
             "Combat invocation was superseded",
             claim=invocation_claim,
         )
+
+
+def _lifecycle_owns_supersession(invocation_claim):
+    """True when a Load/Reset/Exit (or the turn scope's own control) ended
+    this combat entry; read from typed state only (#990)."""
+    if invocation_claim is not None:
+        from core.combat.invocation import invocation_is_current
+
+        if not invocation_is_current(invocation_claim):
+            return True
+    from utils.capture.live_provider_call import (
+        get_active_welcome_scope,
+        get_live_provider_scope,
+        get_live_turn_scope,
+    )
+
+    # A fight run by a startup welcome answers to the welcome scope; a quit,
+    # reset, Load or exit supersedes that scope before the turn scopes. The
+    # player's own text never does while the welcome applies (#990).
+    control = get_live_provider_scope()
+    if control is not None and control is get_active_welcome_scope():
+        with control.lock:
+            kind = (control.supersession or {}).get("kind")
+        if kind is not None and kind != "player_acted":
+            return True
+    scope = get_live_turn_scope()
+    return scope is not None and scope.is_superseded()
+
+
+def _warn_unowned_supersession(exc, encounter_path):
+    pending = None
+    try:
+        encounter = safe_json_load(encounter_path)
+        pending = ((encounter or {}).get("combatState") or {}).get("pendingTurn")
+    except Exception:
+        pending = None
+    pending = pending if isinstance(pending, dict) else {}
+    invocation = pending.get("invocation")
+    invocation = invocation if isinstance(invocation, dict) else {}
+    warning(
+        "COMBAT_LOOP: unowned %s on turn %s (callsite %s); pausing the turn"
+        % (type(exc).__name__, pending.get("turnId"), invocation.get("callsite")),
+        category="combat_events",
+    )
 
 
 def _save_combat_json_under_invocation(
@@ -215,20 +261,16 @@ from core.managers.combat_transaction import (
     completion_lease,
     mark_encounter_awaiting_actor,
     store_agentic_preroll_cache,
+    take_opening_action,
 )
 # Import safe JSON functions
-from utils.encoding_utils import safe_json_load
+from utils.encoding_utils import safe_json_load, sanitize_dict
 from utils.file_operations import safe_write_json
-from utils.module_refresh_lock import module_refresh_lock
+from utils.transient_filesystem import ReadOnlySaveStop, raise_if_save_stopped
+from utils.module_refresh_lock import wait_for_module_refresh
 import core.ai.cumulative_summary as cumulative_summary
 from utils.enhanced_logger import debug, info, warning, error, game_event, set_script_name
-# Import combat message compressor for optimizing conversation history
-from core.ai.combat_compressor import CombatUserMessageCompressor
-# Import deterministic context matchers for enhancing player combat actions
-from core.ai.inventory_context_integration import (
-    build_srd_context,
-    enhance_player_input_with_inventory,
-)
+from core.ai import history_markers as hm
 
 # Set script name for logging
 set_script_name(__name__)
@@ -326,7 +368,8 @@ def _finalize_t043_resume_exchange(
     if response_content is None and retry_provider is not None:
         try:
             response_content = retry_provider(None)
-        except (CombatTurnPaused, LiveProviderSuperseded, InvocationSupersededError):
+        except (CombatTurnPaused, LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop,
+                LiveProviderCompletedError):
             raise
         except Exception as exc:
             parse_error = exc
@@ -348,7 +391,8 @@ def _finalize_t043_resume_exchange(
             break
         try:
             response_content = retry_provider(parse_error)
-        except (CombatTurnPaused, LiveProviderSuperseded, InvocationSupersededError):
+        except (CombatTurnPaused, LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop,
+                LiveProviderCompletedError):
             raise
         except Exception as exc:
             parse_error = exc
@@ -421,9 +465,6 @@ third_model_history_file = "modules/conversation_history/third_model_history.jso
 # Create a combat_logs directory if it doesn't exist
 os.makedirs("combat_logs", exist_ok=True)
 
-# Initialize combat message compressor with API key
-combat_message_compressor = CombatUserMessageCompressor(api_key=OPENAI_API_KEY)
-
 # Constants for chat history generation
 HISTORY_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 
@@ -470,79 +511,40 @@ def _display_combat_narration(narration, message_id=None):
    return True
 
 
-def load_npc_with_fuzzy_match(npc_name, path_manager):
+def load_npc_with_fuzzy_match(npc_name, path_manager, encounter=None, creature=None):
     """
-    Load NPC data with fuzzy name matching support.
-    First tries exact match, then falls back to fuzzy matching if needed.
-    
+    Load an encounter NPC's sheet, exactly (#855, family 2 Part B).
+
+    The sheet is the creature's recorded sourceRef in a typed-agentic
+    encounter, else the exact name (see resolve_npc_sheet_id). A near name is
+    never matched to another NPC's sheet: it returns (None, None) and the
+    caller reports the missing file, as for any missing sheet. Never raises.
+
     Args:
         npc_name: The NPC name to look for
         path_manager: ModulePathManager instance
-        
+        encounter: the encounter holding the creature, when the caller has it
+        creature: the encounter creature, when the caller has it
+
     Returns:
         tuple: (npc_data, matched_filename) or (None, None) if not found
     """
     from utils.encoding_utils import safe_json_load
-    
-    # First try exact match with normalized name
-    formatted_npc_name = path_manager.format_filename(npc_name)
-    npc_file = path_manager.get_character_path(formatted_npc_name)
-    npc_data = safe_json_load(npc_file)
-    
-    if npc_data:
-        debug(f"NPC_LOAD: Exact match found for '{npc_name}' -> '{formatted_npc_name}'", category="combat_manager")
-        return npc_data, formatted_npc_name
-    
-    # If exact match fails, try fuzzy matching
-    debug(f"NPC_LOAD: Exact match failed for '{formatted_npc_name}', attempting fuzzy match", category="combat_manager")
-    
-    # Get all character files in the module
-    import glob
-    # Use the unified characters directory
-    character_dir = "characters"
-    character_files = glob.glob(os.path.join(character_dir, "*.json"))
-    
-    best_match = None
-    best_score = 0
-    best_filename = None
-    
-    for char_file in character_files:
-        # Skip backup files
-        if char_file.endswith(".bak") or char_file.endswith("_BU.json") or "backup" in char_file:
-            continue
-            
-        # Load the character data to check if it's an NPC
-        char_data = safe_json_load(char_file)
-        # Check both character_type (correct field) and characterType (legacy) for compatibility
-        char_type = char_data.get("character_type") or char_data.get("characterType")
-        if char_data and char_type == "npc":
-            char_name = char_data.get("name", "")
-            # Simple fuzzy matching - check if key words from requested name are in character name
-            requested_words = set(formatted_npc_name.lower().split("_"))
-            char_words = set(char_name.lower().replace(" ", "_").split("_"))
-            
-            # Debug log for fuzzy matching
-            debug(f"NPC_FUZZY: Comparing '{formatted_npc_name}' with '{char_name}' from {char_file}", category="combat_manager")
-            debug(f"NPC_FUZZY: Requested words: {requested_words}, Character words: {char_words}", category="combat_manager")
-            
-            # Calculate match score based on word overlap
-            common_words = requested_words.intersection(char_words)
-            if common_words:
-                score = len(common_words) / max(len(requested_words), len(char_words))
-                
-                if score > best_score:
-                    best_score = score
-                    best_match = char_data
-                    # Extract just the filename without path for consistency
-                    best_filename = os.path.splitext(os.path.basename(char_file))[0]
-    
-    # Use best match if score is high enough (threshold: 0.5)
-    if best_match and best_score >= 0.5:
-        info(f"NPC_FUZZY_MATCH: Success - '{npc_name}' matched to '{best_match['name']}' (score: {best_score:.2f})", category="combat_manager")
-        return best_match, best_filename
-    else:
-        warning(f"NPC_FUZZY_MATCH: Failed for '{npc_name}' (best score: {best_score:.2f})", category="combat_manager")
+    from updates.update_character_info import resolve_npc_sheet_id
+
+    matched_filename = resolve_npc_sheet_id(npc_name, encounter, creature)
+    if not matched_filename:
+        warning(f"NPC_LOAD: no sheet for '{npc_name}' (exact names only)", category="combat_manager")
         return None, None
+    try:
+        npc_data = safe_json_load(path_manager.get_character_path(matched_filename))
+    except Exception as e:
+        warning(f"NPC_LOAD: sheet for '{npc_name}' unreadable ({type(e).__name__})", category="combat_manager")
+        return None, None
+    if not isinstance(npc_data, dict):
+        return None, None
+    debug(f"NPC_LOAD: '{npc_name}' -> '{matched_filename}'", category="combat_manager")
+    return npc_data, matched_filename
 
 
 def get_current_area_id():
@@ -634,112 +636,10 @@ def load_json_file(file_path):
 def save_json_file(file_path, data):
     try:
         safe_write_json(file_path, data)
+    except ReadOnlySaveStop:
+        raise  # the read-only save stop ends the session, not just this save
     except Exception as e:
         error(f"FILE_OP: Failed to save {file_path}: {str(e)}", category="file_operations")
-
-def clean_combat_state_blocks(conversation_history):
-    """
-    Remove the instructional combat state blocks from all but the most recent user message.
-    This prevents bloating the conversation with repeated instructions while preserving
-    the actual player actions and narrative.
-    """
-    # Find all user messages that contain combat state blocks
-    user_messages_with_state = []
-    for i, message in enumerate(conversation_history):
-        if (message.get("role") == "user" and 
-            "--- CURRENT COMBAT STATE ---" in message.get("content", "")):
-            user_messages_with_state.append(i)
-    
-    # If we have more than one, clean all but the last one
-    if len(user_messages_with_state) > 1:
-        for idx in user_messages_with_state[:-1]:  # All except the last one
-            content = conversation_history[idx]["content"]
-            
-            # Extract just the player's actual message
-            # Look for the pattern "Player: " after the state block ends
-            if "Player: " in content:
-                # Find where the state block ends (after "--- END OF STATE & DICE ---")
-                if "--- END OF STATE & DICE ---" in content:
-                    # Split on the end marker and then find the player message
-                    parts = content.split("--- END OF STATE & DICE ---", 1)
-                    if len(parts) == 2 and "Player: " in parts[1]:
-                        # Extract just the player's message
-                        player_parts = parts[1].split("Player: ", 1)
-                        if len(player_parts) == 2:
-                            player_msg = player_parts[1].split("\n\nNow, continue the combat flow", 1)[0].strip()
-                            # Replace the entire message with just the player's input
-                            conversation_history[idx]["content"] = f"Player: {player_msg}"
-                            continue
-            
-            # Fallback: If we can't extract cleanly, at least remove the bulk of the state
-            # but keep any player message
-            if "Player: " in content:
-                player_split = content.split("Player: ", 1)
-                if len(player_split) == 2:
-                    player_msg = player_split[1].split("\n\nNow, continue the combat flow", 1)[0].strip()
-                    conversation_history[idx]["content"] = f"Player: {player_msg}"
-    
-    return conversation_history
-
-def clean_old_dm_notes(conversation_history):
-    """
-    Clean up old Dungeon Master Notes from conversation history while preserving critical information.
-    Keeps round tracking, HP status, and basic combat state for the last 2 rounds.
-    This reduces token usage while maintaining enough context for proper combat flow.
-    """
-    # Find all DM note indices
-    dm_note_indices = []
-    for i, message in enumerate(conversation_history):
-        if message.get("role") == "user" and "Dungeon Master Note:" in message.get("content", ""):
-            dm_note_indices.append(i)
-    
-    # Keep the last 3 DM notes fully intact, clean older ones
-    keep_full_count = 3
-    
-    for i, message in enumerate(conversation_history):
-        if (message.get("role") == "user" and 
-            "Dungeon Master Note:" in message.get("content", "")):
-            
-            # Check if this is one of the recent DM notes to keep
-            note_index_in_list = dm_note_indices.index(i) if i in dm_note_indices else -1
-            if note_index_in_list >= len(dm_note_indices) - keep_full_count:
-                # Keep this note fully intact
-                continue
-            
-            # Clean older DM notes but preserve essential information
-            content = message["content"]
-            
-            # Extract round information
-            round_match = re.search(r"COMBAT ROUND (\d+)", content)
-            round_info = f"Round {round_match.group(1)}" if round_match else ""
-            
-            # Extract HP state information
-            hp_pattern = r"HP: \d+/\d+"
-            hp_matches = re.findall(hp_pattern, content)
-            hp_info = ", ".join(hp_matches) if hp_matches else ""
-            
-            # Extract player's message
-            player_split = content.split("Player:", 1)
-            player_msg = player_split[1].strip() if len(player_split) == 2 else ""
-            
-            # Construct cleaned message with essential info
-            cleaned_parts = []
-            if round_info:
-                cleaned_parts.append(round_info)
-            if hp_info:
-                cleaned_parts.append(f"HP: {hp_info}")
-            if player_msg:
-                cleaned_parts.append(f"Player: {player_msg}")
-            
-            if cleaned_parts:
-                message["content"] = f"Dungeon Master Note: {'. '.join(cleaned_parts)}"
-            else:
-                # Keep the original message to see what's not being extracted
-                # This helps identify what other user messages are in the conversation
-                # (e.g., "resuming combat", system messages, etc.)
-                pass  # Don't modify the message - keep original content
-    
-    return conversation_history
 
 def is_valid_json(json_string):
     try:
@@ -971,6 +871,63 @@ def sanitize_unicode_for_logging(text):
     
     return text
 
+def _inexact_character_names(response, encounter_data):
+    """The correction for updateCharacterInfo names that are not exact, or None.
+
+    A target must be a party name, a player or NPC of this encounter, or an
+    existing sheet, exactly (#855, family 2); a near name would otherwise be
+    lost or written to another character at the final consolidated update.
+    """
+    from utils.npc_name_normalizer import exact_character_reference
+
+    try:
+        actions = json.loads(response).get("actions", [])
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(actions, list):
+        return None
+    party = safe_json_load("party_tracker.json") or {}
+    combatants = [
+        creature.get("name") for creature in encounter_data.get("creatures", []) or []
+        if isinstance(creature, dict) and creature.get("type") in ("player", "npc") and creature.get("name")
+    ]
+    inexact = []
+    nameless = 0
+    for action in actions:
+        if not isinstance(action, dict) or str(action.get("action", "")).lower() not in (
+            "updatecharacterinfo", "updateplayerinfo", "updatenpcinfo"
+        ):
+            continue
+        params = action.get("parameters") or {}
+        name = (params.get("characterName") or params.get("npcName")) if isinstance(params, dict) else None
+        if not name:
+            # #959: an update that names no one would be dropped at the end of combat
+            nameless += 1
+        elif exact_character_reference(name, party, combatants) is None:
+            inexact.append(name)
+    if not inexact and not nameless:
+        return None
+    names = list(party.get("partyMembers", []) or []) + [
+        npc.get("name") for npc in party.get("partyNPCs", []) or [] if isinstance(npc, dict)
+    ] + combatants
+    problems = []
+    if inexact:
+        problems.append(
+            "updateCharacterInfo names "
+            + ", ".join(repr(name) for name in inexact)
+            + ", which are not exact character names"
+        )
+    if nameless:
+        problems.append("%d updateCharacterInfo action(s) name no character" % nameless)
+    return (
+        "Character name error: "
+        + "; ".join(problems)
+        + ". Use one of these exact names: "
+        + ", ".join(sorted({str(name) for name in names if name}))
+        + "."
+    )
+
+
 def validate_combat_response(response, encounter_data, user_input, conversation_history=None, npc_voice_batch=None):
     """
     Validate a combat response for accuracy in HP tracking, combat flow, etc.
@@ -988,6 +945,10 @@ def validate_combat_response(response, encounter_data, user_input, conversation_
         debug(f"VALIDATION_CONTEXT: Round={combat_round}, Actions={num_actions}, HasPlan={has_plan}", category="combat_validation")
     except:
         debug("VALIDATION_CONTEXT: Unable to parse response JSON for context", category="combat_validation")
+
+    name_correction = _inexact_character_names(response, encounter_data)
+    if name_correction:
+        return name_correction
     
     # Load validation prompt from file (using toggle for compressed vs original)
     from model_config import USE_COMPRESSED_COMBAT
@@ -1020,36 +981,11 @@ def validate_combat_response(response, encounter_data, user_input, conversation_
             if msg["role"] in ["user", "assistant"]
         ][-(context_pairs * 2):]  # Ensure we only get exactly 12 messages
         
-        # Apply compression to user messages except the last 2
-        compressed_context = []
-        user_message_count = 0
-        total_user_messages = sum(1 for msg in context_messages if msg["role"] == "user")
-        
-        for msg in context_messages:
-            if msg["role"] == "user":
-                user_message_count += 1
-                # Compress all user messages except the last 2
-                if user_message_count <= total_user_messages - 2:
-                    # Check if this is a combat message that should be compressed
-                    if combat_message_compressor.should_compress_user_message(msg, 0, 999):  # Use dummy index since we're just checking content
-                        compressed_content = combat_message_compressor.compress_message((0, msg["content"]))[1]
-                        compressed_context.append({
-                            "role": "user",
-                            "content": compressed_content
-                        })
-                        debug(f"VALIDATION: Compressed user message {user_message_count}/{total_user_messages}", category="combat_validation")
-                    else:
-                        # Not a combat message, keep as-is
-                        compressed_context.append(msg)
-                else:
-                    # Keep last 2 user messages uncompressed
-                    compressed_context.append(msg)
-                    debug(f"VALIDATION: Keeping user message {user_message_count}/{total_user_messages} uncompressed", category="combat_validation")
-            else:
-                # Keep assistant messages as-is
-                compressed_context.append(msg)
-        
-        # Add context header and compressed messages
+        # The context messages are sent as saved (combat message
+        # compression was removed, owner Q6 (ii)).
+        compressed_context = list(context_messages)
+
+        # Add context header and the context messages
         validation_conversation.append({
             "role": "system", 
             "content": f"=== PREVIOUS COMBAT CONTEXT (last {context_pairs} exchanges with compression) ==="
@@ -1237,8 +1173,9 @@ def validate_combat_response(response, encounter_data, user_input, conversation_
                 debug(f"VALIDATION: Invalid JSON from validation model (Attempt {attempt + 1})", category="combat_validation")
                 debug(f"VALIDATION: Problematic response: {validation_response}", category="combat_validation")
                 continue
-                
-        except (LiveProviderSuperseded, InvocationSupersededError):
+
+        except (LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop, LiveProviderCompletedError):
+            # A completed refusal ends the fight window, never re-sent (#1087).
             raise
         except Exception as e:
             debug(f"VALIDATION: Validation error - {str(e)}", category="combat_validation")
@@ -1265,6 +1202,15 @@ def get_initiative_order(encounter_data):
     if not creatures:
         return "No creatures in encounter"
     
+    # A typed encounter's line is its committed initiativeOrder, the order the
+    # combat validation compares against: an observer outside the initiative
+    # membership is not listed (#1354 item C). Legacy encounters keep the
+    # sorted roster below.
+    committed = (encounter_data.get("combatState") or {}).get("initiativeOrder")
+    typed_order = combat_provenance(encounter_data) == "typed" and isinstance(committed, list) and committed
+    if typed_order:
+        creatures = [c for c in (combatant_by_id(encounter_data, cid) for cid in committed) if isinstance(c, dict)]
+
     # Filter out dead creatures - they should not be in the initiative order
     active_creatures = [c for c in creatures if c.get("status", "unknown").lower() != "dead"]
     
@@ -1272,7 +1218,10 @@ def get_initiative_order(encounter_data):
         return "All creatures are dead"
     
     # Sort by initiative (descending), then alphabetically for ties
-    sorted_creatures = sorted(active_creatures, key=lambda x: (-x.get("initiative", 0), x.get("name", "")))
+    if typed_order:
+        sorted_creatures = active_creatures
+    else:
+        sorted_creatures = sorted(active_creatures, key=lambda x: (-x.get("initiative", 0), x.get("name", "")))
     
     order_parts = []
     for creature in sorted_creatures:
@@ -1463,6 +1412,16 @@ def _build_initial_combat_prompt(
     # D-242 consumer 4: a party member already down at combat start.
     down_rules = down_scene_rules_from_encounter(encounter_data)
     down_block = f"\n\n{down_rules}" if down_rules else ""
+    from core.generators.combat_builder import surprise_opening_rules
+
+    surprise_rules = surprise_opening_rules(encounter_data)
+    if surprise_rules:
+        down_block += f"\n\n{surprise_rules}"
+    from core.generators.combat_builder import opening_action_rules
+
+    opening_rules = opening_action_rules(encounter_data)
+    if opening_rules:
+        down_block += f"\n\n{opening_rules}"
     return f"""Dungeon Master Note: Respond with valid JSON containing a 'narration' field, 'combat_round' field, and an 'actions' array. This is the start of combat, so please describe the scene and set initiative order, but don't take any actions yet. Start off by hooking the player and engaging them for the start of combat the way any world class dungeon master would.{down_block}
 
 Important Character Field Definitions:
@@ -1606,6 +1565,42 @@ def recover_pending_combat_output():
     return True
 
 
+def _offer_opening_action(text):
+    """#882: show the player's declared first action at their first turn and
+    offer it as the composer's text (web); the terminal sends it on Enter."""
+    from web.shared_state import emit_player_output, has_player_output_sink
+
+    sentence = text if text.endswith((".", "!", "?")) else text + "."
+    line = "Your declared action: %s Send it as is, or type another action." % sentence
+    if not has_player_output_sink():
+        print(line.replace("Send it as is", "Press Enter to send it"))
+        return
+    # The shape of the rest receipt (#840): a narration on the system channel
+    # is cached with a message id, so the web shows it and a reload keeps it.
+    if emit_player_output({"type": "narration", "channel": "system", "content": line}) is not True:
+        print(line)
+    emit_player_output({"type": "input_suggestion", "channel": "input_suggestion", "content": text})
+
+
+def _open_weapon_roll_prompt(json_file_path):
+    """Item 3: the [ROLL] request of an open code-issued weapon roll phase."""
+    try:
+        state = (safe_json_load(json_file_path) or {}).get("combatState") or {}
+        record = (state.get("pendingTurn") or {}).get("weaponAttack")
+    except Exception:
+        return None
+    if (
+        isinstance(record, dict)
+        and record.get("ready") is not True
+        and isinstance(record.get("dice"), str)
+    ):
+        return "[ROLL] %s%s (Enter: the game rolls): " % (
+            record["dice"],
+            " damage total" if record.get("phase") == "damage" else "",
+        )
+    return None
+
+
 def _agentic_combat_context(encounter_data, path_manager, monster_templates):
     """Build exact character paths plus read-only sheets for intent selection."""
     character_paths = {}
@@ -1622,7 +1617,10 @@ def _agentic_combat_context(encounter_data, path_manager, monster_templates):
                 character_paths[name] = path
                 context_sheets[name] = sheet
         elif creature.get("type") == "npc":
-            sheet, filename = load_npc_with_fuzzy_match(name, path_manager)
+            if creature.get("statsPending") is True:
+                # #1447: no sheet yet; the first intent that targets it builds one.
+                continue
+            sheet, filename = load_npc_with_fuzzy_match(name, path_manager, encounter_data, creature)
             if isinstance(sheet, dict) and filename:
                 character_paths[name] = path_manager.get_character_path(filename)
                 context_sheets[name] = sheet
@@ -1767,6 +1765,62 @@ def _extract_t041_summary(response):
     raise ValueError("T041 returned JSON without a supported prose field")
 
 
+# Context views C6: a location keeps its last ENCOUNTER_KEEP fight records;
+# older ones fold into one record at the head of the list, so the area file
+# and the blocks built from it stay bounded.
+ENCOUNTER_KEEP = 8
+
+
+def _encounter_date(record):
+    when = record.get("worldConditions") if isinstance(record, dict) else None
+    if not isinstance(when, dict):
+        return "an unknown date"
+    return "%s %s %s" % (when.get("day", "?"), when.get("month", "?"), when.get("year", "?"))
+
+
+def fold_location_encounters(encounters, keep=ENCOUNTER_KEEP):
+    """Fold the oldest records of a location's encounters[] in place so at
+    most `keep` recent records remain after one folded record. The folded
+    record keeps the oldest folded encounterId (schema-valid), the latest
+    folded date, a one-line summary and the count under "folded". Returns
+    the number of records folded by this call."""
+    if not isinstance(encounters, list):
+        return 0
+    records = [item for item in encounters if isinstance(item, dict)]
+    folded = records[0] if records and isinstance(records[0].get("folded"), int) else None
+    recent = records[1:] if folded is not None else records
+    if len(recent) <= keep:
+        return 0
+    older = recent[:-keep]
+    recent = recent[-keep:]
+    count = (folded.get("folded", 0) if folded is not None else 0) + len(older)
+    first_id = folded.get("encounterId") if folded is not None else older[0].get("encounterId")
+    first_date = folded.get("foldedFrom") if folded is not None else _encounter_date(older[0])
+    last = older[-1]
+    record = {
+        "encounterId": first_id,
+        "summary": "%d earlier fights here were folded: from %s (%s) through %s (%s)." % (
+            count, first_id, first_date, last.get("encounterId"), _encounter_date(last)),
+        "impact": "Folded record of earlier encounters at this location.",
+        "worldConditions": copy.deepcopy(last.get("worldConditions")),
+        "folded": count,
+        "foldedFrom": first_date,
+    }
+    encounters[:] = [record] + recent
+    return len(older)
+
+
+def _next_encounter_number(encounters):
+    """One more than the largest -E<n> suffix present, folded records
+    included, so a fallback id never repeats one after a fold."""
+    highest = 0
+    for item in encounters if isinstance(encounters, list) else []:
+        value = item.get("encounterId") if isinstance(item, dict) else None
+        if isinstance(value, str) and "-E" in value and value.rsplit("-E", 1)[1].isdigit():
+            highest = max(highest, int(value.rsplit("-E", 1)[1]))
+    return highest + 1
+
+
 def _append_combat_encounter_to_current_area(current_location_id, new_encounter):
     """Merge one encounter into fresh area state under module refresh.
 
@@ -1774,16 +1828,16 @@ def _append_combat_encounter_to_current_area(current_location_id, new_encounter)
     whole-location replacement after T041 would therefore be able to undo a
     completed T088 NPC reconciliation. Resolve the authoritative module/area
     and change only its encounter list while holding the shared outer fence.
+    Busy means wait, never skip (#193 B2-ii, issue #453): a skip lost the
+    fight's record, or made the agentic exit repeat its T041 call. Load,
+    Reset or Quit still end the wait.
     """
-    with module_refresh_lock() as refresh_acquired:
-        if not refresh_acquired:
-            warning(
-                "Combat summary area update skipped because module refresh "
-                "is busy",
-                category="encounter_setup",
-            )
-            return False
-
+    with wait_for_module_refresh(
+        lambda seconds: (
+            "Waiting for module work to finish before recording the fight "
+            "(%d seconds)." % seconds
+        )
+    ):
         try:
             authoritative_party = safe_json_load("party_tracker.json")
         except Exception as exc:
@@ -1814,31 +1868,31 @@ def _append_combat_encounter_to_current_area(current_location_id, new_encounter)
         current_module = authoritative_party.get("module", "")
         if not isinstance(current_module, str):
             return False
-        from utils.module_path_manager import ModulePathManager
-
-        path_manager = ModulePathManager(current_module.replace(" ", "_") or None)
         current_area_id = world_conditions.get("currentAreaId")
         if not isinstance(current_area_id, str) or not current_area_id:
             return False
-        area_file = path_manager.get_area_path(current_area_id)
+        from core.managers.current_location import NO_LOCATION, NOT_FOUND, OK, read_current_location
 
-        try:
-            area_data = safe_json_load(area_file)
-        except Exception as exc:
+        # #448's one reader: strict, so a damaged area is never written back
+        # with its bad bytes replaced (#850).
+        read = read_current_location(authoritative_party)
+        area_file = read.area_file
+        if read.status in (NOT_FOUND, NO_LOCATION):
+            warning(
+                "Combat summary area update skipped because the location "
+                "is no longer present",
+                category="encounter_setup",
+            )
+            return False
+        if read.status != OK:
             error(
-                f"FILE_OP: Failed to load area file: {area_file}",
-                exception=exc,
+                f"FILE_OP: Failed to load area file: {read.detail}",
                 category="file_operations",
             )
             return False
-        if not isinstance(area_data, dict) or not isinstance(
-            area_data.get("locations"), list
-        ):
-            error(
-                f"FILE_OP: Failed to load area file: {area_file}",
-                category="file_operations",
-            )
-            return False
+        # Sanitized as safe_json_load read it, so a healthy area is written
+        # back exactly as before; the new encounter is appended unchanged.
+        area_data = sanitize_dict(read.area)
 
         target_location = next(
             (
@@ -1891,6 +1945,7 @@ def _append_combat_encounter_to_current_area(current_location_id, new_encounter)
                 new_encounter["summary"] = existing["summary"]
             return True
         encounters.append(new_encounter)
+        fold_location_encounters(encounters)
 
         if not safe_write_json(area_file, area_data):
             error(
@@ -1904,6 +1959,169 @@ def _append_combat_encounter_to_current_area(current_location_id, new_encounter)
             category="encounter_setup",
         )
         return True
+
+
+def _combat_record_state(encounter_id):
+    """The combatState of a finished encounter, or None when unreadable."""
+    if not encounter_id:
+        return None
+    try:
+        encounter = safe_json_load(
+            os.path.join("modules", "encounters", "encounter_%s.json" % encounter_id)
+        )
+    except Exception:
+        return None
+    state = encounter.get("combatState") if isinstance(encounter, dict) else None
+    return state if isinstance(state, dict) else None
+
+
+def combat_record_exit_kind(encounter_id):
+    """The typed combatState.pipelineMode of a finished encounter (#543).
+
+    None when the encounter record is missing or unreadable; the marker then
+    states the contract that holds for every exit.
+    """
+    state = _combat_record_state(encounter_id)
+    return state.get("pipelineMode") if state else None
+
+
+def combat_record_xp_receipt(encounter_id):
+    """The combat XP each member was awarded, from the typed receipt (#726).
+
+    None when the encounter has no receipt (an older save or a fight that
+    never applied rewards); the marker then carries no XP line.
+    """
+    state = _combat_record_state(encounter_id)
+    completion = state.get("completion") if state else None
+    receipt = completion.get("appliedRewards") if isinstance(completion, dict) else None
+    return dict(receipt) if isinstance(receipt, dict) and receipt else None
+
+
+def _party_companions():
+    """The party tracker's partyNPCs, or None when the tracker is missing or
+    cannot be read."""
+    try:
+        party = safe_json_load("party_tracker.json")
+    except Exception:
+        return None
+    if not isinstance(party, dict):
+        return None
+    return [npc for npc in party.get("partyNPCs") or [] if isinstance(npc, dict)]
+
+
+def _is_companion(creature, companions):
+    """Whether a creature is one of the party's companions: by occupant id
+    when both carry one; the exact name only as a fallback."""
+    occupant_id = creature.get("occupantId")
+    for npc in companions:
+        if occupant_id and npc.get("occupantId"):
+            if npc["occupantId"] == occupant_id:
+                return True
+        elif npc.get("name") == creature.get("name"):
+            return True
+    return False
+
+
+def combat_record_joined_against_party(encounter_id):
+    """Who joined this fight against the party, from the typed sceneFacts
+    ``joinedHostile`` stamp (#1415 follow-up; ruling on #1403): name, the
+    occupant id or partyNPC, how the fight left them, and who they turned on.
+    None when nobody joined. Code records; the DM decides what it means."""
+    from core.nql.occupants import creature_outcome
+
+    if not encounter_id:
+        return None
+    try:
+        encounter = safe_json_load(
+            os.path.join("modules", "encounters", "encounter_%s.json" % encounter_id)
+        )
+    except Exception:
+        return None
+    if not isinstance(encounter, dict):
+        return None
+    # fail forward: an unreadable tracker gives the record no partyNPC flags
+    companions = _party_companions() or []
+
+    joined = []
+    for row in (encounter.get("sceneFacts") or {}).get("participants") or []:
+        stamp = row.get("joinedHostile") if isinstance(row, dict) else None
+        creature = combatant_by_id(encounter, row.get("combatantId")) if isinstance(stamp, dict) else None
+        if creature is None:
+            continue
+        if normalize_status(creature.get("status")) == "dead":
+            outcome = "died"
+        else:
+            outcome = creature_outcome(creature) or "still standing"
+        entry = {"name": creature.get("name"), "outcome": outcome}
+        if creature.get("occupantId"):
+            entry["occupantId"] = creature["occupantId"]
+        if _is_companion(creature, companions):
+            entry["partyNPC"] = True
+        if stamp.get("by"):
+            entry["by"] = combatant_presentation_name(encounter, stamp["by"])
+        joined.append(entry)
+    return joined or None
+
+
+def render_combat_record_marker(summary_line, exit_kind=None, xp_receipt=None,
+                                joined_against_party=None):
+    """Return the historical combat record appended to the main history.
+
+    ``summary_line`` is the "Combat Summary: ..." line. The normal flow and the
+    resumed-combat flow both append this exact text so the DM treats the fight
+    as history and does not re-award its changes (#253).
+
+    ``exit_kind`` is the encounter's typed pipelineMode (#543). The agentic exit
+    commits HP, slots, effects, ammunition, existing item quantities and XP, and
+    never adds an item or currency; the legacy exit runs the fight's own
+    character updates, which may. The record states only what that exit wrote,
+    so a summary's narrated loot is never presented as owned.
+
+    ``xp_receipt`` is the encounter's typed combat XP receipt (#726). On the
+    agentic exit it is stated as data, so the amount already awarded is a fact
+    rather than something read back out of the summary's prose.
+
+    ``joined_against_party`` is combat_record_joined_against_party's list. On
+    the agentic exit it is stated as data; their attitude and party place are
+    left for the DM to decide.
+    """
+    if exit_kind == "agentic":
+        contract = (
+            "IMPORTANT: The combat system already applied this fight's HP, spell "
+            "slot, effect, ammunition, consumable and combat XP changes; the "
+            "current character sheets show them, so do not re-emit them. This "
+            "combat adds no new item and no currency to any inventory: something "
+            "this summary describes being taken is owned only once a later "
+            "accepted action adds it and the character sheet lists it."
+        )
+        if xp_receipt:
+            contract += (
+                "\nCombat XP already applied by the combat system: "
+                + json.dumps(xp_receipt, sort_keys=True)
+                + "."
+            )
+        if joined_against_party:
+            contract += (
+                "\nJoined against the party in this fight (typed): "
+                + json.dumps(joined_against_party, sort_keys=True)
+                + ". Their attitude and party membership are unchanged; "
+                "setOccupantAttitude and updatePartyNPCs are yours to use if the "
+                "story calls for it."
+            )
+    else:
+        contract = (
+            "IMPORTANT: The changes this fight's turns applied are on the current "
+            "character sheets; do not re-emit them. Something this summary "
+            "describes (an item, treasure or currency) that no character sheet "
+            "lists was not applied, and is owned only once a later accepted "
+            "action adds it."
+        )
+    return (
+        "[COMBAT CONCLUDED - HISTORICAL RECORD]\n"
+        + summary_line
+        + "\n[END OF COMBAT RECORD - Please continue the narrative after this combat]"
+        "\n\n" + contract
+    )
 
 
 def summarize_dialogue(
@@ -2019,7 +2237,7 @@ def summarize_dialogue(
             error("[summarize_dialogue] activeCombatEncounter ID is EMPTY or None. This is the cause of missing encounter IDs.", category="encounter_setup")
             # Try to generate a fallback ID if missing
             existing_encounters = location_data.get("encounters", [])
-            next_num = len(existing_encounters) + 1
+            next_num = _next_encounter_number(existing_encounters)
             encounter_id = f"{current_location_id}-E{next_num}"
             warning(f"[summarize_dialogue] Generated fallback encounter ID: {encounter_id}", category="encounter_setup")
         
@@ -2054,6 +2272,7 @@ def summarize_dialogue(
                 for item in encounters
             ):
                 encounters.append(new_encounter)
+                fold_location_encounters(encounters)
         elif require_persistence:
             raise RuntimeError("Combat summary could not be persisted to the current area")
         # adventureSummary field is deprecated - no longer updated to prevent data bloat
@@ -2216,6 +2435,51 @@ def _finalize_combat_exit(
     return dialogue_summary, player_info
 
 
+def _reward_paths(encounter_data, character_paths):
+    """Keep the sheets of the encounter's committed initiative members (#1339).
+
+    The intent context holds every present player and NPC, an observer
+    included; the reward goes only to the typed initiative membership, the set
+    the victory rule counts (#446). Each name resolves to its own creature rows
+    in ``creatures`` and is gated by combatantId; two rows sharing a name share
+    one sheet, which is paid once when any of them is a member. Legacy and
+    pre-typed encounters keep paying every party-side row (the membership is
+    every row).
+    """
+    eligible = initiative_eligible_ids(encounter_data)
+    # #1415: a member that is not on the party side at fight end (a bystander
+    # who joined as a hostile, a party NPC turned hostile) is not paid.
+    members = {
+        creature.get("name")
+        for creature in encounter_data.get("creatures", [])
+        if isinstance(creature, dict) and creature.get("combatantId") in eligible
+        and is_party_member(creature)
+    }
+    return {
+        name: path for name, path in (character_paths or {}).items()
+        if name in members
+    }
+
+
+def _xp_paths(encounter_data, character_paths):
+    """The reward members (#1339) who are on the party roster: the player and
+    the party's companions (#1458; ruling on #1403). A party-side NPC who is
+    not a companion fights beside the party for this fight and earns no XP;
+    ammunition recovery keeps every member. An unreadable tracker keeps the
+    members, so completion never fails on it."""
+    paths = _reward_paths(encounter_data, character_paths)
+    companions = _party_companions()
+    if companions is None:
+        return paths
+    roster = {
+        creature.get("name")
+        for creature in encounter_data.get("creatures", [])
+        if isinstance(creature, dict)
+        and (creature.get("type") == "player" or _is_companion(creature, companions))
+    }
+    return {name: path for name, path in paths.items() if name in roster}
+
+
 def _complete_agentic_combat(
     encounter_data,
     encounter_path,
@@ -2251,10 +2515,42 @@ def _complete_agentic_combat(
             "Combat effects could not reach their recoverable exit boundary"
         ) from exc
 
+    # AM: the engine returns the recoverable share of the shots fired in this
+    # fight (none when the party fled or yielded: no minute to search).
+    ammunition_note = ""
+    try:
+        from core.managers.combat_state import has_left_fight
+        from core.managers.combat_transaction import recover_ammunition
+
+        fled = any(
+            has_left_fight(creature)
+            for creature in (encounter_data.get("creatures") or [])
+            if isinstance(creature, dict)
+        )
+        # #1405: only the committed initiative members (#1339): an observer
+        # fired nothing here, and its pending count from an earlier fight is
+        # not forfeit by this one.
+        recovery = recover_ammunition(
+            encounter_path, _reward_paths(encounter_data, character_paths), fled
+        )
+        parts = []
+        for name, lines in sorted((recovery or {}).items()):
+            for line in lines:
+                parts.append(
+                    "%s fired %d %s and recovered %d afterwards (now %d)"
+                    % (name, int(line.get("spent", 0)), line.get("name"),
+                       int(line.get("recovered", 0)), int(line.get("after", 0)))
+                )
+        if parts:
+            ammunition_note = " Ammunition: " + "; ".join(parts) + "."
+        encounter_data = safe_json_load(encounter_path) or encounter_data
+    except Exception as exc:
+        warning("AM: ammunition recovery skipped (%s)" % exc, category="combat_events")
+
     xp_narrative, xp_awarded = calculate_xp()
     encounter_data = apply_combat_rewards(
         encounter_path,
-        character_paths,
+        _xp_paths(encounter_data, character_paths),
         xp_awarded,
     )
 
@@ -2268,7 +2564,7 @@ def _complete_agentic_combat(
                 "dialogueSummary", _T041_FALLBACK_SUMMARY
             )
         else:
-            xp_message = f"XP Awarded: {xp_narrative}"
+            xp_message = f"XP Awarded: {xp_narrative}{ammunition_note}"
             if not any(
                 message.get("role") == "user"
                 and message.get("content") == xp_message
@@ -2362,38 +2658,6 @@ def _complete_agentic_combat(
         player_info = None
     return dialogue_summary, player_info
 
-
-def merge_updates(original_data, updated_data):
-    fields_to_update = ['hitPoints', 'equipment', 'attacksAndSpellcasting', 'experience_points']
-
-    for field in fields_to_update:
-        if field in updated_data:
-            if field in ['equipment', 'attacksAndSpellcasting']:
-                # For arrays, replace the entire array
-                original_data[field] = updated_data[field]
-            elif field == 'experience_points':
-                # For XP, only update if the new value is greater than the existing value
-                if updated_data[field] > original_data.get(field, 0):
-                    original_data[field] = updated_data[field]
-            else:
-                # For simple fields like hitpoints, just update the value
-                original_data[field] = updated_data[field]
-
-    return original_data
-
-# DEPRECATED: This function is no longer used and has been replaced by the new XP awarding system
-# that uses update_character_info directly with proper synchronization.
-# The new system:
-# 1. Awards XP through update_character_info with "Awarded X experience points" message
-# 2. Uses atomic file operations with proper locking
-# 3. Has XP protection to prevent reduction
-# 4. Includes comprehensive debug logging
-# Keeping this function for reference only - DO NOT USE
-def update_json_schema(ai_response, player_info, encounter_data, party_tracker_data):
-    # This old function tried to extract XP from AI responses and update characters
-    # It has been replaced by the more robust XP awarding system in the main combat loop
-    warning("DEPRECATED: update_json_schema called but is no longer used", category="xp_tracking")
-    return player_info  # Return unchanged data
 
 def generate_chat_history(conversation_history, encounter_id, archive_filename=None):
     """
@@ -2559,10 +2823,13 @@ def sync_active_encounter():
                 except Exception as e:
                     error(f"FAILURE: Failed to sync player data to encounter", exception=e, category="encounter_setup")
                     
+            elif creature["type"] == "npc" and creature.get("statsPending") is True:
+                # #1447: no sheet yet, so nothing to sync.
+                continue
             elif creature["type"] == "npc":
                 try:
-                    # Use fuzzy matching for NPC loading
-                    npc_data, matched_filename = load_npc_with_fuzzy_match(creature['name'], path_manager)
+                    # The NPC's own sheet: its recorded sourceRef, else its exact name
+                    npc_data, matched_filename = load_npc_with_fuzzy_match(creature['name'], path_manager, encounter_data, creature)
                     if not npc_data:
                         error(f"FAILURE: Failed to load NPC file for: {creature['name']}", category="file_operations")
                     else:
@@ -2627,6 +2894,8 @@ def format_character_for_combat(char_data, char_type="player", role=None):
             item_description = item['item_name']
             if item.get('quantity', 1) > 1:
                 item_description = f"{item_description} x{item['quantity']}"
+            if item.get('equipped') is True:
+                item_description = f"{item_description} [equipped]"
             equipment_list.append(item_description)
         if equipment_list:
             equipment_str = ", ".join(equipment_list)
@@ -2766,6 +3035,8 @@ def format_npc_for_combat(npc_data, npc_role=None):
             item_description = item['item_name']
             if item.get('quantity', 1) > 1:
                 item_description = f"{item_description} x{item['quantity']}"
+            if item.get('equipped') is True:
+                item_description = f"{item_description} [equipped]"
             equipment_list.append(item_description)
         if equipment_list:
             equipment_str = ", ".join(equipment_list)
@@ -2927,11 +3198,151 @@ def filter_encounter_for_system_prompt(encounter_data):
     debug("STATE_CHANGE: Created minimal encounter data for system prompt", category="combat_events")
     return minimal_data
 
+def _round_facts_text(encounter, round_num):
+    """The committed facts of one round for the round summary, or None.
+
+    Built from combatState.roundEvents (the compact committed events) and the
+    encounter's creature states. Names and initiatives come from the roster
+    by combatantId. Returns None when the encounter holds no events for the
+    round, so a legacy fight or an older encounter gives the prompt as before.
+    """
+    events = round_events(encounter, round_num)
+    if not events:
+        return None
+    roster = {}
+    for creature in (encounter or {}).get("creatures", []) or []:
+        if isinstance(creature, dict) and creature.get("combatantId"):
+            roster[str(creature["combatantId"])] = creature
+
+    def _name(combatant_id):
+        creature = roster.get(str(combatant_id))
+        if creature is None:
+            return str(combatant_id)
+        name = creature.get("name")
+        return name if isinstance(name, str) and name.strip() else str(combatant_id)
+
+    lines = []
+    for event in events:
+        actor_id = event.get("actorId")
+        creature = roster.get(str(actor_id)) or {}
+        initiative = creature.get("initiative")
+        head = _name(actor_id)
+        if isinstance(initiative, (int, float)) and not isinstance(initiative, bool):
+            head = f"{head} (initiative {initiative})"
+        action = str(event.get("action") or "action")
+        description = str(event.get("description") or "").strip()
+        parts = [f"{head}: {action}" + (f", {description}" if description else "")]
+        for target in event.get("targets") or []:
+            if not isinstance(target, dict):
+                continue
+            parts.append(
+                "target %s HP %s -> %s (%s)" % (
+                    _name(target.get("combatantId")),
+                    target.get("hpBefore"), target.get("hpAfter"),
+                    display_status(
+                        roster.get(str(target.get("combatantId"))) or {},
+                        target.get("statusAfter"),
+                        hp=target.get("hpAfter"),
+                    ),
+                )
+            )
+        rolls = []
+        for roll in event.get("rolls") or []:
+            if not isinstance(roll, dict):
+                continue
+            # A roll is the die result, never the HP lost: "damage roll 1"
+            # beside "HP 51 -> 49" (the HP line is the damage dealt).
+            piece = str(roll.get("purpose") or roll.get("die") or "roll")
+            if roll.get("total") is not None:
+                piece += f" total {roll.get('total')}"
+            elif roll.get("value") is not None:
+                piece += f" roll {roll.get('value')}"
+                if roll.get("rule") and roll.get("treated") not in (None, roll.get("value")):
+                    piece += f" (counts as {roll.get('treated')}, {roll.get('rule')})"
+                elif (roll.get("rule") and roll.get("facesTreated")
+                      and roll.get("facesTreated") != roll.get("faces")):
+                    piece += f" (dice {roll.get('faces')} count as {roll.get('facesTreated')}, {roll.get('rule')})"
+            if roll.get("success") is not None:
+                piece += " success" if roll.get("success") else " failure"
+            rolls.append(piece)
+        if rolls:
+            parts.append("rolls: " + "; ".join(rolls))
+        spent = []
+        for record in event.get("resources") or []:
+            if not isinstance(record, dict):
+                continue
+            piece = f"{record.get('owner')} {record.get('kind')} {record.get('name')} {record.get('delta')}"
+            if record.get("before") is not None and record.get("after") is not None:
+                piece += f" ({record.get('before')} -> {record.get('after')})"
+            spent.append(piece)
+        if spent:
+            parts.append("resources: " + "; ".join(spent))
+        ticked = []
+        for tick in event.get("effectTicks") or []:
+            if not isinstance(tick, dict):
+                continue
+            holder = tick.get("owner") or _name(tick.get("combatantId"))
+            piece = f"{tick.get('name') or tick.get('effectId') or 'effect'} on {holder}"
+            if tick.get("expired"):
+                piece += " expired"
+            elif tick.get("roundsBefore") is not None and tick.get("roundsAfter") is not None:
+                piece += f" {tick.get('roundsBefore')} -> {tick.get('roundsAfter')} rounds"
+            ticked.append(piece)
+        if ticked:
+            parts.append("effects at round end: " + "; ".join(ticked))
+        lines.append("- " + "; ".join(parts))
+
+    states = []
+    for creature in roster.values():
+        conditions = [str(c) for c in (creature.get("conditions") or []) if c]
+        states.append(
+            "- %s: HP %s/%s, %s%s" % (
+                _name(creature.get("combatantId")),
+                creature.get("currentHitPoints"), creature.get("maxHitPoints"),
+                display_status(creature, encounter=encounter),
+                (", conditions " + ", ".join(conditions)) if conditions else "",
+            )
+        )
+    now_round = ((encounter or {}).get("combatState") or {}).get("round")
+    states_head = "Creature states now"
+    if isinstance(now_round, int) and not isinstance(now_round, bool):
+        states_head += f" (as of round {now_round}, after this round; deaths may be from later rounds)"
+    return (
+        f"Committed facts for round {round_num} (authoritative for actors, initiatives, rolls, "
+        "damage and HP; the log above is for the narrative highlights):\n"
+        + "\n".join(lines)
+        + f"\n\n{states_head}:\n"
+        + "\n".join(states)
+    )
+
+
+_ROUND_SUMMARY_OPENING = re.compile(r"COMBAT ROUND (\d+) SUMMARY:\n")
+
+
+def _round_summary_round(message):
+    """The round a game-written round summary covers, or None.
+
+    A summary carries its round as a marker field. One saved before the
+    field existed is read by the opening words the game gave it (an
+    assistant message that starts with them), as history_markers reads
+    every marker saved before its field.
+    """
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None
+    if hm.MARKER_FIELD in message:
+        if hm.is_marker(message, hm.COMBAT_ROUND_SUMMARY):
+            return hm.message_round(message)
+        return None
+    match = _ROUND_SUMMARY_OPENING.match(message.get("content") or "")
+    return int(match.group(1)) if match else None
+
+
 def compress_old_combat_rounds(
     conversation_history,
     current_round,
     keep_recent_rounds=1,
     invocation_claim=None,
+    encounter=None,
 ):
     """
     Compress old combat rounds in conversation history to reduce token usage.
@@ -2953,8 +3364,7 @@ def compress_old_combat_rounds(
         for round_num in range(1, current_round - keep_recent_rounds):
             # Check if this round is already compressed
             already_compressed = any(
-                msg.get('role') == 'assistant' and 
-                f"COMBAT ROUND {round_num} SUMMARY:" in msg.get('content', '')
+                _round_summary_round(msg) == round_num
                 for msg in conversation_history
             )
             if not already_compressed:
@@ -2975,17 +3385,12 @@ def compress_old_combat_rounds(
         for i, msg in enumerate(conversation_history):
             content = msg.get('content', '')
             
-            # Check for combat round markers in user messages
-            # Look for both old format (COMBAT ROUND X) and new format (combat_round: X)
+            # A user message belongs to a round only by the round the game
+            # wrote on it (the legacy turn message); its words, which hold
+            # the player's, are never searched for round numbers.
             if msg.get('role') == 'user':
-                # Old format: COMBAT ROUND X
-                match = re.search(r'COMBAT ROUND (\d+)', content)
-                if not match:
-                    # New format from initiative tracker: combat_round: X
-                    match = re.search(r'combat_round:\s*(\d+)', content)
-                
-                if match:
-                    round_num = int(match.group(1))
+                round_num = hm.message_round(msg)
+                if round_num is not None:
                     if round_num in rounds_to_compress:
                         current_tracking_round = round_num
                         if round_num not in round_boundaries:
@@ -3011,13 +3416,9 @@ def compress_old_combat_rounds(
             elif current_tracking_round and current_tracking_round in round_boundaries:
                 round_boundaries[current_tracking_round].append(i)
                 
-                # Stop tracking when we hit the next round
-                # Check both old and new format
-                next_round_match = re.search(r'COMBAT ROUND (\d+)', content)
-                if not next_round_match:
-                    next_round_match = re.search(r'combat_round:\s*(\d+)', content)
-                
-                if next_round_match and int(next_round_match.group(1)) != current_tracking_round:
+                # Stop tracking at a summary of another round
+                next_round = _round_summary_round(msg)
+                if next_round is not None and next_round != current_tracking_round:
                     current_tracking_round = None
         
         # Compress each round
@@ -3048,14 +3449,17 @@ def compress_old_combat_rounds(
                     round_to_compress,
                     round_messages,
                     invocation_claim=invocation_claim,
+                    facts=_round_facts_text(encounter, round_to_compress),
                 )
                 
                 if summary:
                     # Add compressed round
-                    new_conversation.append({
-                        "role": "assistant",
-                        "content": f"COMBAT ROUND {round_to_compress} SUMMARY:\n{json.dumps(summary, indent=2)}"
-                    })
+                    new_conversation.append(hm.marker(
+                        "assistant",
+                        f"COMBAT ROUND {round_to_compress} SUMMARY:\n{json.dumps(summary, indent=2)}",
+                        hm.COMBAT_ROUND_SUMMARY,
+                        **{hm.ROUND_FIELD: round_to_compress},
+                    ))
                     
                     # Add transition message
                     if round_to_compress < current_round - keep_recent_rounds:
@@ -3129,7 +3533,6 @@ def _is_valid_combat_round_summary(summary, expected_round):
         "actor",
         "action",
         "target",
-        "roll",
         "result",
         "effects",
     )
@@ -3141,12 +3544,19 @@ def _is_valid_combat_round_summary(summary, expected_round):
             for field in required_action_strings
         ):
             return False
+        # #1378: an action with no roll (defend, dodge) may leave roll empty;
+        # it is still a string. Nothing reads it but the summary's own text.
+        if not isinstance(action.get("roll"), str):
+            return False
 
+        # A round with no committed facts names no initiative, so T042 may
+        # leave it null; nothing reads it (#1008). A given value is a number.
         initiative = action.get("init")
-        if isinstance(initiative, bool) or not isinstance(initiative, (int, float)):
-            return False
-        if not math.isfinite(initiative):
-            return False
+        if initiative is not None:
+            if isinstance(initiative, bool) or not isinstance(initiative, (int, float)):
+                return False
+            if not math.isfinite(initiative):
+                return False
 
         outcome_fields = [field for field in ("damage", "heal") if field in action]
         if not outcome_fields or not all(
@@ -3180,6 +3590,9 @@ def _is_valid_combat_round_summary(summary, expected_round):
         return False
     if not _is_string_list(round_end_state["dead"]):
         return False
+    # #1458: optional, so a summary in the old shape still passes.
+    if "unconscious" in round_end_state and not _is_string_list(round_end_state["unconscious"]):
+        return False
 
     if not all(
         _is_nonempty_string(character) and _is_string_list(conditions)
@@ -3194,40 +3607,50 @@ def generate_combat_round_summary(
     round_num,
     round_messages,
     invocation_claim=None,
+    facts=None,
 ):
-    """Generate a structured summary of a combat round using AI"""
+    """Generate a structured summary of a combat round using AI.
+
+    ``facts`` is the round's committed-facts text (see _round_facts_text);
+    when None the prompt is exactly the narration-only prompt of before.
+    """
     try:
         # Extract content from messages
         round_content = "\n\n".join([
             f"[{msg.get('role', 'unknown')}]: {msg.get('content', '')}"
             for msg in round_messages
         ])
-        
+        facts_block = f"\n{facts}\n" if facts else ""
+
         prompt = f"""Convert this combat round into a structured JSON summary optimized for AI consumption.
 
 Round {round_num} Combat Log:
 {round_content}
-
+{facts_block}
 Create a JSON summary with EXACTLY this structure:
 {{
   "round": {round_num},
   "actions": [
-    {{"actor": "name", "init": number, "action": "action_type", "target": "target_name", "roll": "dice+mod=total vs AC/DC", "result": "hit/miss/save/fail", "damage": "X type" or "heal": "X", "effects": "HP changes, conditions, etc"}}
+    {{"actor": "name", "init": number or null, "action": "action_type", "target": "target_name", "roll": "dice+mod=total vs AC/DC", "result": "hit/miss/save/fail", "damage": "X type" or "heal": "X", "effects": "HP changes, conditions, etc"}}
   ],
-  "deaths": ["ALL creatures with HP 0 or listed as dead in the creature states -- include every dead creature regardless of when they died"],
+  "deaths": ["ALL creatures listed as dead in the creature states -- include every dead creature regardless of when they died"],
   "status_changes": ["new conditions or effects applied this round"],
   "resource_usage": {{"character": "resources used (spell slots, abilities, etc)"}},
   "narrative_highlights": ["evocative highlights capturing key dramatic moments, critical hits, deaths, powerful spells, or memorable character actions"],
   "round_end_state": {{
     "alive": ["Name (current/max HP)"],
     "dead": ["Name"],
+    "unconscious": ["Name"],
     "conditions": {{"Name": ["conditions"]}}
   }}
 }}
 
 CRITICAL RULES:
-- The "deaths" array MUST include every creature shown as dead or at 0 HP in the creature states, even if they died in a prior round. This is a complete death list for state tracking.
+- The "deaths" array MUST include every creature shown as dead in the creature states, even if they died in a prior round. This is a complete death list for state tracking.
+- "deaths" and "dead" list only creatures whose status is dead. A creature at 0 HP that is not dead (unconscious, stable, down) goes in "unconscious", never in "deaths" or "dead".
 - Focus on mechanical accuracy for the actions -- exact roll values, damage numbers, and HP totals.
+- Every action carries "damage" or "heal"; a miss, a failed attempt or a non-damaging action carries "damage": "0".
+- "init" is the initiative shown in the log or the facts; null when none is shown.
 - For narrative_highlights, extract the most dramatic moments.
 - Use only standard ASCII characters -- no smart quotes, no em-dashes, no Unicode symbols."""
 
@@ -3316,6 +3739,20 @@ def run_combat_simulation(
            _finish_owned_combat_round_scope(owned_round_scope)
 
 
+def _resume_party_defeated(encounter_data):
+    """Whether a resumed agentic encounter has no party member standing (#1335).
+
+    Such a resume gets no T043 re-engagement narration: the down-scene rescue
+    rules assume a standing ally (a solo party heard invented companions), and
+    the party-defeat pause follows. A legacy encounter has no typed pause and
+    keeps its narration.
+    """
+    return (
+        (encounter_data.get("combatState") or {}).get("pipelineMode") == "agentic"
+        and all_party_resolved(encounter_data)
+    )
+
+
 def _run_combat_simulation(
     encounter_id,
     party_tracker_data,
@@ -3388,6 +3825,8 @@ def _run_combat_simulation(
                combat_state["phase"] = "awaiting_actor"
            save_json_file(json_file_path, encounter_data)
        print(f"[COMBAT_MANAGER] Encounter loaded: {len(encounter_data.get('creatures', []))} creatures")
+   except ReadOnlySaveStop:
+       raise
    except Exception as e:
        print(f"[COMBAT_MANAGER] Exception loading encounter: {str(e)}")
        error(f"FAILURE: Failed to load encounter file {json_file_path}", exception=e, category="file_operations")
@@ -3452,8 +3891,8 @@ def _run_combat_simulation(
                    return None, None
        
        elif creature["type"] == "npc":
-           # Use fuzzy matching for NPC loading
-           npc_data, matched_filename = load_npc_with_fuzzy_match(creature["name"], path_manager)
+           # The NPC's own sheet: its recorded sourceRef, else its exact name
+           npc_data, matched_filename = load_npc_with_fuzzy_match(creature["name"], path_manager, encounter_data, creature)
            if npc_data and matched_filename:
                # Use the matched filename as the key to avoid duplicates
                if matched_filename not in npc_templates:
@@ -3482,6 +3921,22 @@ def _run_combat_simulation(
        # Filter out adventureSummary and encounters from location data to reduce token usage (same as conversation_utils.py)
        # Encounters are tracked separately and don't need to be in the location context
        location_for_combat = {k: v for k, v in location_info.items() if k not in ['adventureSummary', 'encounters']}
+       # P4-f: who is here is the engine's view; the authored lists are not
+       # read for state when the view answers.
+       try:
+           from core.nql import occupants as _occupants
+           _world_now = party_tracker_data.get("worldConditions", {}) or {}
+           _here = _occupants.place_roster(
+               str(party_tracker_data.get("module") or ""), str(_world_now.get("currentLocationId") or "")
+           )
+       except Exception:
+           _here = None
+       if _here is not None:
+           location_for_combat.pop("monsters", None)
+           location_for_combat.pop("npcs", None)
+           location_for_combat["occupants"] = _here["present"]
+           if _here["rosterRecord"]:
+               location_for_combat["rosterRecord"] = _here["rosterRecord"]
        conversation_history[4]["content"] = f"Location:\n{json.dumps(location_for_combat, indent=2)}"
        
        # Add each NPC as a separate system message (matching conversation_utils format)
@@ -3698,8 +4153,8 @@ def _run_combat_simulation(
            
            # Get the actual max HP from the correct source
            if creature["type"] == "npc":
-               # For NPCs, look up their true max HP from their character file using fuzzy match
-               npc_data, matched_filename = load_npc_with_fuzzy_match(creature_name, path_manager)
+               # For NPCs, look up their true max HP from their own character file
+               npc_data, matched_filename = load_npc_with_fuzzy_match(creature_name, path_manager, encounter_data, creature)
                if npc_data:
                    creature_max_hp = npc_data["maxHitPoints"]
                else:
@@ -3765,7 +4220,8 @@ def _run_combat_simulation(
            or combat_state.get("pendingDelivery") is not None
        )
    )
-   if is_resuming and not pending_agentic_recovery:
+   resume_party_defeated = _resume_party_defeated(encounter_data)
+   if is_resuming and not pending_agentic_recovery and not resume_party_defeated:
        # This is a resumed session. Inject a message to get a re-engagement narration.
        print("[COMBAT_MANAGER] Injecting 'player has returned' message to re-engage AI.")
        debug("RESUME: Starting combat resume flow", category="combat_events")
@@ -3846,8 +4302,7 @@ This is narration only. Do not advance the round or apply any combat action."""
 
            temperature_used = get_combat_temperature(encounter_data, validation_attempt=0)
 
-           # Compress conversation history before sending to AI
-           messages_to_send = combat_message_compressor.process_combat_conversation(conversation_history)
+           messages_to_send = copy.deepcopy(conversation_history)
 
            _require_current_combat_invocation(invocation_claim)
            resume_response = capture_and_fanout("T043", api_client.create_completion,
@@ -3858,9 +4313,15 @@ This is narration only. Do not advance the round or apply any combat action."""
                **{k: v for k, v in combat_config.items() if k != "model"})
            _require_current_combat_invocation(invocation_claim)
 
-       except (CombatTurnPaused, LiveProviderSuperseded, InvocationSupersededError):
+       except (CombatTurnPaused, LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop):
            raise
        except Exception as e:
+           if (
+               isinstance(e, LiveProviderCompletedError)
+               and combat_provenance(encounter_data) == "typed"
+           ):
+               # #1087: a typed resume never re-sends a refused call.
+               raise
            resume_stage_failed = True
            error("FAILURE: T043 re-engagement API call failed.", exception=e, category="combat_events")
            print(f"DEBUG: [RESUME] Error getting re-engagement: {str(e)}")
@@ -3905,9 +4366,7 @@ This is narration only. Do not advance the round or apply any combat action."""
                )
            except Exception:
                pass
-           retry_messages = combat_message_compressor.process_combat_conversation(
-               conversation_history
-           )
+           retry_messages = copy.deepcopy(conversation_history)
            retry_response = capture_and_fanout(
                "T043",
                api_client.create_completion,
@@ -4008,8 +4467,7 @@ This is narration only. Do not advance the round or apply any combat action."""
                # Calculate temperature with attempt number for dynamic adjustment
                temperature_used = get_combat_temperature(encounter_data, validation_attempt=attempt)
 
-               # Compress conversation history before sending to AI
-               messages_to_send = combat_message_compressor.process_combat_conversation(conversation_history)
+               messages_to_send = copy.deepcopy(conversation_history)
 
                response = capture_and_fanout("T044", api_client.create_completion,
                    _request_provider=MODEL_PROVIDER,
@@ -4044,7 +4502,9 @@ This is narration only. Do not advance the round or apply any combat action."""
                    # validation_result is now the full feedback string
                    conversation_history.append({"role": "user", "content": validation_result})
                    continue
-           except (CombatTurnPaused, LiveProviderSuperseded, InvocationSupersededError):
+           except (CombatTurnPaused, LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop,
+                   LiveProviderCompletedError):
+               # A completed refusal ends the fight window, never re-sent (#1087).
                raise
            except Exception as e:
                error(f"FAILURE: AI call for initial scene failed on attempt {attempt + 1}", exception=e, category="combat_events")
@@ -4062,6 +4522,13 @@ This is narration only. Do not advance the round or apply any combat action."""
        )
        parsed_response = json.loads(initial_response)
        _display_combat_narration(parsed_response['narration'])
+   elif is_resuming and resume_party_defeated and not pending_agentic_recovery:
+       # A pending agentic recovery keeps the deferral below.
+       debug(
+           "RESUME: Whole party defeated; no re-engagement narration, the "
+           "party-defeat pause follows (#1335)",
+           category="combat_events",
+       )
    else:
        # Staged mechanics are more authoritative than a generic re-engagement
        # scene. Recover/apply them in the loop first, then narrate that exact
@@ -4170,7 +4637,7 @@ This is narration only. Do not advance the round or apply any combat action."""
            and (encounter_data.get("combatState") or {}).get(
                "pendingDelivery"
            ) is None
-           and all_hostiles_resolved(encounter_data)
+           and combat_resolved(encounter_data)
        ):
            character_paths, _context_sheets = _agentic_combat_context(
                encounter_data,
@@ -4225,8 +4692,8 @@ This is narration only. Do not advance the round or apply any combat action."""
        # Reload NPC data
        for creature in encounter_data["creatures"]:
            if creature["type"] == "npc":
-               # Use fuzzy matching for NPC reloading
-               npc_data, matched_filename = load_npc_with_fuzzy_match(creature["name"], path_manager)
+               # The NPC's own sheet: its recorded sourceRef, else its exact name
+               npc_data, matched_filename = load_npc_with_fuzzy_match(creature["name"], path_manager, encounter_data, creature)
                if npc_data and matched_filename:
                    # Update the NPC in the templates dictionary
                    npc_templates[matched_filename] = npc_data
@@ -4279,6 +4746,8 @@ This is narration only. Do not advance the round or apply any combat action."""
        presentation_history_input = None
        presentation_skipped_player_notice = None
        down_table_talk = None
+       weapon_roll_prompt = None
+       weapon_roll_answer = None
        if agentic_mode:
            agentic_recovery = recovery_action(encounter_data)
            # D-242-A round boundary: while the human is down, before the
@@ -4302,6 +4771,7 @@ This is narration only. Do not advance the round or apply any combat action."""
                        name=player_name_display, token=GO_ON_TOKEN
                    )
                )
+               raise_if_save_stopped()
                try:
                    boundary_line = input(
                        f"{stats_display} "
@@ -4461,8 +4931,31 @@ This is narration only. Do not advance the round or apply any combat action."""
                category="combat_events",
            )
        else:
+           # The terminal's builtin input() has no stop hook: never ask for
+           # an action that could not be saved (issue #654).
+           raise_if_save_stopped()
            try:
-               user_input_text = input(f"{stats_display} {player_name_display}: ")
+               # Item 3: an open code-issued weapon roll asks with its own
+               # [ROLL] line; the typed answer goes to the turn as is.
+               weapon_roll_prompt = (
+                   _open_weapon_roll_prompt(json_file_path) if agentic_mode else None
+               )
+               # #882: the action the player declared as the fight began is
+               # offered once, at this first window; marked before it is shown.
+               opening_action = (
+                   None if weapon_roll_prompt else take_opening_action(json_file_path)
+               )
+               if opening_action:
+                   _offer_opening_action(opening_action)
+               user_input_text = input(
+                   weapon_roll_prompt or f"{stats_display} {player_name_display}: "
+               )
+               if weapon_roll_prompt:
+                   weapon_roll_answer = user_input_text
+                   if not user_input_text.strip():
+                       user_input_text = "(Enter: the game rolls)"
+               elif opening_action and not user_input_text.strip():
+                   user_input_text = opening_action
                print(f"DEBUG: [COMBAT_LOOP] Got player input: {user_input_text[:50]}..." if len(user_input_text) > 50 else f"DEBUG: [COMBAT_LOOP] Got player input: {user_input_text}")
                debug(f"COMBAT_LOOP: Received player input of length {len(user_input_text)}", category="combat_events")
            except EOFError:
@@ -4486,42 +4979,9 @@ This is narration only. Do not advance the round or apply any combat action."""
                active_round_scope = open_live_turn_scope()
                owned_round_scope["scope"] = active_round_scope
 
-       # Preserve the actual submission for deterministic rule matching. The
-       # enriched text below contains code-authored inventory/SRD annotations
-       # and must never be treated as a fresh player mention.
+       # The player's submission as typed (D-KW-5: never annotated).
        raw_combat_input_text = user_input_text
        
-       # Enhance player input with inventory and relevant SRD context for combat
-       try:
-           # Load fresh player data for inventory
-           player_file = path_manager.get_character_path(normalize_character_name(player_name_display))
-           fresh_player_data = safe_json_load(player_file)
-           
-           # Enhance real player input with inventory context. The automatic
-           # initiative continuation is a system instruction, not a player
-           # action, so inventory context would be misleading there.
-           if not automatic_initiative_step:
-               user_input_text = enhance_player_input_with_inventory(
-                   raw_combat_input_text,
-                   fresh_player_data,  # character_data
-                   party_tracker_data,  # party_tracker_data
-                   None,  # characters_data not needed
-                   in_combat=True  # This is combat context
-               )
-               if not agentic_mode:
-                   srd_context = build_srd_context(
-                       raw_combat_input_text,
-                       fresh_player_data,
-                   )
-                   if srd_context:
-                       user_input_text = "%s\n\n%s" % (user_input_text, srd_context)
-               debug(
-                   "COMBAT_LOOP: Enhanced player input with inventory/SRD context",
-                   category="combat_events",
-               )
-       except Exception as e:
-           debug(f"COMBAT_LOOP: Failed to enhance player context: {e}", category="combat_events")
-           # Continue with unenhanced input if enhancement fails
        presentation_history_input = _delivery_history_input(
            presentation_history_input, user_input_text
        )
@@ -4601,8 +5061,8 @@ This is narration only. Do not advance the round or apply any combat action."""
                # Get the actual max HP from the correct source
                npc_data = None
                if creature["type"] == "npc":
-                   # For NPCs, look up their true max HP from their character file using fuzzy match
-                   npc_data, matched_filename = load_npc_with_fuzzy_match(creature_name, path_manager)
+                   # For NPCs, look up their true max HP from their own character file
+                   npc_data, matched_filename = load_npc_with_fuzzy_match(creature_name, path_manager, encounter_data, creature)
                    if npc_data:
                        creature_max_hp = npc_data["maxHitPoints"]
                    else:
@@ -4754,7 +5214,6 @@ This is narration only. Do not advance the round or apply any combat action."""
 
                spell_references = build_contextual_spell_payload(
                    context_sheets,
-                   raw_combat_input_text,
                    actor_names=automatic_turn_window,
                    encounter_context="\n".join(
                        str(value)
@@ -4818,17 +5277,26 @@ This is narration only. Do not advance the round or apply any combat action."""
                        presentation_skipped_player_notice,
                    )
                )
-               outcome = execute_agentic_turn(
-                   json_file_path,
-                   agentic_actor_ids,
-                   character_paths,
-                   context_sheets,
-                   provider_player_input,
-                   spell_references=spell_references,
-                   delivery_context=delivery_context,
-                   npc_voice_intents=npc_voice_intents,
-                   invocation_claim=invocation_claim,
-               )
+               try:
+                   outcome = execute_agentic_turn(
+                       json_file_path,
+                       agentic_actor_ids,
+                       character_paths,
+                       context_sheets,
+                       provider_player_input,
+                       spell_references=spell_references,
+                       delivery_context=delivery_context,
+                       npc_voice_intents=npc_voice_intents,
+                       invocation_claim=invocation_claim,
+                       weapon_roll_text=weapon_roll_answer,
+                   )
+               except (LiveProviderSuperseded, InvocationSupersededError) as exc:
+                   # A supersession no Load/Reset/Exit owns must not end the
+                   # fight silently: pause this turn and keep it (#990).
+                   if _lifecycle_owns_supersession(invocation_claim):
+                       raise
+                   _warn_unowned_supersession(exc, json_file_path)
+                   raise CombatTurnPaused("unowned supersession") from exc
                if voice_stage is not None:
                    try:
                        from core.npc.voice_context import (
@@ -4850,30 +5318,42 @@ This is narration only. Do not advance the round or apply any combat action."""
                # paths, or provider details. Only explicitly approved player
                # messages cross the UI boundary; every other safe pause uses
                # one neutral recovery instruction.
+               # #1118 (D-1118-8 D): a code-issued roll's dice card is a system
+               # record, shown first under its own id (so a re-ask of the same
+               # phase does not show it twice on the web); the DM's words then
+               # carry the ask.
+               pause_card = getattr(exc, "card", None)
                pause_narration = getattr(exc, "player_message", None) or (
+                   None if pause_card else
                    "Combat paused safely. Your turn is preserved. Please try "
                    "the action again, or save and resume the game."
                )
+               if pause_card:
+                   from core.managers.checks_runtime import _show_check_receipt
+
+                   _show_check_receipt(pause_card, message_id=getattr(exc, "card_id", None))
                conversation_history.append(
                    {"role": "user", "content": presentation_history_input}
                )
-               conversation_history.append(
-                   {
-                       "role": "assistant",
-                       "content": json.dumps(
-                           {
-                               "combat_round": current_round,
-                               "narration": pause_narration,
-                               "actions": [],
-                           },
-                           ensure_ascii=False,
-                       ),
-                   }
-               )
+               if pause_narration:
+                   conversation_history.append(
+                       {
+                           "role": "assistant",
+                           "content": json.dumps(
+                               {
+                                   "combat_round": current_round,
+                                   "narration": pause_narration,
+                                   "actions": [],
+                               },
+                               ensure_ascii=False,
+                           ),
+                       }
+                   )
                _save_combat_history_under_invocation(
                    invocation_claim, conversation_history
                )
-               _display_combat_narration(pause_narration)
+               if pause_narration:
+                   _display_combat_narration(pause_narration)
                if (
                    agentic_recovery["action"] == "apply_staged_events"
                    and isinstance(exc, CombatTransactionError)
@@ -4968,6 +5448,7 @@ This is narration only. Do not advance the round or apply any combat action."""
                        committed_round,
                        keep_recent_rounds=1,
                        invocation_claim=invocation_claim,
+                       encounter=encounter_data,
                    )
                    if compressed_history != conversation_history:
                        conversation_history = compressed_history
@@ -4993,7 +5474,7 @@ This is narration only. Do not advance the round or apply any combat action."""
                    invocation_claim=invocation_claim,
                )
 
-           if all_hostiles_resolved(encounter_data):
+           if combat_resolved(encounter_data):
                try:
                    final_result = _complete_agentic_combat(
                        encounter_data,
@@ -5070,14 +5551,13 @@ This is narration only. Do not advance the round or apply any combat action."""
        # DON'T add (player) markers - the tracker handles this properly now
        marked_initiative_display = initiative_display
        
-       # Extract current turn from initiative display if available
-       current_turn_marker = "[>]"
-       current_turn_line = ""
-       if current_turn_marker in marked_initiative_display:
-           for line in marked_initiative_display.split('\n'):
-               if current_turn_marker in line:
-                   current_turn_line = line.strip()
-                   break
+       # Whose turn the tracker points at: the creatures whose own tracker
+       # line carries [>], each line matched whole against its creature.
+       from .initiative_tracker_ai import tracker_current_turn_names
+
+       current_turn_names = tracker_current_turn_names(
+           marked_initiative_display, encounter_data.get("creatures", [])
+       )
        
        # Build turn window info if available
        turn_window_text = ""
@@ -5113,8 +5593,7 @@ constraints:
 """
        elif (
            not automatic_initiative_step
-           and current_turn_line
-           and player_character_name in current_turn_line
+           and player_character_name in current_turn_names
        ):
            submitted_window = _living_turn_window_from_player(encounter_data)
            if submitted_window:
@@ -5231,12 +5710,16 @@ Rules:
 
 {required_response}"""
        
-       # Clean old DM notes and combat state blocks before adding new user input
-       conversation_history = clean_old_dm_notes(conversation_history)
-       conversation_history = clean_combat_state_blocks(conversation_history)
-       
-       # Add user input to conversation history
-       conversation_history.append({"role": "user", "content": user_input_with_note})
+       # Add user input to conversation history: an automatic initiative
+       # window is a game marker, a player's turn carries the player's own
+       # words beside the turn message (#449); both carry the round the
+       # tracker above names (combat_round: current_round).
+       if automatic_initiative_step:
+           turn_message = hm.marker("user", user_input_with_note, hm.COMBAT_CONTINUATION)
+       else:
+           turn_message = hm.player_turn(user_input_with_note, raw_combat_input_text)
+       turn_message[hm.ROUND_FIELD] = current_round
+       conversation_history.append(turn_message)
        save_json_file(conversation_history_file, conversation_history)
 
        # Compose legacy NPC guidance once for this calculated initiative
@@ -5303,11 +5786,10 @@ Rules:
 
                print(f"DEBUG: [COMBAT] Using model: {combat_config['model']} (temp: {temperature_used}, provider: {MODEL_PROVIDER}, attempt: {attempt + 1})")
 
-               # Compress conversation history before sending to AI
-               messages_to_send = combat_message_compressor.process_combat_conversation(conversation_history)
+               messages_to_send = copy.deepcopy(conversation_history)
 
-               # T105 guidance is private and request-local. Compression runs
-               # first, then the same immutable batch is inserted before the
+               # T105 guidance is private and request-local. The history is
+               # copied first, then the same immutable batch is inserted before the
                # final user combat-state message on every correction attempt.
                if legacy_voice_batch is not None:
                    try:
@@ -5472,7 +5954,7 @@ Rules:
                    else:
                        warning("VALIDATION: Max retries exceeded for combat validation. Using last response.", category="combat_validation")
                        break
-           except (LiveProviderSuperseded, InvocationSupersededError):
+           except (LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop, LiveProviderCompletedError):
                raise
            except Exception as e:
                error(f"FAILURE: Failed to get or validate AI response (Attempt {attempt + 1}/{max_retries})", exception=e, category="combat_events")
@@ -5607,9 +6089,10 @@ Rules:
                        debug(f"COMPRESSION: Checking for round compression (current round: {new_round})", category="combat_events")
                        debug(f"COMPRESSION: About to call compress_old_combat_rounds with round {new_round}", category="combat_events")
                        compressed_history = compress_old_combat_rounds(
-                           conversation_history, 
-                           new_round, 
-                           keep_recent_rounds=1  # Changed from 2 to 1 for more aggressive compression
+                           conversation_history,
+                           new_round,
+                           keep_recent_rounds=1,  # Changed from 2 to 1 for more aggressive compression
+                           encounter=encounter_data,
                        )
                        
                        # Save compressed history
@@ -5655,6 +6138,10 @@ Rules:
                character_name = parameters.get(char_name_key)
                changes = parameters.get("changes")
 
+               if not character_name and changes:
+                   # Backstop: the name check sends a nameless update back (#959)
+                   warning("CONSOLIDATING: an update names no character; not applied: %r" % (changes,),
+                           category="combat_events")
                if character_name and changes:
                    if character_name not in final_character_updates:
                        final_character_updates[character_name] = []

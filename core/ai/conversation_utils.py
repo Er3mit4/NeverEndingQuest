@@ -77,14 +77,17 @@
 # ============================================================================
 
 import json
+from core.ai import history_markers as hm
 import os
 import re
 from utils.module_path_manager import ModulePathManager
-from utils.encoding_utils import safe_json_load
+from utils.encoding_utils import safe_json_load, sanitize_dict
+from core.managers.current_location import current_location_data
 from utils.character_sheet_contract import normalize_for_runtime
 from utils.plot_formatting import format_plot_for_ai
 from utils.enhanced_logger import debug, info, warning, error, set_script_name
-from core.ai.atlas_builder import build_atlas_for_module, format_atlas_for_conversation
+from utils.transient_filesystem import raise_if_save_stopped
+from core.ai.atlas_builder import cached_atlas_for_module, format_atlas_for_conversation
 from core.combat.down_scene import (
     DOWN_RULES_MARKER,
     from_sheets as down_scene_rules_from_sheets,
@@ -98,6 +101,109 @@ def _effects_runtime_view(character_data):
     except Exception:
         pass
     return character_data
+
+
+
+def _signed(value):
+    """'+4' / '-1' for an engine-written bonus; 'N/A' when the sheet has none."""
+    return f"{value:+d}" if type(value) is int else "N/A"
+
+
+def _skills_text(sheet):
+    """The sheet's skills for the DM: engine bonuses from a dict, names only from a legacy list."""
+    skills = sheet.get('skills')
+    if isinstance(skills, dict) and skills:
+        return ', '.join(f"{skill} {_signed(bonus)}" if type(bonus) is int else str(skill)
+                         for skill, bonus in skills.items())
+    if isinstance(skills, list) and skills:
+        return 'proficient: ' + ', '.join(str(skill) for skill in skills)
+    return 'none'
+
+
+def _expertise_text(sheet):
+    expertise = sheet.get('expertise')
+    if isinstance(expertise, list) and expertise:
+        return ' | EXPERTISE: ' + ', '.join(str(skill) for skill in expertise)
+    return ''
+
+
+def _saves_text(sheet):
+    """Saving throws for the DM: the engine's totals when stored, proficient abilities otherwise."""
+    totals = sheet.get('savingThrowBonuses')
+    proficient = sheet.get('savingThrows') if isinstance(sheet.get('savingThrows'), list) else []
+    if isinstance(totals, dict) and totals:
+        return ', '.join(f"{ability.capitalize()} {_signed(total)}" for ability, total in totals.items()) + (
+            f" (proficient: {', '.join(str(a) for a in proficient)})" if proficient else "")
+    return ', '.join(str(a) for a in proficient) if proficient else 'none'
+
+
+def _roll_modes_text(sheet):
+    """The engine's roll modes from conditions; the roll prompt applies them, this only forewarns the DM."""
+    modes = sheet.get('rollModes')
+    if isinstance(modes, dict) and modes:
+        return ' | ROLL MODES (the engine applies these at the roll prompt; never pass them as mode): ' + '; '.join(f"{what}: {mode}" for what, mode in modes.items())
+    return ''
+
+
+def _level_ups_text(sheet):
+    """Engine-written: the level-ups the XP has earned (the DM offers levelUp; no arithmetic here)."""
+    pending = sheet.get('levelUpsPending')
+    if type(pending) is int and pending > 0:
+        return f" | LEVEL-UP EARNED ({pending}; offer levelUp)"
+    return ''
+
+
+def _concentration_text(sheet):
+    """Code-written: the spell the character concentrates on (the engine saves on damage and ends it everywhere)."""
+    record = sheet.get('concentration')
+    if isinstance(record, dict) and record.get('name'):
+        targets = ', '.join(record.get('targets') or []) or 'self'
+        until = f"; until {record['expiration']}" if record.get('expiration') else ''
+        return (f" | CONCENTRATING ON: {record['name']} (targets {targets}{until}; one spell at a time, a new one ends it; "
+                f"the engine rolls the Constitution save when damage lands and reports it under CHECK RESULTS; never roll it)")
+    return ''
+
+
+def _exhaustion_text(sheet):
+    level = sheet.get('exhaustion')
+    if type(level) is int and level > 0:
+        return f' | EXHAUSTION: level {level} (-{2 * level} on d20 rolls; a long rest removes one level)'
+    return ''
+
+
+def _speed_text(sheet):
+    """The speed the engine holds now: the base fact, less 5 ft per exhaustion level (its rule)."""
+    level = sheet.get('exhaustion')
+    base = sheet.get('speed')
+    if type(level) is int and level > 0 and type(base) is int:
+        return f"{max(0, base - 5 * level)} ft NOW (base {base}, exhaustion level {level} costs {5 * level})"
+    return str(base)
+
+def _charges_tag(item):
+    """"[charges C of M]" for an equipment row with an integer charges object,
+    plus how it recharges: the row's typed rate, or its catalog type's rule
+    (H2b; a catalog row carries no rate). A catalog charged item whose count
+    the engine has not set yet says so; a destroyed unit (quantity 0) says so."""
+    if not isinstance(item, dict):
+        return ""
+    charges = item.get("charges")
+    rule = None
+    try:
+        from core.nql import genesis
+        rule = genesis.charge_rule(item)
+    except Exception:
+        rule = None
+    if not isinstance(charges, dict) or type(charges.get("current")) is not int or type(charges.get("max")) is not int:
+        if rule is not None and rule.source == "pack" and item.get("quantity") != 0:
+            return "[charged; the engine sets its count at first use]"
+        return ""
+    if item.get("quantity") == 0:
+        return "[destroyed; its charges are gone]"
+    rate = item.get("rechargeRate")
+    rate_text = f", recharges {rate}" if isinstance(rate, str) and rate and rate != "never" else ""
+    if not rate_text and rule is not None and rule.source == "pack" and rule.recharges and rule.rate:
+        rate_text = f", recharges {rule.rate}"
+    return f"[charges {charges['current']} of {charges['max']}{rate_text}]"
 
 
 def _format_temporary_effects(character_data):
@@ -182,123 +288,6 @@ def inject_campaign_summaries(new_history, current_module=None):
     except Exception as e:
         debug(f"FAILURE: Error injecting campaign summaries", exception=e, category="campaign_context")
 
-# ============================================================================
-# MODULE TRANSITION DETECTION AND HANDLING
-# ============================================================================
-
-def find_last_module_transition_index(conversation_history):
-    """Find the index of the last module transition marker"""
-    for i in range(len(conversation_history) - 1, -1, -1):
-        message = conversation_history[i]
-        if (message.get("role") == "user" and 
-            message.get("content", "").startswith("Module transition:")):
-            return i
-    return -1  # No previous module transition found
-
-def find_last_system_message_index(conversation_history):
-    """Find the index of the last system message to use as boundary marker"""
-    for i in range(len(conversation_history) - 1, -1, -1):
-        if conversation_history[i].get("role") == "system":
-            return i
-    return 0  # If no system message found, start from beginning
-
-def extract_conversation_segment(conversation_history, start_index):
-    """Extract conversation segment from start_index to end"""
-    if start_index >= len(conversation_history):
-        return []
-    return conversation_history[start_index:]
-
-def generate_conversation_summary(conversation_segment, module_name):
-    """Generate a concise summary of the conversation segment for a module"""
-    if not conversation_segment:
-        return f"Brief activities in {module_name}."
-    
-    # Count meaningful interactions (exclude system messages and transitions)
-    meaningful_messages = [
-        msg for msg in conversation_segment 
-        if msg.get("role") in ["user", "assistant"] and 
-        not msg.get("content", "").startswith(("Location transition:", "Module transition:"))
-    ]
-    
-    if len(meaningful_messages) <= 2:
-        return f"Brief activities in {module_name}."
-    elif len(meaningful_messages) <= 5:
-        return f"Short adventure in {module_name} with several interactions."
-    else:
-        return f"Extended adventure in {module_name} with multiple significant events and discoveries."
-
-def insert_module_summary_and_transition(conversation_history, summary_text, transition_text, insertion_index):
-    """Insert module summary and transition marker at specified index"""
-    # Create summary message
-    summary_message = {
-        "role": "user",
-        "content": f"Module summary: {summary_text}"
-    }
-    
-    # Create transition message  
-    transition_message = {
-        "role": "user",
-        "content": transition_text
-    }
-    
-    # Insert both messages at the specified index
-    conversation_history.insert(insertion_index, summary_message)
-    conversation_history.insert(insertion_index + 1, transition_message)
-    
-    debug(f"STATE_CHANGE: Inserted module summary and transition at index {insertion_index}", category="module_management")
-    debug(f"STATE_CHANGE: Module transition message: '{transition_text}'", category="module_management")
-    
-    return conversation_history
-
-def handle_module_conversation_segmentation(conversation_history, from_module, to_module):
-    """Insert module transition marker - compression handled later by check_and_process_module_transitions()
-    
-    This function now only inserts the transition marker. The actual conversation
-    compression is handled separately by check_and_process_module_transitions() 
-    which mirrors the location transition processing logic.
-    """
-    debug(f"STATE_CHANGE: Inserting module transition marker for {from_module} -> {to_module}", category="module_management")
-    
-    # Simply insert the module transition marker at the end (matching location transition format)
-    transition_text = f"Module transition: {from_module} to {to_module}"
-    transition_message = {
-        "role": "user",
-        "content": transition_text
-    }
-    
-    # Add transition marker to conversation history
-    conversation_history.append(transition_message)
-    
-    debug(f"STATE_CHANGE: Module transition marker inserted: '{transition_text}'", category="module_management")
-    debug(f"STATE_CHANGE: Conversation history now has {len(conversation_history)} messages", category="conversation_management")
-    
-    return conversation_history
-
-def get_previous_module_from_history(conversation_history):
-    """Extract the previous module from conversation history"""
-    # Look for the most recent module transition marker
-    last_transition_index = find_last_module_transition_index(conversation_history)
-    if last_transition_index != -1:
-        # Parse the transition message to get the "to" module
-        transition_msg = conversation_history[last_transition_index].get("content", "")
-        # Format: "Module transition: from_module to to_module"
-        parts = transition_msg.split(" to ")
-        if len(parts) == 2:
-            return parts[1].strip()
-    
-    # If no transition found, look for module info in system messages
-    for msg in reversed(conversation_history):
-        if msg.get("role") == "system":
-            content = msg.get("content", "")
-            if "Current module:" in content:
-                # Extract module name from world state context
-                import re
-                match = re.search(r"Current module: ([^\n(]+)", content)
-                if match:
-                    return match.group(1).strip()
-    
-    return None
-
 def compress_json_data(data):
     """Compress JSON data by removing unnecessary whitespace."""
     return json.dumps(data, separators=(',', ':'))
@@ -339,8 +328,8 @@ def _latest_player_input(conversation_history):
 
     for message in reversed(conversation_history):
         if isinstance(message, dict) and message.get("role") == "user":
-            value = _raw_player_text(message.get("content"))
-            if value and not value.startswith("Error Note:"):
+            value = _raw_player_text(message)
+            if value:
                 return value
     return ""
 
@@ -575,6 +564,22 @@ def build_companion_memory_message(
         )
         return None
 
+def _loot_for_view(location, party_tracker_data):
+    """P3a: the location's lootItems as the DM sees them, with the remaining
+    count; read with the turn's (or the welcome's) control-scope wait."""
+    from core.managers.item_acquisition import loot_view
+    from utils.capture.live_provider_call import (
+        _interruptible_wait, get_active_welcome_scope, get_live_provider_scope,
+    )
+
+    def wait():
+        _interruptible_wait(0.25, get_live_provider_scope() or get_active_welcome_scope(),
+                            "Reading the module's items...")
+
+    party = party_tracker_data if isinstance(party_tracker_data, dict) else {}
+    return loot_view(location, party.get("module"), party, wait=wait)
+
+
 def update_conversation_history(
     conversation_history,
     party_tracker_data,
@@ -617,7 +622,7 @@ def update_conversation_history(
     for i in range(max(0, len(conversation_history) - 5), len(conversation_history)):
         if i < len(conversation_history):
             msg = conversation_history[i]
-            if msg.get("role") == "user" and "Module transition:" in msg.get("content", ""):
+            if hm.is_marker(msg, hm.MODULE_TRANSITION):
                 # Found a transition marker - parse it
                 import re
                 match = re.match(r"Module transition: (.+?) to (.+?)$", msg.get("content", ""))
@@ -634,11 +639,7 @@ def update_conversation_history(
                         later_msg
                         for later_msg in conversation_history[i + 1 :]
                         if later_msg.get("role") in {"user", "assistant"}
-                        and not (
-                            later_msg.get("role") == "user"
-                            and "Module transition:"
-                            in later_msg.get("content", "")
-                        )
+                        and not hm.is_marker(later_msg, *hm.MODULE_KINDS)
                     ]
                     print(f"DEBUG: [update_conversation_history] Found unprocessed transition: {transition_from_module} -> {transition_to_module}")
                     break
@@ -667,7 +668,7 @@ def update_conversation_history(
             continue
 
         # Skip module transition markers
-        if msg["role"] == "user" and "Module transition:" in msg.get("content", ""):
+        if hm.is_marker(msg, *hm.MODULE_KINDS):
             continue
 
         # ALWAYS remove companion memories - fresh canonical data is injected below.
@@ -801,15 +802,11 @@ def update_conversation_history(
             # Fallback to parameter if file reading fails
             current_module = party_tracker_data.get('module', 'Unknown') if party_tracker_data else 'Unknown'
         
-        world_state_parts = []
-        if available_modules:
-            other_modules = [m for m in available_modules if m != current_module]
-            if other_modules:
-                world_state_parts.append(f"Available modules for travel: {', '.join(other_modules)}")
-                world_state_parts.append(f"To travel to another module, use: 'I travel to [module name]' or similar explicit phrasing")
-            world_state_parts.append(f"Current module: {current_module}")
-        else:
-            world_state_parts.append(f"Current module: {current_module} (no other modules detected)")
+        # C3: other modules are listed once, under INSTALLED MODULE REFERENCES.
+        world_state_parts = [f"Current module: {current_module}"]
+        if available_modules and [m for m in available_modules if m != current_module]:
+            world_state_parts.append("Other installed modules are listed under INSTALLED MODULE REFERENCES; "
+                                     "to travel to one, use: 'I travel to [module name]' or similar explicit phrasing")
             
         hub_context = format_campaign_hubs(campaign_manager.campaign_data.get('hubs', {}))
         if hub_context:
@@ -864,7 +861,7 @@ def update_conversation_history(
     current_module_name = party_tracker_data.get("module", "").replace(" ", "_") if party_tracker_data else None
     if current_module_name:
         try:
-            atlas = build_atlas_for_module(current_module_name)
+            atlas = cached_atlas_for_module(current_module_name)
             if atlas:
                 atlas_message = format_atlas_for_conversation(atlas)
                 new_history.append({"role": "system", "content": atlas_message})
@@ -884,46 +881,44 @@ def update_conversation_history(
     #         map_message += f"{map_data}\n"
     #         new_history.append({"role": "system", "content": map_message})
 
-    # Load the area-specific JSON file
-    location_data = None
-    if current_area_id:
-        # Use current module from party tracker for consistent path resolution
-        current_module_name = party_tracker_data.get("module", "").replace(" ", "_") if party_tracker_data else None
-        path_manager = ModulePathManager(current_module_name)
-        area_file = path_manager.get_area_path(current_area_id)
-        print(f"DEBUG: [update_conversation_history] Loading area file: {area_file}")
-        try:
-            location_data = safe_json_load(area_file)
-            if location_data is None:
-                print(f"DEBUG: [update_conversation_history] ERROR: {area_file} not found. Skipping location data.")
-            else:
-                print(f"DEBUG: [update_conversation_history] Loaded area {current_area_id} with {len(location_data.get('locations', []))} locations")
-        except json.JSONDecodeError:
-            print(f"DEBUG: [update_conversation_history] ERROR: {area_file} has an invalid JSON format. Skipping location data.")
-            location_data = None
-    else:
-        print(f"DEBUG: [update_conversation_history] No current_area_id, skipping area file load")
-
-    # Find the relevant location data based on the current location ID
+    # The current location, from #448's one reader; sanitized, as this history always read it; lootItems resolved from the raw record
     current_location = None
-    if location_data and current_location_id:
-        print(f"DEBUG: [update_conversation_history] Searching for locationId '{current_location_id}' in area {current_area_id}")
-        for location in location_data["locations"]:
-            if location["locationId"] == current_location_id:
-                current_location = location
-                print(f"DEBUG: [update_conversation_history] FOUND location: {location.get('name')}")
-                break
-        if not current_location:
-            print(f"DEBUG: [update_conversation_history] ERROR: Location '{current_location_id}' NOT FOUND in area {current_area_id}")
-            print(f"DEBUG: [update_conversation_history] Available location IDs: {[loc.get('locationId') for loc in location_data.get('locations', [])]}")
-    else:
-        print(f"DEBUG: [update_conversation_history] Skipping location search - location_data: {location_data is not None}, current_location_id: {current_location_id}")
+    loot = None
+    if current_area_id and current_location_id:
+        current_location = current_location_data(party_tracker_data, consumer="update_conversation_history")
+        if current_location is not None:
+            if current_location.get("lootItems"):
+                loot = _loot_for_view(current_location, party_tracker_data)
+            current_location = sanitize_dict(current_location)
 
     # Insert the most recent location information
     if current_location:
-        # Create a filtered copy for conversation history, omitting adventureSummary to reduce tokens
-        location_for_conversation = {k: v for k, v in current_location.items() if k != 'adventureSummary'}
-        
+        # Create a filtered copy for conversation history, omitting adventureSummary to reduce tokens.
+        # C3: adjacency is told once, by the atlas; the connectivity fields are omitted here.
+        location_for_conversation = {k: v for k, v in current_location.items()
+                                     if k not in ('adventureSummary', 'connectivity', 'areaConnectivity', 'areaConnectivityId', 'lootItems')}
+        if loot is not None:
+            location_for_conversation["lootItems"] = loot
+        # The engine's record of what became of each group here replaces the
+        # per-fight encounter entries (the adventure summary keeps the story).
+        # Absent only while the engine or its document is unavailable.
+        try:
+            from core.nql import occupants as _occupants
+            _record = _occupants.location_record(
+                current_location_id, party_tracker_data.get("module", "") if party_tracker_data else ""
+            )
+        except Exception as _exc:  # the context is never the reason a turn stops
+            warning(f"[update_conversation_history] roster record unavailable: {_exc}",
+                    category="conversation_history")
+            _record = None
+        if _record is not None:
+            # P4-f: who is here is the engine's view (`occupants`, with the
+            # authored description joined by id); the authored lists stay in
+            # the file, unread for state.
+            for _authored_list in ("encounters", "monsters", "npcs"):
+                location_for_conversation.pop(_authored_list, None)
+            location_for_conversation.update(_record)
+
         new_history.append({
             "role": "system",
             "content": f"Current Location:\n{compress_json_data(location_for_conversation)}\n"
@@ -958,7 +953,7 @@ def update_conversation_history(
     # Add the rest of the conversation history
     debug(f"STATE_CHANGE: update_conversation_history preserving {len(updated_history)} messages", category="conversation_management")
     # Check for module transition messages
-    module_transitions = [msg for msg in updated_history if msg.get("role") == "user" and "Module transition:" in msg.get("content", "")]
+    module_transitions = [msg for msg in updated_history if hm.is_marker(msg, *hm.MODULE_KINDS)]
     if module_transitions:
         debug(f"VALIDATION: Found {len(module_transitions)} module transition messages in preserved history", category="module_management")
     else:
@@ -996,10 +991,23 @@ def _feats_text(feats):
         if isinstance(feat, dict):
             name = _single_line(feat.get("name"))
             desc = _single_line(feat.get("description"))
+            if feat.get("grantedSpells"):
+                desc += " grantedSpells=" + json.dumps(feat["grantedSpells"], ensure_ascii=True)
             parts.append(f"{name}: {desc}" if desc else name)
         else:
             parts.append(_single_line(feat))
     return ", ".join(parts)
+
+
+def _spell_guidance_message(sheet):
+    """r2 13b: the SRD entries of the spells on a player's sheet (never the words)."""
+    try:
+        from core.ai.srd_reference import sheet_spell_guidance
+
+        return sheet_spell_guidance(sheet.get("name"), sheet)
+    except Exception as exc:  # noqa: BLE001 - guidance is enrichment; the turn goes on
+        warning(f"SRD spell guidance unavailable: {exc}", category="conversation_management")
+        return ""
 
 
 def update_character_data(conversation_history, party_tracker_data):
@@ -1013,7 +1021,8 @@ def update_character_data(conversation_history, party_tracker_data):
             entry["role"] == "system"
             and ("Here's the updated character data for" in entry["content"]
                  or "Here's the NPC data for" in entry["content"]
-                 or DOWN_RULES_MARKER in entry["content"])
+                 or DOWN_RULES_MARKER in entry["content"]
+                 or entry["content"].startswith("SRD spell guidance for "))
         )
     ]
 
@@ -1056,6 +1065,13 @@ def update_character_data(conversation_history, party_tracker_data):
                         item_description = f"{item['item_name']} ({item['item_type']})"
                         if item['quantity'] > 1:
                             item_description = f"{item_description} x{item['quantity']}"
+                        if item.get('equipped') is True:
+                            item_description = f"{item_description} [equipped]"
+                        # Item charges: the engine-held count (the DM never
+                        # invents one; the description's own number is flavor).
+                        charges_tag = _charges_tag(item)
+                        if charges_tag:
+                            item_description = f"{item_description} {charges_tag}"
                         # D-242-D: the item's whole description (single line).
                         item_desc_text = _single_line(item.get('description'))
                         if item_desc_text:
@@ -1071,49 +1087,21 @@ def update_character_data(conversation_history, party_tracker_data):
                         bg_feature_name = bg_feature['name']
                     
                     
-                    # Calculate skill modifiers for display
-                    skills_display = ""
-                    if isinstance(member_data['skills'], dict):
-                        # Legacy format - use pre-calculated values
-                        skills_display = ', '.join(f"{skill} +{bonus}" if bonus >= 0 else f"{skill} {bonus}" 
-                                                 for skill, bonus in member_data['skills'].items())
-                    else:
-                        # Array format - calculate modifiers for proficient skills
-                        skill_abilities = {
-                            'Acrobatics': 'dexterity', 'Animal Handling': 'wisdom', 
-                            'Arcana': 'intelligence', 'Athletics': 'strength',
-                            'Deception': 'charisma', 'History': 'intelligence',
-                            'Insight': 'wisdom', 'Intimidation': 'charisma',
-                            'Investigation': 'intelligence', 'Medicine': 'wisdom',
-                            'Nature': 'intelligence', 'Perception': 'wisdom',
-                            'Performance': 'charisma', 'Persuasion': 'charisma',
-                            'Religion': 'intelligence', 'Sleight of Hand': 'dexterity',
-                            'Stealth': 'dexterity', 'Survival': 'wisdom'
-                        }
-                        
-                        skill_displays = []
-                        for skill in member_data.get('skills', []):
-                            if skill in skill_abilities:
-                                ability_name = skill_abilities[skill]
-                                ability_score = member_data['abilities'].get(ability_name, 10)
-                                ability_mod = (ability_score - 10) // 2
-                                modifier = ability_mod + member_data['proficiencyBonus']
-                                if modifier >= 0:
-                                    skill_displays.append(f"{skill} +{modifier}")
-                                else:
-                                    skill_displays.append(f"{skill} {modifier}")
-                        skills_display = ', '.join(skill_displays) if skill_displays else 'none'
+                    # Skill bonuses are the rules engine's (core/nql/stats): a dict
+                    # carries the engine's numbers; a legacy list names the
+                    # proficient skills without a number (no arithmetic here).
+                    skills_display = _skills_text(member_data)
                     
                     # Format character data
                     formatted_data = f"""
 CHAR: {member_data['name']}
 TYPE: {member_data['character_type'].capitalize()} | LVL: {member_data['level']} | RACE: {member_data['race']} | CLASS: {member_data['class']} | ALIGN: {str(member_data['alignment']).upper()} | BG: {member_data['background']}
-AC: {member_data['armorClass']} | SPD: {member_data['speed']}
+AC: {member_data['armorClass']} | SPD: {_speed_text(member_data)}
 STATUS: {member_data['status']} | CONDITION: {member_data['condition']} | AFFECTED: {', '.join(member_data['condition_affected'])}
 STATS: STR {member_data['abilities']['strength']}, DEX {member_data['abilities']['dexterity']}, CON {member_data['abilities']['constitution']}, INT {member_data['abilities']['intelligence']}, WIS {member_data['abilities']['wisdom']}, CHA {member_data['abilities']['charisma']}
-SAVES: {', '.join(member_data['savingThrows'])}
+SAVES: {_saves_text(member_data)}
 SKILLS: {skills_display}
-PROF BONUS: +{member_data['proficiencyBonus']}
+PROF BONUS: +{member_data['proficiencyBonus']} | INIT: {_signed(member_data.get('initiative'))} (final total; proficiency, feats and expertise are already included in INIT, SKILLS, SAVES, SENSES and spell DC){_expertise_text(member_data)}{_exhaustion_text(member_data)}{_roll_modes_text(member_data)}
 SENSES: {', '.join(f"{sense} {value}" for sense, value in member_data['senses'].items())}
 LANGUAGES: {', '.join(member_data['languages'])}
 PROF: {', '.join([f"{cat}: {', '.join(items)}" for cat, items in member_data['proficiencies'].items()])}
@@ -1125,14 +1113,14 @@ CLASS FEAT: {', '.join([f"{feature['name']}" for feature in member_data['classFe
 RACIAL: {', '.join([f"{trait['name']}" for trait in member_data['racialTraits']])}
 BG FEAT: {bg_feature_name}
 FEATS: {_feats_text(member_data.get('feats', []))}
-TEMP FX: {_format_temporary_effects(member_data)}
+TEMP FX: {_format_temporary_effects(member_data)}{_concentration_text(member_data)}
 EQUIP: {equipment_str}
 AMMO: {', '.join([f"{ammo['name']} x{ammo['quantity']}" for ammo in member_data.get('ammunition', [])])}
 ATK: {', '.join([f"{atk['name']} ({atk['type']}, {atk['damageDice']} {atk['damageType']})" for atk in member_data['attacksAndSpellcasting']])}
 SPELLCASTING: {member_data.get('spellcasting', {}).get('ability', 'N/A')} | DC: {member_data.get('spellcasting', {}).get('spellSaveDC', 'N/A')} | ATK: +{member_data.get('spellcasting', {}).get('spellAttackBonus', 'N/A')}
 SPELLS: {', '.join([f"{level}: {', '.join(spells)}" for level, spells in member_data.get('spellcasting', {}).get('spells', {}).items() if spells])}
 CURRENCY: {member_data['currency']['gold']}G, {member_data['currency']['silver']}S, {member_data['currency']['copper']}C
-XP: {member_data['experience_points']}/{member_data.get('exp_required_for_next_level', 'N/A')}
+XP: {member_data['experience_points']}/{member_data.get('exp_required_for_next_level', 'N/A')}{_level_ups_text(member_data)}
 TRAITS: {member_data['personality_traits']}
 IDEALS: {member_data['ideals']}
 BONDS: {member_data['bonds']}
@@ -1140,6 +1128,11 @@ FLAWS: {member_data['flaws']}
 """
                     character_message = f"Here's the updated character data for {name}:\n{formatted_data}\n"
                     character_data.append({"role": "system", "content": character_message})
+                    # r2 13b: the SRD entries of this sheet's spells, beside the
+                    # sheet and replaced with it each turn.
+                    spell_guidance = _spell_guidance_message(member_data)
+                    if spell_guidance:
+                        character_data.append({"role": "system", "content": spell_guidance})
                     loaded_sheets.append(member_data)
             except FileNotFoundError:
                 print(f"{member_file} not found. Skipping JSON data for {name}.")
@@ -1174,6 +1167,11 @@ FLAWS: {member_data['flaws']}
                         # Check if quantity exists before accessing it
                         if item.get('quantity', 1) > 1:
                             item_description = f"{item_description} x{item['quantity']}"
+                        if item.get('equipped') is True:
+                            item_description = f"{item_description} [equipped]"
+                        charges_tag = _charges_tag(item)
+                        if charges_tag:
+                            item_description = f"{item_description} {charges_tag}"
                         # D-242-D: the item's whole description (single line).
                         item_desc_text = _single_line(item.get('description'))
                         if item_desc_text:
@@ -1188,51 +1186,19 @@ FLAWS: {member_data['flaws']}
                     if isinstance(bg_feature, dict) and 'name' in bg_feature:
                         bg_feature_name = bg_feature['name']
 
-                    # Calculate skill modifiers for NPC display
-                    npc_skills_display = ""
-                    if isinstance(npc_data.get('skills', {}), dict):
-                        # NPCs typically use dict format with pre-calculated values
-                        npc_skills_display = ', '.join(f"{skill} +{bonus}" if bonus >= 0 else f"{skill} {bonus}" 
-                                                     for skill, bonus in npc_data['skills'].items())
-                    elif isinstance(npc_data.get('skills', []), list):
-                        # In case NPCs use array format, calculate modifiers
-                        skill_abilities = {
-                            'Acrobatics': 'dexterity', 'Animal Handling': 'wisdom', 
-                            'Arcana': 'intelligence', 'Athletics': 'strength',
-                            'Deception': 'charisma', 'History': 'intelligence',
-                            'Insight': 'wisdom', 'Intimidation': 'charisma',
-                            'Investigation': 'intelligence', 'Medicine': 'wisdom',
-                            'Nature': 'intelligence', 'Perception': 'wisdom',
-                            'Performance': 'charisma', 'Persuasion': 'charisma',
-                            'Religion': 'intelligence', 'Sleight of Hand': 'dexterity',
-                            'Stealth': 'dexterity', 'Survival': 'wisdom'
-                        }
-                        
-                        skill_displays = []
-                        for skill in npc_data.get('skills', []):
-                            if skill in skill_abilities:
-                                ability_name = skill_abilities[skill]
-                                ability_score = npc_data['abilities'].get(ability_name, 10)
-                                ability_mod = (ability_score - 10) // 2
-                                modifier = ability_mod + npc_data.get('proficiencyBonus', 2)
-                                if modifier >= 0:
-                                    skill_displays.append(f"{skill} +{modifier}")
-                                else:
-                                    skill_displays.append(f"{skill} {modifier}")
-                        npc_skills_display = ', '.join(skill_displays) if skill_displays else 'none'
-                    else:
-                        npc_skills_display = 'none'
+                    # Skill bonuses are the rules engine's (core/nql/stats).
+                    npc_skills_display = _skills_text(npc_data)
 
                     # Format NPC data (using same schema as players)
                     formatted_data = f"""
 NPC: {npc_data['name']}
 ROLE: {npc['role']} | TYPE: {npc_data['character_type'].capitalize()} | LVL: {npc_data['level']} | RACE: {npc_data['race']} | CLASS: {npc_data['class']} | ALIGN: {str(npc_data['alignment']).upper()} | BG: {npc_data['background']}
-AC: {npc_data['armorClass']} | SPD: {npc_data['speed']}
+AC: {npc_data['armorClass']} | SPD: {_speed_text(npc_data)}
 STATUS: {npc_data['status']} | CONDITION: {npc_data['condition']} | AFFECTED: {', '.join(npc_data['condition_affected'])}
 STATS: STR {npc_data['abilities']['strength']}, DEX {npc_data['abilities']['dexterity']}, CON {npc_data['abilities']['constitution']}, INT {npc_data['abilities']['intelligence']}, WIS {npc_data['abilities']['wisdom']}, CHA {npc_data['abilities']['charisma']}
-SAVES: {', '.join(npc_data['savingThrows'])}
+SAVES: {_saves_text(npc_data)}
 SKILLS: {npc_skills_display}
-PROF BONUS: +{npc_data['proficiencyBonus']}
+PROF BONUS: +{npc_data['proficiencyBonus']} | INIT: {_signed(npc_data.get('initiative'))} (final total; proficiency, feats and expertise are already included in INIT, SKILLS, SAVES, SENSES and spell DC){_roll_modes_text(npc_data)}{_expertise_text(npc_data)}{_exhaustion_text(npc_data)}
 SENSES: {', '.join(f"{sense} {value}" for sense, value in npc_data['senses'].items())}
 LANGUAGES: {', '.join(npc_data['languages'])}
 PROF: {', '.join([f"{cat}: {', '.join(items)}" for cat, items in npc_data['proficiencies'].items()])}
@@ -1244,14 +1210,14 @@ CLASS FEAT: {', '.join([f"{feature['name']}" for feature in npc_data['classFeatu
 RACIAL: {', '.join([f"{trait['name']}" for trait in npc_data['racialTraits']])}
 BG FEAT: {bg_feature_name}
 FEATS: {_feats_text(npc_data.get('feats', []))}
-TEMP FX: {_format_temporary_effects(npc_data)}
+TEMP FX: {_format_temporary_effects(npc_data)}{_concentration_text(npc_data)}
 EQUIP: {equipment_str}
 AMMO: {', '.join([f"{ammo['name']} x{ammo['quantity']}" for ammo in npc_data['ammunition']])}
 ATK: {', '.join([f"{atk['name']} ({atk['type']}, {atk['damageDice']} {atk['damageType']})" for atk in npc_data['attacksAndSpellcasting']])}
 SPELLCASTING: {npc_data.get('spellcasting', {}).get('ability', 'N/A')} | DC: {npc_data.get('spellcasting', {}).get('spellSaveDC', 'N/A')} | ATK: +{npc_data.get('spellcasting', {}).get('spellAttackBonus', 'N/A')}
 SPELLS: {', '.join([f"{level}: {', '.join(spells)}" for level, spells in npc_data.get('spellcasting', {}).get('spells', {}).items() if spells])}
 CURRENCY: {npc_data['currency']['gold']}G, {npc_data['currency']['silver']}S, {npc_data['currency']['copper']}C
-XP: {npc_data['experience_points']}/{npc_data.get('exp_required_for_next_level', 'N/A')}
+XP: {npc_data['experience_points']}/{npc_data.get('exp_required_for_next_level', 'N/A')}{_level_ups_text(npc_data)}
 TRAITS: {npc_data['personality_traits']}
 IDEALS: {npc_data['ideals']}
 BONDS: {npc_data['bonds']}
@@ -1286,6 +1252,8 @@ FLAWS: {npc_data['flaws']}
 def generate_chat_history(conversation_history):
     """Generate a lightweight chat history without system messages"""
     output_file = "modules/conversation_history/chat_history.json"
+    # Outside the try below: a read-only save stop must not be logged away.
+    raise_if_save_stopped()
     
     try:
         # Filter out system messages and keep only user and assistant messages

@@ -98,7 +98,6 @@ import os
 import glob
 import re
 import hashlib
-import errno
 import shutil
 import stat
 from copy import deepcopy
@@ -118,7 +117,13 @@ register_callsite("T033", "core/generators/module_stitcher.py", 4016)
 # Set script name for logging
 set_script_name("module_stitcher")
 from utils.encoding_utils import safe_json_load
+from core.generators.location_prefixes import location_prefix, location_prefix_index
 from utils.file_operations import safe_write_json
+from utils.transient_filesystem import (
+    is_transient_filesystem_error,
+    read_bytes_preserving_errors,
+    replace_target_is_read_only,
+)
 from utils.module_path_manager import ModulePathManager
 
 
@@ -134,6 +139,102 @@ _STAT_SUPPORTS_NOFOLLOW = os.stat in getattr(
 _LISTDIR_SUPPORTS_FD = os.listdir in getattr(os, "supports_fd", set())
 _UNLINK_SUPPORTS_DIR_FD = os.unlink in getattr(os, "supports_dir_fd", set())
 _RENAME_SUPPORTS_DIR_FD = os.rename in getattr(os, "supports_dir_fd", set())
+
+
+def _windows_held_handles_supported() -> bool:
+    """Whether native Windows entries can be held by handle (issue #608)."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        import msvcrt
+    except ImportError:
+        return False
+    return hasattr(ctypes, "WinDLL") and hasattr(msvcrt, "open_osfhandle")
+
+
+def _open_windows_no_follow(path: str, *, directory: bool) -> int:
+    """Hold one native Windows entry without following a link (issue #608).
+
+    FILE_FLAG_OPEN_REPARSE_POINT opens a junction or symlink as itself, the
+    O_NOFOLLOW counterpart. Directories ask for FILE_LIST_DIRECTORY: an open
+    with attribute access alone was observed not to block a rename.
+    FILE_SHARE_DELETE is withheld, so while the handle is held the entry and
+    its ancestors cannot be renamed or deleted; its children still can, and
+    other processes may still write a held file. Returns a CRT descriptor.
+    Every failure is an OSError, so callers type it like any other I/O error.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+        if directory:
+            access = 0x0001 | 0x0080  # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES
+            flags = 0x00200000 | 0x02000000  # OPEN_REPARSE_POINT | BACKUP_SEMANTICS
+        else:
+            access = 0x80000000  # GENERIC_READ
+            flags = 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
+        handle = kernel.CreateFileW(
+            os.fsdecode(path),
+            access,
+            1 | 2,  # FILE_SHARE_READ | FILE_SHARE_WRITE; no FILE_SHARE_DELETE
+            None, 3, flags, None,  # non-inherited, OPEN_EXISTING
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return msvcrt.open_osfhandle(
+                handle, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT
+            )
+        except BaseException:
+            kernel.CloseHandle(handle)
+            raise
+    except OSError:
+        raise
+    except Exception as exc:
+        raise OSError(f"Windows entry could not be held: {exc}") from exc
+
+
+def _windows_final_path(descriptor: int) -> str:
+    """Return a held Windows entry's own path (issue #608).
+
+    The path is read from the handle in \\\\?\\Volume{...} form: junctions on
+    the way are resolved, so every component is a real directory that the
+    held handle pins, and the prefix turns off Win32 name rewriting (a
+    trailing dot or space is kept). Children are named through it.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetFinalPathNameByHandleW.argtypes = (
+            wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+        )
+        kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        handle = msvcrt.get_osfhandle(descriptor)
+        size = 32768  # the longest Windows path, 32767 characters, plus NUL
+        buffer = ctypes.create_unicode_buffer(size)
+        length = kernel.GetFinalPathNameByHandleW(
+            handle, buffer, size, 0x1  # FILE_NAME_NORMALIZED | VOLUME_NAME_GUID
+        )
+        if length == 0 or length >= size:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return buffer.value
+    except OSError:
+        raise
+    except Exception as exc:
+        raise OSError(f"Held entry path could not be read: {exc}") from exc
 
 
 class ModuleSafetyStatus(str, Enum):
@@ -177,18 +278,42 @@ class PublicationStatus(str, Enum):
     INDETERMINATE = "INDETERMINATE"
 
 
+class NotJoinedCause(str, Enum):
+    """Why an installed module was not joined, for the startup line."""
+
+    # A check on this module's files or content refused it. Module analysis
+    # and the safety validators still report their local errors here
+    # (issue #639).
+    CHECK_REFUSED = "check_refused"
+    # The safety check produced no verdict (UNAVAILABLE), or a check could
+    # not run on this machine (issue #639).
+    CHECK_UNAVAILABLE = "check_unavailable"
+    # Scan entry only, never a result's cause: publication was
+    # INDETERMINATE and the registry on disk does not join the module
+    # (issue #608).
+    UNPROVEN = "unproven"
+    # Scan entry only, never a result's cause: as UNPROVEN, while the
+    # registry file is read-only, so no module can join (issue #654).
+    REGISTRY_READ_ONLY = "registry_read_only"
+    # Scan entry only, never a result's cause: lifecycle recovery was
+    # INDETERMINATE, so the scan joined nothing. The entry names a module
+    # that was waiting, or no module when the wait list could not be read
+    # (issue #638).
+    LIFECYCLE_INDETERMINATE = "lifecycle_indeterminate"
+
+
 @dataclass(frozen=True)
 class TargetedPublicationResult:
     """Proof-bearing result for publishing one exact module directory.
 
     ``NOT_PUBLISHED`` is returned only when the registry is proven not to
-    reference the module and the live module is proven to match its retained
-    pre-publication snapshot.
-    ``INDETERMINATE`` means cleanup is unsafe because at least one relevant
-    on-disk state could not be proven.
+    reference the module and the live module is proven to match the manifest
+    of the held tree taken before validation.
+    ``INDETERMINATE`` means at least one relevant on-disk state could not be
+    proven.
 
     ``backup_path`` is a compatibility-shaped, permanently ``None`` field.
-    Task1 snapshot receipts deliberately expose no mutable filesystem locator.
+    The manifest receipt deliberately exposes no mutable filesystem locator.
     """
 
     status: PublicationStatus
@@ -198,89 +323,19 @@ class TargetedPublicationResult:
     registry_restoration_proven: bool = False
     module_restoration_proven: bool = False
     backup_path: Optional[str] = field(default=None, init=False, repr=False)
+    # IMPORT_REQUIRED only: the registered modules whose ids collide.
+    conflicting_modules: Tuple[str, ...] = ()
+    # NOT_PUBLISHED only, and only where the refusing check is known.
+    cause: Optional[NotJoinedCause] = None
 
     @property
     def published(self) -> bool:
         return self.status is PublicationStatus.PUBLISHED
 
-    @property
-    def cleanup_safe(self) -> bool:
-        return (
-            self.status is PublicationStatus.NOT_PUBLISHED
-            and self.registry_absence_proven is True
-            and self.registry_restoration_proven is True
-            and self.module_restoration_proven is True
-        )
-
-    def cleanup_safe_for(self, expected_module_name: str) -> bool:
-        """Bind complete non-publication proof to the exact builder result."""
-        return (
-            self.module_name == expected_module_name
-            and self.cleanup_safe is True
-        )
-
     def __bool__(self) -> bool:
         raise TypeError(
             "TargetedPublicationResult has no implicit truth value; inspect "
-            ".status, .published, or .cleanup_safe explicitly"
-        )
-
-
-@dataclass(frozen=True)
-class RegistryAbsenceResult:
-    """Fresh-disk proof used to decide whether orphan cleanup is safe."""
-
-    module_name: str
-    proven: bool
-    absent: bool
-    reason: str = ""
-
-    @property
-    def cleanup_safe(self) -> bool:
-        return self.proven is True and self.absent is True
-
-    def __bool__(self) -> bool:
-        raise TypeError(
-            "RegistryAbsenceResult has no implicit truth value; inspect "
-            ".proven, .absent, or .cleanup_safe explicitly"
-        )
-
-
-class OrphanCleanupStatus(str, Enum):
-    """Exact outcome of proof-bound unpublished-module cleanup."""
-
-    REMOVED = "REMOVED"
-    ALREADY_ABSENT = "ALREADY_ABSENT"
-    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
-
-
-@dataclass(frozen=True)
-class OrphanCleanupResult:
-    """Typed cleanup result that cannot be mistaken for an arbitrary boolean."""
-
-    status: OrphanCleanupStatus
-    module_name: str
-    reason: str = ""
-    quarantine_path: Optional[str] = None
-
-    @property
-    def safe_to_retry(self) -> bool:
-        return (
-            self.status is OrphanCleanupStatus.REMOVED
-            or self.status is OrphanCleanupStatus.ALREADY_ABSENT
-        )
-
-    def safe_to_retry_for(self, expected_module_name: str) -> bool:
-        """Bind a retry-safe status to the exact generated module."""
-        return (
-            self.module_name == expected_module_name
-            and self.safe_to_retry is True
-        )
-
-    def __bool__(self) -> bool:
-        raise TypeError(
-            "OrphanCleanupResult has no implicit truth value; inspect .status "
-            "or .safe_to_retry explicitly"
+            ".status or .published explicitly"
         )
 
 
@@ -292,24 +347,24 @@ class _ExactModuleEntryGuard:
     module_path: str
     descriptor: int
     identity: Tuple[int, int, int]
+    # The path the manifest names children through: module_path on POSIX,
+    # the held handle's final path on native Windows (#608).
+    held_path: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class _ModuleBackupResult:
-    """Identity-bound proof of bytes captured during one locked snapshot.
+    """Identity-bound manifest receipt of the held module tree.
 
-    ``proven`` covers only the descriptor-held bytes, manifest, captured area
-    documents, and durability operations completed by the snapshot attempt.
-    It deliberately carries no pathname: a mutable namespace entry cannot
-    remain identity-bound after its descriptor closes.  Physical evidence is
-    retained best-effort under the hidden backup root, but only the future
-    recovery transaction may enumerate and turn it into a trusted locator.
+    ``proven`` covers only the manifest read through the held entry guard
+    before validation; no copy of the module is made.  It deliberately
+    carries no pathname: a mutable namespace entry cannot remain
+    identity-bound after its descriptor closes.
     """
 
     proven: bool
     reason: str = ""
     manifest: Optional[Dict[str, str]] = None
-    area_documents: Optional[Dict[str, Dict[str, Any]]] = None
 
     def __bool__(self) -> bool:
         raise TypeError(
@@ -318,31 +373,33 @@ class _ModuleBackupResult:
         )
 
 
-def _coerce_module_backup_result(result: Any) -> _ModuleBackupResult:
-    """Reject legacy path-only receipts that carry no identity-bound proof."""
-    if type(result) is _ModuleBackupResult:
-        return result
-    if isinstance(result, (str, os.PathLike)):
-        return _ModuleBackupResult(
-            proven=False,
-            reason="A path-only backup result carries no descriptor-bound proof",
-        )
-    if result is None:
-        return _ModuleBackupResult(
-            proven=False,
-            reason="Backup creation returned no result",
-        )
-    return _ModuleBackupResult(
-        proven=False,
-        reason=(
-            "Backup creation returned unsupported type "
-            f"{type(result).__name__}"
-        ),
-    )
-
-
 class _FdBackupError(Exception):
     """Controlled fail-closed result for descriptor-relative backup work."""
+
+
+class _ModuleFilesBusy(Exception):
+    """A module file was held by another process; not a property of the module (#608)."""
+
+
+_MODULE_FILES_BUSY_REASON = (
+    "Module files were busy; publication stopped before registry access"
+)
+
+
+class _ModuleFilesRefused(Exception):
+    """A candidate's own reset masters cannot be read for its conflict scan."""
+
+
+class _ModuleCheckCouldNotRun(_ModuleFilesRefused):
+    """A check could not run on this machine; not a property of the module (#639).
+
+    A refusal to every handler that does not ask for it by name, so only the
+    publication path changes what it reports.
+    """
+
+
+class _ModuleCheckUnavailable(ValueError):
+    """The safety check produced no verdict while building registry bytes."""
 
 
 def _coerce_module_safety_result(result: Any) -> ModuleSafetyResult:
@@ -371,31 +428,15 @@ def _coerce_module_safety_result(result: Any) -> ModuleSafetyResult:
     )
 
 
-def _location_prefix_to_index(prefix: str) -> int:
-    """Inverse of ModuleBuilder.get_location_prefix's 0-indexed scheme:
-    0->A .. 25->Z, 26->AA, 27->AB, ...
-
-    Used by INT-H2 to find the next free location-prefix index from existing
-    location IDs. Reads the FULL alpha prefix (1-2 letters), so 'AA01' maps to
-    index 26 (not 0), preventing reuse of already-used two-letter prefixes.
-    """
-    prefix = (prefix or "").upper()
-    if len(prefix) == 1:
-        return ord(prefix[0]) - 65
-    if len(prefix) == 2:
-        return (ord(prefix[0]) - 65 + 1) * 26 + (ord(prefix[1]) - 65)
-    return 26 * 26  # 3+ letters: jump well past the 2-letter range
+def _location_prefix_to_index(prefix: str):
+    """INT-H2: the index of a location ID's FULL alpha prefix ('AA01' -> 26, not 0),
+    from the one encoding (#646); None for a prefix outside the location schema."""
+    return location_prefix_index((prefix or "").upper())
 
 
 def _location_index_to_prefix(index: int) -> str:
-    """Return the deterministic inverse prefix used by module generation."""
-    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
-        raise ValueError("Location prefix index must be a non-negative integer")
-    if index < 26:
-        return chr(65 + index)
-    if index < 702:
-        return chr(65 + (index // 26) - 1) + chr(65 + (index % 26))
-    raise ValueError("The supported location-prefix namespace is exhausted")
+    """The prefix module generation gives this index (#646: the shared encoding)."""
+    return location_prefix(index)
 
 
 class ModuleStitcher:
@@ -414,13 +455,30 @@ class ModuleStitcher:
 
         # Load or create world registry
         self.world_registry = self._load_world_registry()
+        # Modules the last scan could not join because their ids collide
+        # with a registered module: [{"module", "collides_with",
+        # "refused_because"}], and the unplayed ones it joined by
+        # renumbering a copy: [{"module", "collides_with", "renumbered"}].
+        # And the installed ones publication refused, or could not prove and
+        # left unjoined: [{"module", "reason", "cause"}], where cause is a
+        # NotJoinedCause value or None. A publication that could not be proven
+        # is "unproven", or "registry_read_only" while the registry is
+        # read-only. A scan blocked by lifecycle recovery lists the waiting
+        # ones as "lifecycle_indeterminate".
+        self.import_required = []
+        self.imported = []
+        self.not_joined = []
         
         # Clean up old connections if they exist (migration to isolated modules)
         if 'connections' in self.world_registry:
             print("Migrating to isolated module architecture - removing cross-module connections")
             del self.world_registry['connections']
             self.world_registry['isolatedModules'] = True
-            safe_write_json(self.world_registry_file, self.world_registry)
+            # Redone in memory on every construction, so a read-only
+            # registry costs nothing here (issue #654).
+            safe_write_json(
+                self.world_registry_file, self.world_registry, on_read_only="raise"
+            )
     
     def _default_world_registry(self) -> Dict[str, Any]:
         return {
@@ -557,12 +615,6 @@ class ModuleStitcher:
             return "unsafe", None, "Exact module entry is not a directory"
         return "directory", target_stat, ""
 
-    def _exact_cleanup_target_state(
-        self, module_name: str, module_path: str
-    ) -> Tuple[str, Optional[os.stat_result], str]:
-        """Compatibility seam for the proof-bound cleanup path."""
-        return self._exact_module_entry_state(module_name, module_path)
-
     @staticmethod
     def _stable_directory_identity(
         path_stat: os.stat_result,
@@ -619,24 +671,44 @@ class ModuleStitcher:
     ) -> Tuple[Optional[_ExactModuleEntryGuard], str]:
         """Hold a no-follow directory descriptor when the platform supports it."""
         identity = self._stable_directory_identity(initial_stat)
+        windows = _windows_held_handles_supported()
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         directory = getattr(os, "O_DIRECTORY", 0)
-        if identity is None or not nofollow or not directory:
+        if identity is None or not (windows or (nofollow and directory)):
             return None, "Stable no-follow directory identity is unsupported"
 
         descriptor = None
         try:
-            flags = os.O_RDONLY | nofollow | directory
-            flags |= getattr(os, "O_CLOEXEC", 0)
-            descriptor = os.open(module_path, flags)
+            if windows:
+                descriptor = _open_windows_no_follow(module_path, directory=True)
+            else:
+                flags = os.O_RDONLY | nofollow | directory
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                descriptor = os.open(module_path, flags)
             held_stat = os.fstat(descriptor)
             if self._stable_directory_identity(held_stat) != identity:
                 return None, "Held module directory identity does not match"
+            held_path = module_path
+            if windows:
+                # OPEN_REPARSE_POINT holds a link as itself; refusing it is
+                # the O_NOFOLLOW proof. A volume with no serial cannot bind
+                # the manifest's device checks, and one whose handle has no
+                # final path (a network share) cannot name children through
+                # the held directory (issue #608).
+                if self._stat_result_is_reparse(held_stat):
+                    return None, "Held module directory identity does not match"
+                if held_stat.st_dev == 0:
+                    return None, "Stable no-follow directory identity is unsupported"
+                try:
+                    held_path = _windows_final_path(descriptor)
+                except OSError:
+                    return None, "Stable no-follow directory identity is unsupported"
             guard = _ExactModuleEntryGuard(
                 module_name,
                 module_path,
                 descriptor,
                 identity,
+                held_path,
             )
             valid, reason = self._revalidate_exact_module_entry_guard(guard)
             if not valid:
@@ -683,147 +755,6 @@ class ModuleStitcher:
             return False, reason or "Exact module absence changed"
         return False, "Initial exact module entry state was not proven"
 
-    def _publication_transactions_inactive_for_cleanup_locked(
-        self,
-    ) -> Tuple[bool, str]:
-        """Temporary GAP-01 seam; Task 3 replaces it with journal recovery."""
-        transaction_root = os.path.join(
-            self.modules_dir, ".publication_transactions"
-        )
-        active_root = os.path.join(transaction_root, "active")
-
-        try:
-            transaction_stat = self._lstat_or_absent(transaction_root)
-        except (OSError, ValueError):
-            return False, "Publication transaction root could not be inspected"
-        if transaction_stat is not None:
-            if self._is_symlink_or_reparse(transaction_root):
-                return False, "Publication transaction root is unsafe"
-            try:
-                if os.path.ismount(transaction_root):
-                    return False, "Publication transaction root is a mount point"
-                if not stat.S_ISDIR(transaction_stat.st_mode):
-                    return False, "Publication transaction root is not a directory"
-            except OSError:
-                return False, "Publication transaction root could not be inspected"
-
-        try:
-            active_stat = self._lstat_or_absent(active_root)
-        except (OSError, ValueError):
-            return False, "Active publication state could not be inspected"
-        if active_stat is None:
-            return True, ""
-        if self._is_symlink_or_reparse(active_root):
-            return False, "Active publication state is unsafe"
-        try:
-            if os.path.ismount(active_root):
-                return False, "Active publication state is a mount point"
-            if not stat.S_ISDIR(active_stat.st_mode):
-                return False, "Active publication state is not a directory"
-            with os.scandir(active_root) as entries:
-                if next(entries, None) is not None:
-                    return False, "An active publication transaction remains"
-        except OSError:
-            return False, "Active publication state could not be inspected"
-        return True, ""
-
-    def _prepare_orphan_quarantine_root_locked(self) -> Tuple[Optional[str], str]:
-        """Create or verify the contained same-filesystem quarantine root."""
-        quarantine_root = os.path.join(
-            self.modules_dir, ".module_orphan_quarantine"
-        )
-        try:
-            with os.scandir(self.modules_dir) as entries:
-                entry_names = [entry.name for entry in entries]
-            quarantine_name = os.path.basename(quarantine_root)
-            if any(
-                self._module_names_alias(name, quarantine_name)
-                and name != quarantine_name
-                for name in entry_names
-            ):
-                return None, "A case-aliased quarantine root exists"
-            quarantine_stat = self._lstat_or_absent(quarantine_root)
-            if quarantine_stat is not None:
-                if self._is_symlink_or_reparse(quarantine_root):
-                    return None, "Orphan quarantine root is unsafe"
-                if not stat.S_ISDIR(quarantine_stat.st_mode):
-                    return None, "Orphan quarantine root is not a directory"
-            else:
-                os.mkdir(quarantine_root, 0o700)
-                quarantine_stat = self._lstat_or_absent(quarantine_root)
-                if quarantine_stat is None:
-                    return None, "Orphan quarantine root creation is unproven"
-                if not stat.S_ISDIR(quarantine_stat.st_mode):
-                    return None, "Orphan quarantine root is not a directory"
-
-            modules_root = os.path.realpath(self.modules_dir)
-            resolved_quarantine = os.path.realpath(quarantine_root)
-            if os.path.dirname(resolved_quarantine) != modules_root:
-                return None, "Orphan quarantine root is not contained"
-            if self._is_symlink_or_reparse(quarantine_root):
-                return None, "Orphan quarantine root became unsafe"
-            if os.path.ismount(quarantine_root):
-                return None, "Orphan quarantine root is a mount point"
-        except (OSError, ValueError):
-            return None, "Orphan quarantine root could not be prepared"
-        return quarantine_root, ""
-
-    def _quarantined_tree_safe_to_purge(self, quarantine_path: str) -> bool:
-        """Do not recursively purge a tree containing link/reparse/mount edges."""
-        def raise_walk_error(walk_error):
-            raise walk_error
-
-        try:
-            for directory, child_directories, child_files in os.walk(
-                quarantine_path,
-                topdown=True,
-                onerror=raise_walk_error,
-                followlinks=False,
-            ):
-                for child_name in child_directories + child_files:
-                    child_path = os.path.join(directory, child_name)
-                    if self._is_symlink_or_reparse(child_path):
-                        return False
-                    if os.path.isdir(child_path) and os.path.ismount(child_path):
-                        return False
-            return True
-        except OSError:
-            return False
-
-    @staticmethod
-    def _sync_directory_if_supported(directory: str) -> bool:
-        """Synchronize directory-entry changes where the platform supports it."""
-        if os.name == "nt":
-            return True
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        descriptor = None
-        sync_ok = False
-        close_ok = True
-        unsupported = {
-            errno.EINVAL,
-            getattr(errno, "ENOTSUP", errno.EINVAL),
-            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
-            getattr(errno, "ENOSYS", errno.EINVAL),
-        }
-        try:
-            descriptor = os.open(directory, flags)
-            try:
-                os.fsync(descriptor)
-                sync_ok = True
-            except OSError as exc:
-                sync_ok = exc.errno in unsupported
-            except (TypeError, ValueError):
-                sync_ok = False
-        except (OSError, TypeError, ValueError):
-            sync_ok = False
-        finally:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except (OSError, TypeError, ValueError):
-                    close_ok = False
-        return sync_ok and close_ok
-
     def _read_registry_snapshot(self) -> Tuple[Optional[Dict[str, Any]], str]:
         """Fresh-read and shape-check the on-disk world registry."""
         try:
@@ -836,6 +767,10 @@ class ModuleStitcher:
             return None, "World registry is not a JSON object"
         if not isinstance(registry.get("modules"), dict):
             return None, "World registry 'modules' value is not an object"
+        # Startup reconciliation writes a registry with no 'areas' key at
+        # all; that is an empty area map, not a malformed one.
+        if "areas" not in registry:
+            registry["areas"] = {}
         if not isinstance(registry.get("areas"), dict):
             return None, "World registry 'areas' value is not an object"
         return registry, ""
@@ -870,201 +805,73 @@ class ModuleStitcher:
             for area_data in registry.get("areas", {}).values()
         )
 
-    def _prove_module_absent_from_registry_locked(
-        self, module_name: str
-    ) -> RegistryAbsenceResult:
-        registry, reason = self._read_registry_snapshot()
-        if registry is None:
-            return RegistryAbsenceResult(module_name, False, False, reason)
-        absent = not self._registry_references_module(registry, module_name)
-        return RegistryAbsenceResult(
-            module_name,
-            True,
-            absent,
-            "No exact registry reference exists"
-            if absent
-            else "The exact module is still referenced by the registry",
-        )
+    def _module_proven_unjoined(self, module_name: str) -> bool:
+        """Installed, and the registry does not join it (issue #608).
 
-    def prove_module_absent_from_registry_locked(
-        self, module_name: str
-    ) -> RegistryAbsenceResult:
-        """Fresh proof API for callers that already own module_refresh_lock."""
-        if self._target_module_path(module_name) is None:
-            return RegistryAbsenceResult(
-                module_name,
-                False,
-                False,
-                "Invalid or non-contained module name",
-            )
-        from utils.module_refresh_lock import assert_module_refresh_lock_owned
-
-        assert_module_refresh_lock_owned()
-        return self._prove_module_absent_from_registry_locked(module_name)
-
-    def cleanup_unpublished_module_locked(
-        self,
-        expected_module_name: str,
-        publication_result: TargetedPublicationResult,
-        fresh_absence_result: RegistryAbsenceResult,
-    ) -> OrphanCleanupResult:
-        """Quarantine one exact unpublished module after complete fresh proof.
-
-        The caller must still own ``module_refresh_lock``.  No boolean can grant
-        authority: both proof-bearing result objects and their exact identities
-        are revalidated here immediately before the destructive rename.
+        Absent or a bare stub counts as unjoined; any other row proves
+        nothing, so it is False. When the file cannot be read, this session's
+        registry decides: it is the world this session plays.
         """
+        if not os.path.isdir(os.path.join(self.modules_dir, module_name)):
+            return False
+        registry, _reason = self._read_registry_snapshot()
+        if registry is None:
+            registry = self.world_registry
+        if not isinstance(registry, dict):
+            return False
+        return not self._registry_references_module(
+            registry, module_name
+        ) or self._is_registry_stub(registry, module_name)
 
-        def recovery(reason: str, quarantine_path: Optional[str] = None):
-            return OrphanCleanupResult(
-                OrphanCleanupStatus.RECOVERY_REQUIRED,
-                expected_module_name
-                if isinstance(expected_module_name, str)
-                else "unknown",
-                reason,
-                quarantine_path,
-            )
+    @classmethod
+    def _is_registry_stub(
+        cls, registry: Dict[str, Any], module_name: str
+    ) -> bool:
+        """Whether the registry names the module only by a bare stub.
 
-        if self._target_module_path(expected_module_name) is None:
-            return recovery("Expected module name is invalid or not contained")
-        from utils.module_refresh_lock import assert_module_refresh_lock_owned
-
-        assert_module_refresh_lock_owned()
-
-        if type(publication_result) is not TargetedPublicationResult:
-            return recovery("Publication proof object is unavailable")
-        if type(fresh_absence_result) is not RegistryAbsenceResult:
-            return recovery("Fresh registry-absence proof object is unavailable")
-        if publication_result.cleanup_safe_for(expected_module_name) is not True:
-            return recovery("Publication rollback proof is incomplete or mismatched")
-        if (
-            fresh_absence_result.module_name != expected_module_name
-            or fresh_absence_result.cleanup_safe is not True
-        ):
-            return recovery("Fresh registry-absence proof is incomplete or mismatched")
-
-        module_path = self._target_module_path(expected_module_name)
-        if module_path is None:
-            return recovery("Expected module name is invalid or not contained")
-
-        transactions_inactive, transaction_reason = (
-            self._publication_transactions_inactive_for_cleanup_locked()
-        )
-        if not transactions_inactive:
-            return recovery(transaction_reason)
-
-        target_state, target_stat, target_reason = (
-            self._exact_cleanup_target_state(expected_module_name, module_path)
-        )
-        if target_state == "absent":
-            return OrphanCleanupResult(
-                OrphanCleanupStatus.ALREADY_ABSENT,
-                expected_module_name,
-                target_reason,
-            )
-        if target_state != "directory" or target_stat is None:
-            return recovery(target_reason)
-
-        quarantine_root, quarantine_reason = (
-            self._prepare_orphan_quarantine_root_locked()
-        )
-        if quarantine_root is None:
-            return recovery(quarantine_reason)
-
-        quarantine_path = None
-        for _ in range(8):
-            candidate = os.path.join(quarantine_root, uuid4().hex)
-            try:
-                candidate_stat = self._lstat_or_absent(candidate)
-            except (OSError, ValueError):
-                return recovery("Opaque quarantine path could not be inspected")
-            if candidate_stat is None:
-                quarantine_path = candidate
-                break
-        if quarantine_path is None:
-            return recovery("A unique opaque quarantine path could not be allocated")
-
-        try:
-            resolved_quarantine = os.path.realpath(quarantine_path)
-            if os.path.dirname(resolved_quarantine) != os.path.realpath(
-                quarantine_root
+        Startup reconciliation records every module directory as exactly
+        ``{"moduleName": M}``. Such an entry carries no areas and no module
+        data, so the module has not been integrated yet. Any other field,
+        an alias entry, or an area row naming the module means it is not a
+        stub.
+        """
+        modules = registry.get("modules", {})
+        areas = registry.get("areas", {})
+        if not isinstance(modules, dict) or not isinstance(areas, dict):
+            return False
+        if modules.get(module_name) != {"moduleName": module_name}:
+            return False
+        for key, module_data in modules.items():
+            if key == module_name:
+                continue
+            if cls._module_names_alias(key, module_name):
+                return False
+            if isinstance(module_data, dict) and cls._module_names_alias(
+                module_data.get("moduleName"), module_name
             ):
-                return recovery("Opaque quarantine path is not contained")
-            os.replace(module_path, quarantine_path)
-        except (OSError, ValueError):
-            return recovery("Exact module could not be quarantined")
-
-        try:
-            public_stat = self._lstat_or_absent(module_path)
-            quarantine_stat = self._lstat_or_absent(quarantine_path)
-            if quarantine_stat is None:
-                quarantine_valid = False
-            else:
-                same_device = quarantine_stat.st_dev == target_stat.st_dev
-                same_inode = (
-                    not target_stat.st_ino
-                    or not quarantine_stat.st_ino
-                    or quarantine_stat.st_ino == target_stat.st_ino
-                )
-                quarantine_valid = (
-                    public_stat is None
-                    and same_device
-                    and same_inode
-                    and stat.S_ISDIR(quarantine_stat.st_mode)
-                    and not self._is_symlink_or_reparse(quarantine_path)
-                )
-        except (OSError, ValueError):
-            quarantine_valid = False
-        if not quarantine_valid:
-            return recovery(
-                "Quarantine rename could not be verified", quarantine_path
-            )
-
-        quarantine_synced = self._sync_directory_if_supported(quarantine_root)
-        modules_synced = self._sync_directory_if_supported(self.modules_dir)
-        if not quarantine_synced or not modules_synced:
-            return recovery(
-                "Quarantine rename could not be fully synchronized",
-                quarantine_path,
-            )
-
-        if self._quarantined_tree_safe_to_purge(quarantine_path):
-            try:
-                shutil.rmtree(quarantine_path)
-            except Exception:
-                # The public name is durably absent. Hidden evidence is
-                # deliberately retained for a later maintenance/recovery pass.
-                pass
-
-        return OrphanCleanupResult(
-            OrphanCleanupStatus.REMOVED,
-            expected_module_name,
-            "Exact public module entry was quarantined",
-            quarantine_path,
+                return False
+        return not any(
+            isinstance(area_data, dict)
+            and cls._module_names_alias(area_data.get("module"), module_name)
+            for area_data in areas.values()
         )
 
-    def prove_module_absent_from_registry(
-        self, module_name: str
-    ) -> RegistryAbsenceResult:
-        """Prove from a fresh disk read whether exact-module cleanup is safe."""
-        from utils.module_refresh_lock import module_refresh_lock
+    @classmethod
+    def is_joined_registry_module(
+        cls, registry: Dict[str, Any], module_name: str
+    ) -> bool:
+        """Whether the world registry has joined the module (#720).
 
-        if self._target_module_path(module_name) is None:
-            return RegistryAbsenceResult(
-                module_name,
-                False,
-                False,
-                "Invalid or non-contained module name",
-            )
-        with module_refresh_lock() as acquired:
-            if not acquired:
-                return RegistryAbsenceResult(
-                    module_name,
-                    False,
-                    False,
-                    "Module publication lock timed out",
-                )
-            return self.prove_module_absent_from_registry_locked(module_name)
+        Joined means the registry's modules table holds an entry for the
+        exact name that is not a bare stub, the rule
+        roster_conversion.world_modules uses. A module whose joining was
+        refused, never checked, or blocked by an id collision keeps only the
+        stub that startup reconciliation writes, so it is not joined.
+        """
+        modules = registry.get("modules") if isinstance(registry, dict) else None
+        if not isinstance(modules, dict) or module_name not in modules:
+            return False
+        return not cls._is_registry_stub(registry, module_name)
 
     def _registry_matches_snapshot(
         self, expected: Dict[str, Any]
@@ -1082,7 +889,8 @@ class ModuleStitcher:
         """Atomically restore and fresh-read the prior registry snapshot."""
         try:
             write_result = safe_write_json(
-                self.world_registry_file, deepcopy(prior_registry)
+                self.world_registry_file, deepcopy(prior_registry),
+                on_read_only="raise",
             )
         except Exception as exc:
             return False, f"Prior registry restore raised: {exc}"
@@ -1099,46 +907,28 @@ class ModuleStitcher:
         self.world_registry = deepcopy(restored)
         return True, ""
 
-    @staticmethod
-    def _directory_manifest(directory: str) -> Optional[Dict[str, str]]:
-        """Hash every directory, file, and symlink in a module tree."""
-        try:
-            if not directory or not os.path.isdir(directory):
-                return None
-            manifest: Dict[str, str] = {}
-            for root, dirs, files in os.walk(directory, followlinks=False):
-                dirs.sort()
-                files.sort()
-                relative_root = os.path.relpath(root, directory)
-                manifest[f"dir:{relative_root}"] = "directory"
-
-                for name in list(dirs) + files:
-                    path = os.path.join(root, name)
-                    relative_path = os.path.relpath(path, directory)
-                    if os.path.islink(path):
-                        manifest[f"link:{relative_path}"] = os.readlink(path)
-                        continue
-                    if os.path.isdir(path):
-                        continue
-                    if not os.path.isfile(path):
-                        return None
-                    digest = hashlib.sha256()
-                    with open(path, "rb") as handle:
-                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                    manifest[f"file:{relative_path}"] = digest.hexdigest()
-            return manifest
-        except Exception:
-            return None
-
     def _validate_required_publication_files(
-        self, module_path: str
+        self, module_path: str, *, report_local_errors: bool = False
     ) -> Tuple[bool, str]:
-        """Validate every publication-critical JSON object and area schema."""
+        """Validate every publication-critical JSON object and area schema.
+
+        With ``report_local_errors``, a check that could not run on this
+        machine (the schema library, a read error, the game's own schema)
+        raises _ModuleCheckCouldNotRun instead of returning a refusal
+        (issue #639).
+        """
         schema_dir = Path(__file__).resolve().parents[2] / "schemas"
         required_files = {
             "module_plot.json": "plot_schema.json",
             "module_context.json": None,
+        }
+        # The module builder writes a module-level party tracker; published
+        # modules (the repo's own, and modules dropped into modules/) never
+        # ship one, and no play path reads it through the schema (the
+        # declared start reads only its weather and politicalClimate). It is
+        # checked only when present, and its content never refuses
+        # publication (#586): a failure is logged and the module publishes.
+        optional_files = {
             "party_tracker.json": "party_schema.json",
         }
 
@@ -1160,8 +950,15 @@ class ModuleStitcher:
                 schema_path = schema_dir / schema_name
                 if not schema_path.exists():
                     return
-                schema = load_object(schema_path)
-                Draft7Validator.check_schema(schema)
+                try:
+                    schema = load_object(schema_path)
+                    Draft7Validator.check_schema(schema)
+                except Exception as exc:
+                    if not report_local_errors:
+                        raise
+                    raise _ModuleCheckCouldNotRun(
+                        f"Schema {schema_name} could not be used: {exc}"
+                    ) from exc
                 errors = sorted(
                     Draft7Validator(schema).iter_errors(data),
                     key=lambda item: list(item.path),
@@ -1181,6 +978,27 @@ class ModuleStitcher:
                     return False, f"Required publication file is missing: {filename}"
                 data = load_object(file_path)
                 validate_available_schema(data, schema_name, filename)
+            for filename, schema_name in optional_files.items():
+                file_path = module_root / filename
+                if not os.path.lexists(file_path):
+                    continue
+                if not file_path.is_file():
+                    return False, f"Publication file is not a regular file: {filename}"
+                try:
+                    data = load_object(file_path)
+                    validate_available_schema(data, schema_name, filename)
+                except (OSError, ValueError, _ModuleCheckCouldNotRun) as exc:
+                    # A schema the game cannot use does not stop it either
+                    # (issue #639). Publication checks a module several
+                    # times; report once.
+                    warned = self.__dict__.setdefault("_own_tracker_warned", set())
+                    if str(file_path) not in warned:
+                        warned.add(str(file_path))
+                        warning(
+                            f"MODULE_PUBLICATION: {module_root.name}'s own {filename} "
+                            f"is not used by play and fails: {exc}; publishing anyway",
+                            category="module_integration",
+                        )
 
             areas_dir = module_root / "areas"
             if not areas_dir.is_dir():
@@ -1213,6 +1031,14 @@ class ModuleStitcher:
                 seen_area_ids.add(area_id)
 
             return True, ""
+        except _ModuleCheckCouldNotRun:
+            raise
+        except (ImportError, OSError) as exc:
+            if report_local_errors:
+                raise _ModuleCheckCouldNotRun(
+                    f"Publication files could not be checked: {exc}"
+                ) from exc
+            return False, f"Publication file validation failed: {exc}"
         except Exception as exc:
             return False, f"Publication file validation failed: {exc}"
 
@@ -1270,33 +1096,142 @@ class ModuleStitcher:
         except (OSError, ValueError) as exc:
             return None, None, f"Module identifiers could not be inspected: {exc}"
 
+    @staticmethod
+    def _read_error_is_busy(exc: OSError, path: str) -> bool:
+        """Whether a failed file read means another process holds the file.
+
+        The C runtime reports a Windows sharing or lock violation as access
+        denied. So a denied read is classified by one Win32 read of the same
+        file, whose bytes are not used: busy unless that read also fails for
+        a reason that is not transient (issue #608).
+        """
+        if is_transient_filesystem_error(exc):
+            return True
+        if not isinstance(exc, PermissionError):
+            return False
+        try:
+            read_bytes_preserving_errors(path)
+        except OSError as probe_exc:
+            return is_transient_filesystem_error(probe_exc)
+        return True
+
+    def _paired_master_location_ids(self, module_path: str) -> set:
+        """Read location ids from the candidate's paired ``_BU.json`` masters.
+
+        A master repeats its live twin's areaId, so it cannot join the scan
+        helper above. Only masters with a live twin are read: the managed
+        import's BU refresh rewrites exactly those, and boot hydration turns
+        an orphan into a live file before the refresh. A master the ID fixer
+        could not have read raises ``_ModuleFilesRefused`` so the module is
+        refused with a report rather than skipped in silence (issue #609). A
+        master busy in another process raises ``_ModuleFilesBusy`` (#608).
+        """
+        areas_path = os.path.join(module_path, "areas")
+        location_ids = set()
+        try:
+            with os.scandir(areas_path) as entries:
+                by_name = {entry.name: entry for entry in entries}
+            for name in sorted(by_name):
+                if not name.endswith("_BU.json"):
+                    continue
+                if name[: -len("_BU.json")] + ".json" not in by_name:
+                    continue
+                entry = by_name[name]
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    raise _ModuleFilesRefused(
+                        f"Paired master is not a regular file: areas/{name}"
+                    )
+                try:
+                    master = safe_json_load(entry.path)
+                except OSError as exc:
+                    if self._read_error_is_busy(exc, entry.path):
+                        raise _ModuleFilesBusy(str(exc)) from exc
+                    raise
+                if not master:
+                    continue
+                if not isinstance(master, dict):
+                    raise _ModuleFilesRefused(
+                        f"Paired master is not a JSON object: areas/{name}"
+                    )
+                locations = master.get("locations", [])
+                if isinstance(locations, (list, dict, str)) and not locations:
+                    continue
+                if not isinstance(locations, list):
+                    raise _ModuleFilesRefused(
+                        f"Paired master locations are malformed: areas/{name}"
+                    )
+                for location in locations:
+                    if not isinstance(location, dict):
+                        raise _ModuleFilesRefused(
+                            f"Paired master location is malformed: areas/{name}"
+                        )
+                    location_id = location.get("locationId")
+                    if not location_id:
+                        continue
+                    if isinstance(location_id, (list, dict)):
+                        raise _ModuleFilesRefused(
+                            f"Paired master locationId is malformed: areas/{name}"
+                        )
+                    if isinstance(location_id, str):
+                        location_ids.add(location_id)
+        except _ModuleFilesRefused:
+            raise
+        except (OSError, ValueError, UnicodeError, TypeError) as exc:
+            if is_transient_filesystem_error(exc):
+                raise _ModuleFilesBusy(str(exc)) from exc
+            if isinstance(exc, OSError):
+                # The masters could not be read on this machine (issue #639).
+                raise _ModuleCheckCouldNotRun(
+                    f"Paired masters could not be read: {exc}"
+                ) from exc
+            raise _ModuleFilesRefused(
+                f"Paired masters could not be read: {exc}"
+            ) from exc
+        return location_ids
+
     def _detect_legacy_publication_conflicts(
         self,
         module_name: str,
         module_path: str,
         registry_snapshot: Dict[str, Any],
-    ) -> Tuple[Optional[bool], str]:
-        """Detect whether legacy publication would require live-file rewrites.
+    ) -> Tuple[Optional[bool], str, Tuple[str, ...]]:
+        """Detect whether a candidate's ids collide with registered modules.
 
         ``True`` means a managed import is required, ``False`` means registry-only
         publication can continue, and ``None`` means the read was unsafe or
-        ambiguous. This helper never writes or creates a mutation backup.
+        ambiguous. The third value names the registered modules whose ids
+        collide (empty unless ``True``). The candidate's location ids include
+        its paired ``_BU.json`` masters; a master that cannot be read raises
+        ``_ModuleFilesRefused``. This helper never writes.
         """
         candidate_areas, candidate_locations, reason = (
             self._module_identity_sets_for_conflict_scan(module_path)
         )
         if candidate_areas is None or candidate_locations is None:
-            return None, reason
+            return None, reason, ()
 
-        registered_areas = set(registry_snapshot.get("areas", {}))
-        area_conflicts = candidate_areas.intersection(registered_areas)
+        registered_area_rows = registry_snapshot.get("areas", {})
+        area_conflicts = candidate_areas.intersection(registered_area_rows)
         if area_conflicts:
             return True, (
                 "Managed import is required for conflicting area IDs: "
                 + ", ".join(sorted(area_conflicts))
-            )
+            ), tuple(sorted({
+                registered_area_rows[area_id].get("module")
+                for area_id in area_conflicts
+                if isinstance(registered_area_rows[area_id], dict)
+                and isinstance(registered_area_rows[area_id].get("module"), str)
+            }))
+
+        # Issue #609: a reset master's ids are the module's ids too. Counting
+        # them here sends a master-only collision to the managed import
+        # instead of passing it as conflict-free.
+        candidate_locations = candidate_locations | (
+            self._paired_master_location_ids(module_path)
+        )
 
         existing_location_ids = set()
+        colliding_modules = set()
         existing_module_names = {
             area_data.get("module")
             for area_data in registry_snapshot.get("areas", {}).values()
@@ -1307,7 +1242,7 @@ class ModuleStitcher:
         for existing_name in sorted(existing_module_names):
             existing_path = self._target_module_path(existing_name)
             if existing_path is None:
-                return None, "Registered module path is unsafe"
+                return None, "Registered module path is unsafe", ()
             state, _entry_stat, state_reason = self._exact_module_entry_state(
                 existing_name, existing_path
             )
@@ -1317,13 +1252,19 @@ class ModuleStitcher:
             if state == "absent":
                 continue
             if state != "directory":
-                return None, f"Registered module path is unsafe: {state_reason}"
+                return (
+                    None,
+                    f"Registered module path is unsafe: {state_reason}",
+                    (),
+                )
             _areas, locations, existing_reason = (
                 self._module_identity_sets_for_conflict_scan(existing_path)
             )
             if locations is None:
-                return None, existing_reason
+                return None, existing_reason, ()
             existing_location_ids.update(locations)
+            if candidate_locations.intersection(locations):
+                colliding_modules.add(existing_name)
 
         location_conflicts = candidate_locations.intersection(
             existing_location_ids
@@ -1332,11 +1273,14 @@ class ModuleStitcher:
             return True, (
                 "Managed import is required for conflicting location IDs: "
                 + ", ".join(sorted(location_conflicts))
-            )
-        return False, ""
+            ), tuple(sorted(colliding_modules))
+        return False, "", ()
     
-    def detect_new_modules(self) -> List[str]:
-        """Detect new modules in the modules directory"""
+    def detect_new_modules(self, *, strict: bool = False) -> List[str]:
+        """Detect new modules in the modules directory.
+
+        ``strict`` raises a failure instead of reporting no new module
+        (issue #638)."""
         try:
             detected_modules = []
             
@@ -1362,14 +1306,20 @@ class ModuleStitcher:
                 
                 # Check if module has area files (current data structure)
                 if self._has_area_files(item_path):
-                    # Check if already registered
-                    if item not in self.world_registry.get('modules', {}):
+                    # Check if already registered (a bare stub is not)
+                    if item not in self.world_registry.get(
+                        'modules', {}
+                    ) or self._is_registry_stub(self.world_registry, item):
                         detected_modules.append(item)
                         print(f"Detected new module: {item}")
             
-            return detected_modules
+            # Directory listing order is filesystem-dependent; integration
+            # order decides which of two colliding modules is joined.
+            return sorted(detected_modules)
             
         except Exception as e:
+            if strict:
+                raise
             print(f"Error detecting modules: {e}")
             return []
     
@@ -1696,9 +1646,19 @@ Create atmospheric travel narration that leads into this adventure."""
 
     @staticmethod
     def _descriptor_mount_id(descriptor: int) -> Optional[int]:
-        """Read Linux mount identity for one already-open descriptor."""
+        """Read the mount identity for one already-open descriptor.
+
+        Linux: the mnt_id from /proc/self/fdinfo. Native Windows has no mount
+        id: another volume is reachable inside a tree only through a reparse
+        point, which every level refuses, so that refusal is the proof and
+        the volume serial stands in for the id (issue #608).
+        """
         if os.name == "nt":
-            return None
+            try:
+                device = os.fstat(int(descriptor)).st_dev
+            except (OSError, TypeError, ValueError):
+                return None
+            return device if isinstance(device, int) and device > 0 else None
         try:
             with open(
                 f"/proc/self/fdinfo/{int(descriptor)}",
@@ -1715,6 +1675,9 @@ Create atmospheric travel narration that leads into this adventure."""
 
     @staticmethod
     def _fd_relative_backup_supported() -> bool:
+        if os.name == "nt":
+            # The receipt is taken through held handles (issue #608).
+            return _windows_held_handles_supported()
         return (
             os.name != "nt"
             and bool(getattr(os, "O_NOFOLLOW", 0))
@@ -1740,17 +1703,49 @@ Create atmospheric travel narration that leads into this adventure."""
         except (OSError, TypeError, ValueError):
             return False
 
-    def _fd_directory_names(self, directory_descriptor: int) -> List[str]:
+    @staticmethod
+    def _held_entry_stat(
+        parent_descriptor: int, parent_path: Optional[str], name: str
+    ) -> os.stat_result:
+        """Stat one child of a held directory without following a link.
+
+        Native Windows has no dir_fd. The child is named through the held
+        parent's final path (_windows_final_path): every component is a real
+        directory the held handles pin, and no name is rewritten (issue #608).
+        """
+        if os.name == "nt":
+            return os.lstat(os.path.join(parent_path, name))
+        return os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+
+    def _fd_directory_names(
+        self, directory_descriptor: int, held_path: Optional[str]
+    ) -> List[str]:
         """Return a deterministic entry list using a fresh directory offset."""
         scan_descriptor = None
         close_ok = True
         try:
-            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            flags |= getattr(os, "O_CLOEXEC", 0)
-            scan_descriptor = os.open(
-                ".", flags, dir_fd=directory_descriptor
-            )
-            names = os.listdir(scan_descriptor)
+            if os.name == "nt":
+                # List the held directory by its final path and bind that
+                # path to the held handle on both sides (issue #608).
+                held_identity = self._filesystem_entry_identity(
+                    os.fstat(directory_descriptor)
+                )
+                before = self._filesystem_entry_identity(os.lstat(held_path))
+                names = os.listdir(held_path)
+                after = self._filesystem_entry_identity(os.lstat(held_path))
+                if held_identity is None or not (
+                    before == held_identity == after
+                ):
+                    raise _FdBackupError(
+                        "Directory enumeration could not be proven"
+                    )
+            else:
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                scan_descriptor = os.open(
+                    ".", flags, dir_fd=directory_descriptor
+                )
+                names = os.listdir(scan_descriptor)
             if not all(
                 isinstance(name, str)
                 and name not in {"", ".", ".."}
@@ -1772,15 +1767,6 @@ Create atmospheric travel narration that leads into this adventure."""
             if not close_ok:
                 raise _FdBackupError("Directory enumeration close was unproven")
 
-    @staticmethod
-    def _case_aliases(names: List[str], exact_name: str) -> List[str]:
-        exact_folded = exact_name.casefold()
-        return [
-            name
-            for name in names
-            if name.casefold() == exact_folded and name != exact_name
-        ]
-
     def _open_verified_directory_at(
         self,
         parent_descriptor: int,
@@ -1789,6 +1775,7 @@ Create atmospheric travel narration that leads into this adventure."""
         *,
         expected_device: int,
         expected_mount_id: int,
+        parent_path: Optional[str],
     ) -> Tuple[int, Tuple[int, int, int]]:
         expected_identity = self._filesystem_entry_identity(expected_stat)
         if (
@@ -1801,9 +1788,14 @@ Create atmospheric travel narration that leads into this adventure."""
 
         descriptor = None
         try:
-            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            flags |= getattr(os, "O_CLOEXEC", 0)
-            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            if os.name == "nt":
+                descriptor = _open_windows_no_follow(
+                    os.path.join(parent_path, name), directory=True
+                )
+            else:
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                descriptor = os.open(name, flags, dir_fd=parent_descriptor)
             held_stat = os.fstat(descriptor)
             if (
                 self._filesystem_entry_identity(held_stat) != expected_identity
@@ -1833,12 +1825,12 @@ Create atmospheric travel narration that leads into this adventure."""
         directory_descriptor: int,
         expected_identity: Tuple[int, int, int],
         expected_mount_id: int,
+        *,
+        parent_path: Optional[str],
     ) -> bool:
         try:
-            bound_stat = os.stat(
-                name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
+            bound_stat = self._held_entry_stat(
+                parent_descriptor, parent_path, name
             )
             held_stat = os.fstat(directory_descriptor)
             return (
@@ -1852,6 +1844,27 @@ Create atmospheric travel narration that leads into this adventure."""
         except (OSError, TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _read_held_chunk(descriptor: int) -> bytes:
+        """Read up to 1 MiB from a held file.
+
+        On native Windows the C runtime reports a byte-range lock held by
+        another process as access denied; ReadFile keeps the Windows error,
+        so the lock reads as busy, not as a refused file (issue #608).
+        """
+        if os.name != "nt":
+            return os.read(descriptor, 1024 * 1024)
+        import _winapi
+        import ctypes
+        import msvcrt
+
+        chunk, error_code = _winapi.ReadFile(
+            msvcrt.get_osfhandle(descriptor), 1024 * 1024
+        )
+        if error_code:
+            raise ctypes.WinError(error_code)
+        return chunk
+
     def _open_verified_regular_for_read(
         self,
         parent_descriptor: int,
@@ -1860,7 +1873,8 @@ Create atmospheric travel narration that leads into this adventure."""
         *,
         expected_device: int,
         expected_mount_id: int,
-    ) -> Tuple[int, int, Tuple[int, int, int]]:
+        parent_path: Optional[str],
+    ) -> Tuple[Optional[int], int, Tuple[int, int, int]]:
         expected_identity = self._filesystem_entry_identity(expected_stat)
         if (
             expected_identity is None
@@ -1874,30 +1888,41 @@ Create atmospheric travel narration that leads into this adventure."""
         path_descriptor = None
         read_descriptor = None
         try:
-            path_flags = os.O_PATH | os.O_NOFOLLOW
-            path_flags |= getattr(os, "O_CLOEXEC", 0)
-            path_descriptor = os.open(
-                name,
-                path_flags,
-                dir_fd=parent_descriptor,
-            )
-            path_stat = os.fstat(path_descriptor)
-            if (
-                self._filesystem_entry_identity(path_stat) != expected_identity
-                or not stat.S_ISREG(path_stat.st_mode)
-                or self._stat_result_is_reparse(path_stat)
-                or path_stat.st_dev != expected_device
-                or getattr(path_stat, "st_nlink", 0) != 1
-                or self._descriptor_mount_id(path_descriptor)
-                != expected_mount_id
-            ):
-                raise _FdBackupError("Regular source identity changed before read")
+            if os.name == "nt":
+                # One no-follow read handle. A special file (for example a
+                # Linux FIFO seen over \\wsl.localhost) shows as a reparse
+                # point, so it is refused, not opened (issue #608).
+                read_descriptor = _open_windows_no_follow(
+                    os.path.join(parent_path, name), directory=False
+                )
+            else:
+                path_flags = os.O_PATH | os.O_NOFOLLOW
+                path_flags |= getattr(os, "O_CLOEXEC", 0)
+                path_descriptor = os.open(
+                    name,
+                    path_flags,
+                    dir_fd=parent_descriptor,
+                )
+                path_stat = os.fstat(path_descriptor)
+                if (
+                    self._filesystem_entry_identity(path_stat)
+                    != expected_identity
+                    or not stat.S_ISREG(path_stat.st_mode)
+                    or self._stat_result_is_reparse(path_stat)
+                    or path_stat.st_dev != expected_device
+                    or getattr(path_stat, "st_nlink", 0) != 1
+                    or self._descriptor_mount_id(path_descriptor)
+                    != expected_mount_id
+                ):
+                    raise _FdBackupError(
+                        "Regular source identity changed before read"
+                    )
 
-            read_flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-            read_flags |= getattr(os, "O_CLOEXEC", 0)
-            read_descriptor = os.open(
-                f"/proc/self/fd/{path_descriptor}", read_flags
-            )
+                read_flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                read_flags |= getattr(os, "O_CLOEXEC", 0)
+                read_descriptor = os.open(
+                    f"/proc/self/fd/{path_descriptor}", read_flags
+                )
             read_stat = os.fstat(read_descriptor)
             if (
                 self._filesystem_entry_identity(read_stat) != expected_identity
@@ -1933,293 +1958,6 @@ Create atmospheric travel narration that leads into this adventure."""
             if not close_ok:
                 raise _FdBackupError("Regular source close was unproven")
 
-    def _fd_copy_regular_file(
-        self,
-        source_parent_descriptor: int,
-        destination_parent_descriptor: int,
-        name: str,
-        source_stat: os.stat_result,
-        *,
-        source_device: int,
-        source_mount_id: int,
-        destination_device: int,
-        destination_mount_id: int,
-        capture_content: bool,
-    ) -> Tuple[str, Optional[bytes]]:
-        source_path_descriptor = None
-        source_read_descriptor = None
-        destination_descriptor = None
-        close_ok = True
-        try:
-            (
-                source_path_descriptor,
-                source_read_descriptor,
-                source_identity,
-            ) = self._open_verified_regular_for_read(
-                source_parent_descriptor,
-                name,
-                source_stat,
-                expected_device=source_device,
-                expected_mount_id=source_mount_id,
-            )
-
-            destination_flags = (
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | os.O_NOFOLLOW
-                | getattr(os, "O_CLOEXEC", 0)
-            )
-            destination_descriptor = os.open(
-                name,
-                destination_flags,
-                0o600,
-                dir_fd=destination_parent_descriptor,
-            )
-            destination_stat = os.fstat(destination_descriptor)
-            destination_identity = self._filesystem_entry_identity(
-                destination_stat
-            )
-            if (
-                destination_identity is None
-                or not stat.S_ISREG(destination_stat.st_mode)
-                or self._stat_result_is_reparse(destination_stat)
-                or destination_stat.st_dev != destination_device
-                or getattr(destination_stat, "st_nlink", 0) != 1
-                or self._descriptor_mount_id(destination_descriptor)
-                != destination_mount_id
-            ):
-                raise _FdBackupError("Destination file identity was unsafe")
-
-            digest = hashlib.sha256()
-            captured = bytearray() if capture_content else None
-            copied_size = 0
-            while True:
-                chunk = os.read(source_read_descriptor, 1024 * 1024)
-                if not isinstance(chunk, bytes):
-                    raise _FdBackupError("Source read returned an invalid value")
-                if not chunk:
-                    break
-                digest.update(chunk)
-                if captured is not None:
-                    captured.extend(chunk)
-                copied_size += len(chunk)
-                offset = 0
-                while offset < len(chunk):
-                    written = os.write(destination_descriptor, chunk[offset:])
-                    if not isinstance(written, int) or written <= 0:
-                        raise _FdBackupError(
-                            "Destination write did not make progress"
-                        )
-                    offset += written
-
-            final_source_stat = os.fstat(source_read_descriptor)
-            rebound_source_stat = os.stat(
-                name,
-                dir_fd=source_parent_descriptor,
-                follow_symlinks=False,
-            )
-            rebound_destination_stat = os.stat(
-                name,
-                dir_fd=destination_parent_descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                self._filesystem_entry_identity(final_source_stat)
-                != source_identity
-                or self._filesystem_entry_identity(rebound_source_stat)
-                != source_identity
-                or self._filesystem_entry_identity(rebound_destination_stat)
-                != destination_identity
-                or copied_size != final_source_stat.st_size
-            ):
-                raise _FdBackupError("File binding changed during copy")
-            os.fsync(destination_descriptor)
-            return (
-                digest.hexdigest(),
-                bytes(captured) if captured is not None else None,
-            )
-        except _FdBackupError:
-            raise
-        except (OSError, TypeError, ValueError) as exc:
-            raise _FdBackupError("Regular file copy could not be proven") from exc
-        finally:
-            if destination_descriptor is not None:
-                descriptor_to_close = destination_descriptor
-                destination_descriptor = None
-                close_ok = self._close_backup_descriptor(descriptor_to_close)
-            if source_read_descriptor is not None:
-                descriptor_to_close = source_read_descriptor
-                source_read_descriptor = None
-                close_ok = (
-                    self._close_backup_descriptor(descriptor_to_close)
-                    and close_ok
-                )
-            if source_path_descriptor is not None:
-                descriptor_to_close = source_path_descriptor
-                source_path_descriptor = None
-                close_ok = (
-                    self._close_backup_descriptor(descriptor_to_close)
-                    and close_ok
-                )
-            if not close_ok:
-                raise _FdBackupError("File descriptor close was unproven")
-
-    def _fd_copy_directory_tree(
-        self,
-        source_descriptor: int,
-        destination_descriptor: int,
-        *,
-        relative_root: str,
-        source_device: int,
-        source_mount_id: int,
-        destination_device: int,
-        destination_mount_id: int,
-        manifest: Dict[str, str],
-        area_documents: Dict[str, Dict[str, Any]],
-    ) -> None:
-        names = self._fd_directory_names(source_descriptor)
-        folded_names = [name.casefold() for name in names]
-        if len(folded_names) != len(set(folded_names)):
-            raise _FdBackupError("Source contains case-aliased entries")
-
-        for name in names:
-            try:
-                source_stat = os.stat(
-                    name,
-                    dir_fd=source_descriptor,
-                    follow_symlinks=False,
-                )
-            except (OSError, TypeError, ValueError) as exc:
-                raise _FdBackupError("Source entry could not be classified") from exc
-            if (
-                self._filesystem_entry_identity(source_stat) is None
-                or self._stat_result_is_reparse(source_stat)
-                or source_stat.st_dev != source_device
-            ):
-                raise _FdBackupError("Source entry classification was unsafe")
-
-            relative_path = (
-                name if relative_root == "." else f"{relative_root}/{name}"
-            )
-            if stat.S_ISDIR(source_stat.st_mode):
-                source_child_descriptor = None
-                destination_child_descriptor = None
-                close_ok = True
-                try:
-                    (
-                        source_child_descriptor,
-                        source_child_identity,
-                    ) = self._open_verified_directory_at(
-                        source_descriptor,
-                        name,
-                        source_stat,
-                        expected_device=source_device,
-                        expected_mount_id=source_mount_id,
-                    )
-                    try:
-                        os.mkdir(
-                            name,
-                            0o700,
-                            dir_fd=destination_descriptor,
-                        )
-                    except (OSError, TypeError, ValueError) as exc:
-                        raise _FdBackupError(
-                            "Destination directory creation collided"
-                        ) from exc
-                    destination_stat = os.stat(
-                        name,
-                        dir_fd=destination_descriptor,
-                        follow_symlinks=False,
-                    )
-                    (
-                        destination_child_descriptor,
-                        destination_child_identity,
-                    ) = self._open_verified_directory_at(
-                        destination_descriptor,
-                        name,
-                        destination_stat,
-                        expected_device=destination_device,
-                        expected_mount_id=destination_mount_id,
-                    )
-                    manifest[f"dir:{relative_path}"] = "directory"
-                    self._fd_copy_directory_tree(
-                        source_child_descriptor,
-                        destination_child_descriptor,
-                        relative_root=relative_path,
-                        source_device=source_device,
-                        source_mount_id=source_mount_id,
-                        destination_device=destination_device,
-                        destination_mount_id=destination_mount_id,
-                        manifest=manifest,
-                        area_documents=area_documents,
-                    )
-                    if not self._fd_directory_binding_matches(
-                        source_descriptor,
-                        name,
-                        source_child_descriptor,
-                        source_child_identity,
-                        source_mount_id,
-                    ) or not self._fd_directory_binding_matches(
-                        destination_descriptor,
-                        name,
-                        destination_child_descriptor,
-                        destination_child_identity,
-                        destination_mount_id,
-                    ):
-                        raise _FdBackupError(
-                            "Directory binding changed during recursive copy"
-                        )
-                    os.fsync(destination_child_descriptor)
-                finally:
-                    if destination_child_descriptor is not None:
-                        descriptor_to_close = destination_child_descriptor
-                        destination_child_descriptor = None
-                        close_ok = self._close_backup_descriptor(
-                            descriptor_to_close
-                        )
-                    if source_child_descriptor is not None:
-                        descriptor_to_close = source_child_descriptor
-                        source_child_descriptor = None
-                        close_ok = (
-                            self._close_backup_descriptor(descriptor_to_close)
-                            and close_ok
-                        )
-                    if not close_ok:
-                        raise _FdBackupError(
-                            "Recursive directory close was unproven"
-                        )
-                continue
-
-            if not stat.S_ISREG(source_stat.st_mode):
-                raise _FdBackupError("Source contains a non-regular entry")
-            if getattr(source_stat, "st_nlink", 0) != 1:
-                raise _FdBackupError("Source hardlinks are not accepted")
-            capture_content = (
-                relative_root == "areas"
-                and name.endswith(".json")
-                and not name.endswith("_BU.json")
-            )
-            digest, raw_bytes = self._fd_copy_regular_file(
-                source_descriptor,
-                destination_descriptor,
-                name,
-                source_stat,
-                source_device=source_device,
-                source_mount_id=source_mount_id,
-                destination_device=destination_device,
-                destination_mount_id=destination_mount_id,
-                capture_content=capture_content,
-            )
-            manifest[f"file:{relative_path}"] = digest
-            if capture_content and raw_bytes is not None:
-                try:
-                    area_value = json.loads(raw_bytes.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    area_value = None
-                if isinstance(area_value, dict):
-                    area_documents[name] = area_value
-
     def _fd_directory_manifest(
         self,
         directory_descriptor: int,
@@ -2228,17 +1966,16 @@ Create atmospheric travel narration that leads into this adventure."""
         expected_device: int,
         expected_mount_id: int,
         manifest: Dict[str, str],
+        held_path: Optional[str],
     ) -> None:
-        names = self._fd_directory_names(directory_descriptor)
+        names = self._fd_directory_names(directory_descriptor, held_path)
         folded_names = [name.casefold() for name in names]
         if len(folded_names) != len(set(folded_names)):
             raise _FdBackupError("Manifest contains case-aliased entries")
         for name in names:
             try:
-                entry_stat = os.stat(
-                    name,
-                    dir_fd=directory_descriptor,
-                    follow_symlinks=False,
+                entry_stat = self._held_entry_stat(
+                    directory_descriptor, held_path, name
                 )
             except (OSError, TypeError, ValueError) as exc:
                 raise _FdBackupError("Manifest entry could not be classified") from exc
@@ -2251,6 +1988,9 @@ Create atmospheric travel narration that leads into this adventure."""
             relative_path = (
                 name if relative_root == "." else f"{relative_root}/{name}"
             )
+            child_path = (
+                None if held_path is None else os.path.join(held_path, name)
+            )
             if stat.S_ISDIR(entry_stat.st_mode):
                 child_descriptor = None
                 close_ok = True
@@ -2262,6 +2002,7 @@ Create atmospheric travel narration that leads into this adventure."""
                             entry_stat,
                             expected_device=expected_device,
                             expected_mount_id=expected_mount_id,
+                            parent_path=held_path,
                         )
                     )
                     manifest[f"dir:{relative_path}"] = "directory"
@@ -2271,6 +2012,7 @@ Create atmospheric travel narration that leads into this adventure."""
                         expected_device=expected_device,
                         expected_mount_id=expected_mount_id,
                         manifest=manifest,
+                        held_path=child_path,
                     )
                     if not self._fd_directory_binding_matches(
                         directory_descriptor,
@@ -2278,6 +2020,7 @@ Create atmospheric travel narration that leads into this adventure."""
                         child_descriptor,
                         child_identity,
                         expected_mount_id,
+                        parent_path=held_path,
                     ):
                         raise _FdBackupError(
                             "Manifest directory binding changed"
@@ -2310,12 +2053,13 @@ Create atmospheric travel narration that leads into this adventure."""
                         entry_stat,
                         expected_device=expected_device,
                         expected_mount_id=expected_mount_id,
+                        parent_path=held_path,
                     )
                 )
                 digest = hashlib.sha256()
                 read_size = 0
                 while True:
-                    chunk = os.read(read_descriptor, 1024 * 1024)
+                    chunk = self._read_held_chunk(read_descriptor)
                     if not isinstance(chunk, bytes):
                         raise _FdBackupError(
                             "Manifest read returned an invalid value"
@@ -2325,10 +2069,8 @@ Create atmospheric travel narration that leads into this adventure."""
                     digest.update(chunk)
                     read_size += len(chunk)
                 final_stat = os.fstat(read_descriptor)
-                rebound_stat = os.stat(
-                    name,
-                    dir_fd=directory_descriptor,
-                    follow_symlinks=False,
+                rebound_stat = self._held_entry_stat(
+                    directory_descriptor, held_path, name
                 )
                 if (
                     self._filesystem_entry_identity(final_stat)
@@ -2358,275 +2100,19 @@ Create atmospheric travel narration that leads into this adventure."""
                         "Manifest file close was unproven"
                     )
 
-    def _create_module_backup(
-        self,
-        module_name: str,
-        *,
-        entry_guard: _ExactModuleEntryGuard,
-    ) -> _ModuleBackupResult:
-        """Create one no-follow, fd-relative, retained module snapshot."""
-        if not self._fd_relative_backup_supported():
-            return _ModuleBackupResult(
-                proven=False,
-                reason="Descriptor-relative backup capability is unavailable",
-            )
-        expected_module_path = self._target_module_path(module_name)
-        try:
-            guard_path_matches = (
-                expected_module_path is not None
-                and os.path.normcase(os.path.abspath(entry_guard.module_path))
-                == os.path.normcase(os.path.abspath(expected_module_path))
-            )
-        except (AttributeError, OSError, TypeError, ValueError):
-            guard_path_matches = False
-        if (
-            not isinstance(entry_guard, _ExactModuleEntryGuard)
-            or entry_guard.module_name != module_name
-            or not guard_path_matches
-        ):
-            return _ModuleBackupResult(
-                proven=False,
-                reason="An exact lexical module guard is required for backup",
-            )
-
-        modules_descriptor = None
-        backup_root_descriptor = None
-        backup_leaf_descriptor = None
-        modules_identity = None
-        modules_mount_id = None
-        backup_root_name = None
-        backup_leaf_name = None
-        files_backed_up = None
-        result = _ModuleBackupResult(
-            proven=False,
-            reason="Descriptor-relative backup could not be proven",
-        )
-        close_ok = True
-        try:
-            modules_stat = os.stat(self.modules_dir, follow_symlinks=False)
-            modules_identity = self._filesystem_entry_identity(modules_stat)
-            if (
-                modules_identity is None
-                or not stat.S_ISDIR(modules_stat.st_mode)
-                or self._stat_result_is_reparse(modules_stat)
-            ):
-                raise _FdBackupError("Modules directory identity was unsafe")
-            modules_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            modules_flags |= getattr(os, "O_CLOEXEC", 0)
-            modules_descriptor = os.open(self.modules_dir, modules_flags)
-            held_modules_stat = os.fstat(modules_descriptor)
-            modules_mount_id = self._descriptor_mount_id(modules_descriptor)
-            if (
-                self._filesystem_entry_identity(held_modules_stat)
-                != modules_identity
-                or self._stat_result_is_reparse(held_modules_stat)
-                or modules_mount_id is None
-            ):
-                raise _FdBackupError("Modules directory binding was unproven")
-
-            source_stat = os.stat(
-                module_name,
-                dir_fd=modules_descriptor,
-                follow_symlinks=False,
-            )
-            held_source_stat = os.fstat(entry_guard.descriptor)
-            source_identity = self._filesystem_entry_identity(source_stat)
-            source_mount_id = self._descriptor_mount_id(entry_guard.descriptor)
-            if (
-                source_identity is None
-                or source_identity != entry_guard.identity
-                or self._filesystem_entry_identity(held_source_stat)
-                != entry_guard.identity
-                or not stat.S_ISDIR(source_stat.st_mode)
-                or self._stat_result_is_reparse(source_stat)
-                or self._stat_result_is_reparse(held_source_stat)
-                or source_stat.st_dev != held_modules_stat.st_dev
-                or source_mount_id != modules_mount_id
-            ):
-                raise _FdBackupError("Held module is not the exact modules child")
-
-            backup_root_name = ".integration_backups"
-            module_names = self._fd_directory_names(modules_descriptor)
-            if self._case_aliases(module_names, backup_root_name):
-                raise _FdBackupError("A case-aliased backup root exists")
-            try:
-                backup_root_stat = os.stat(
-                    backup_root_name,
-                    dir_fd=modules_descriptor,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                try:
-                    os.mkdir(
-                        backup_root_name,
-                        0o700,
-                        dir_fd=modules_descriptor,
-                    )
-                except FileExistsError:
-                    pass
-                os.fsync(modules_descriptor)
-                backup_root_stat = os.stat(
-                    backup_root_name,
-                    dir_fd=modules_descriptor,
-                    follow_symlinks=False,
-                )
-            backup_root_descriptor, _backup_root_identity = (
-                self._open_verified_directory_at(
-                    modules_descriptor,
-                    backup_root_name,
-                    backup_root_stat,
-                    expected_device=held_modules_stat.st_dev,
-                    expected_mount_id=modules_mount_id,
-                )
-            )
-            if self._case_aliases(
-                self._fd_directory_names(modules_descriptor),
-                backup_root_name,
-            ):
-                raise _FdBackupError("Backup root alias appeared during open")
-
-            backup_uuid = uuid4().hex
-            if (
-                not isinstance(backup_uuid, str)
-                or len(backup_uuid) != 32
-                or any(character not in "0123456789abcdef" for character in backup_uuid)
-            ):
-                raise _FdBackupError("Backup UUID generation was invalid")
-            backup_leaf_name = f"{module_name}_{backup_uuid}"
-            leaf_names = self._fd_directory_names(backup_root_descriptor)
-            if any(
-                name.casefold() == backup_leaf_name.casefold()
-                for name in leaf_names
-            ):
-                raise _FdBackupError("Backup UUID leaf already exists")
-            try:
-                os.mkdir(
-                    backup_leaf_name,
-                    0o700,
-                    dir_fd=backup_root_descriptor,
-                )
-            except (OSError, TypeError, ValueError) as exc:
-                raise _FdBackupError("Backup UUID leaf creation collided") from exc
-            backup_leaf_stat = os.stat(
-                backup_leaf_name,
-                dir_fd=backup_root_descriptor,
-                follow_symlinks=False,
-            )
-            backup_leaf_descriptor, _backup_leaf_identity = (
-                self._open_verified_directory_at(
-                    backup_root_descriptor,
-                    backup_leaf_name,
-                    backup_leaf_stat,
-                    expected_device=backup_root_stat.st_dev,
-                    expected_mount_id=modules_mount_id,
-                )
-            )
-            if self._case_aliases(
-                self._fd_directory_names(backup_root_descriptor),
-                backup_leaf_name,
-            ):
-                raise _FdBackupError("Backup leaf alias appeared during open")
-            os.fsync(backup_root_descriptor)
-
-            copied_manifest = {"dir:.": "directory"}
-            area_documents: Dict[str, Dict[str, Any]] = {}
-            self._fd_copy_directory_tree(
-                entry_guard.descriptor,
-                backup_leaf_descriptor,
-                relative_root=".",
-                source_device=held_source_stat.st_dev,
-                source_mount_id=source_mount_id,
-                destination_device=backup_leaf_stat.st_dev,
-                destination_mount_id=modules_mount_id,
-                manifest=copied_manifest,
-                area_documents=area_documents,
-            )
-            source_manifest = {"dir:.": "directory"}
-            self._fd_directory_manifest(
-                entry_guard.descriptor,
-                relative_root=".",
-                expected_device=held_source_stat.st_dev,
-                expected_mount_id=source_mount_id,
-                manifest=source_manifest,
-            )
-            destination_manifest = {"dir:.": "directory"}
-            self._fd_directory_manifest(
-                backup_leaf_descriptor,
-                relative_root=".",
-                expected_device=backup_leaf_stat.st_dev,
-                expected_mount_id=modules_mount_id,
-                manifest=destination_manifest,
-            )
-            if (
-                copied_manifest != source_manifest
-                or copied_manifest != destination_manifest
-            ):
-                raise _FdBackupError("Descriptor manifests did not match")
-            files_backed_up = sum(
-                key.startswith("file:") for key in copied_manifest
-            )
-            if files_backed_up <= 0:
-                raise _FdBackupError("Backup contained no regular files")
-
-            entry_valid, _entry_reason = (
-                self._revalidate_exact_module_entry_guard(entry_guard)
-            )
-            if not entry_valid:
-                raise _FdBackupError("Source binding changed before proof")
-            os.fsync(backup_leaf_descriptor)
-            os.fsync(backup_root_descriptor)
-            os.fsync(modules_descriptor)
-            result = _ModuleBackupResult(
-                proven=True,
-                manifest=copied_manifest,
-                area_documents=area_documents,
-            )
-        except _FdBackupError as exc:
-            result = _ModuleBackupResult(
-                proven=False,
-                reason=str(exc),
-            )
-        except (OSError, TypeError, ValueError):
-            result = _ModuleBackupResult(
-                proven=False,
-                reason="Descriptor-relative backup raised before proof",
-            )
-        finally:
-            if backup_leaf_descriptor is not None:
-                descriptor_to_close = backup_leaf_descriptor
-                backup_leaf_descriptor = None
-                close_ok = self._close_backup_descriptor(descriptor_to_close)
-            if backup_root_descriptor is not None:
-                descriptor_to_close = backup_root_descriptor
-                backup_root_descriptor = None
-                close_ok = (
-                    self._close_backup_descriptor(descriptor_to_close)
-                    and close_ok
-                )
-            if modules_descriptor is not None:
-                descriptor_to_close = modules_descriptor
-                modules_descriptor = None
-                close_ok = (
-                    self._close_backup_descriptor(descriptor_to_close)
-                    and close_ok
-                )
-            if not close_ok:
-                result = _ModuleBackupResult(
-                    proven=False,
-                    reason="Backup descriptor close was unproven",
-                )
-        if result.proven is True and files_backed_up is not None:
-            print(
-                f"    - Backed up {files_backed_up} files "
-                "(descriptor-relative snapshot receipt; no path authority)"
-            )
-        return result
-
     def _manifest_exact_module_guard(
         self,
         entry_guard: Optional[_ExactModuleEntryGuard],
+        *,
+        report_busy: bool = False,
     ) -> Optional[Dict[str, str]]:
-        """Manifest only the directory held by the exact publication guard."""
+        """Manifest only the directory held by the exact publication guard.
+
+        With ``report_busy``, a transient error (a Windows sharing or lock
+        violation, or a temporary POSIX error) raises _ModuleFilesBusy instead
+        of returning None: another process holding a file is not a property
+        of the module (issue #608).
+        """
         if (
             not self._fd_relative_backup_supported()
             or not isinstance(entry_guard, _ExactModuleEntryGuard)
@@ -2643,6 +2129,11 @@ Create atmospheric travel narration that leads into this adventure."""
             mount_id = self._descriptor_mount_id(entry_guard.descriptor)
             if mount_id is None:
                 return None
+            # Only the path G1 proved names the held tree; a guard without
+            # one gets no receipt (issue #608).
+            held_path = entry_guard.held_path
+            if not held_path:
+                return None
             manifest = {"dir:.": "directory"}
             self._fd_directory_manifest(
                 entry_guard.descriptor,
@@ -2650,12 +2141,26 @@ Create atmospheric travel narration that leads into this adventure."""
                 expected_device=held_stat.st_dev,
                 expected_mount_id=mount_id,
                 manifest=manifest,
+                held_path=held_path,
             )
             entry_valid, _entry_reason = (
                 self._revalidate_exact_module_entry_guard(entry_guard)
             )
             return manifest if entry_valid else None
-        except (_FdBackupError, OSError, TypeError, ValueError):
+        except (_FdBackupError, OSError, TypeError, ValueError) as exc:
+            if report_busy:
+                cause = exc
+                local = None
+                while cause is not None:
+                    if is_transient_filesystem_error(cause):
+                        raise _ModuleFilesBusy(str(cause)) from exc
+                    if local is None and isinstance(cause, OSError):
+                        local = cause
+                    cause = cause.__cause__
+                if local is not None:
+                    # The tree could not be read on this machine; that is not
+                    # a property of the module (issue #639).
+                    raise _ModuleCheckCouldNotRun(str(local)) from exc
             return None
 
     @staticmethod
@@ -2845,8 +2350,12 @@ Create atmospheric travel narration that leads into this adventure."""
         reason: str,
         *,
         entry_guard: Optional[_ExactModuleEntryGuard],
+        cause: Optional[NotJoinedCause] = None,
     ) -> TargetedPublicationResult:
-        """Prove prior registry and non-destructive module snapshot equality."""
+        """Prove prior registry and non-destructive module snapshot equality.
+
+        ``cause`` is carried only on the ``NOT_PUBLISHED`` result.
+        """
         registry_ok, registry_reason = self._registry_matches_snapshot(
             prior_registry
         )
@@ -2935,6 +2444,7 @@ Create atmospheric travel narration that leads into this adventure."""
             registry_absence_proven=True,
             registry_restoration_proven=True,
             module_restoration_proven=True,
+            cause=cause,
         )
 
     def _finish_entry_identity_failure(
@@ -2950,8 +2460,8 @@ Create atmospheric travel narration that leads into this adventure."""
 
         Once the held identity no longer owns the lexical path, path-based
         module rollback cannot prove it is operating on the original tree. The
-        backup is retained and the result stays indeterminate for manual or
-        later journal-backed recovery.
+        result stays indeterminate for manual or later journal-backed
+        recovery.
         """
         if registry_attempted:
             registry_ok, registry_reason = self._restore_registry_snapshot(
@@ -2989,7 +2499,7 @@ Create atmospheric travel narration that leads into this adventure."""
             prior_registry
         )
         if not registry_ok:
-            # Candidate module + backup are intentionally retained. Rolling the
+            # The candidate module is intentionally left in place. Rolling the
             # module back while registry state is unknown could make a registry
             # that actually committed point at deleted or incompatible files.
             return TargetedPublicationResult(
@@ -3043,7 +2553,7 @@ Create atmospheric travel narration that leads into this adventure."""
         )
 
     def _registry_with_live_publication_identities(
-        self, registry: Dict[str, Any]
+        self, registry: Dict[str, Any], exclude_module: Optional[str] = None
     ) -> Dict[str, Any]:
         """Return a detached conflict view augmented from live module trees.
 
@@ -3051,7 +2561,8 @@ Create atmospheric travel narration that leads into this adventure."""
         map.  Conflict resolution still needs the identifiers owned by those
         already-live modules.  Rebuild that conflict-only view from disk while
         the caller owns ``module_refresh_lock``; never rewrite the live registry
-        as part of discovery.
+        as part of discovery. ``exclude_module`` leaves out the live tree that
+        a managed import is about to replace (its own old identities).
         """
         from utils.module_refresh_lock import assert_module_refresh_lock_owned
 
@@ -3079,6 +2590,8 @@ Create atmospheric travel narration that leads into this adventure."""
         for entry in entries:
             module_name = entry.name
             if module_name.startswith(".") or module_name in support_roots:
+                continue
+            if module_name == exclude_module:
                 continue
             if entry.is_symlink():
                 raise ValueError("Live module root is a link")
@@ -3115,7 +2628,9 @@ Create atmospheric travel narration that leads into this adventure."""
 
         return conflict_registry
 
-    def build_publication_registry_bytes(self, candidate_path, module_name):
+    def build_publication_registry_bytes(
+        self, candidate_path, module_name, *, replacing_live=False
+    ):
         """Store-free registry preparation for the atomic-publish path (P2b).
 
         Runs on a freshly built module candidate (utils/module_publish's hidden
@@ -3130,6 +2645,11 @@ Create atmospheric travel narration that leads into this adventure."""
         is made live. Any raise here aborts the publish with ``modules/<name>``
         never touched -- the player's game is unaffected and the build simply did
         not happen. Never operates on live module state.
+
+        ``replacing_live=True`` is the managed import of an unplayed live
+        module: the candidate is a copy of ``modules/<name>`` that will replace
+        it, so the occupied final path, a bare registry stub of the name, and
+        the live tree's own identities are not conflicts.
         """
         from utils.module_publish import validate_module_name
         from utils.module_refresh_lock import assert_module_refresh_lock_owned
@@ -3161,7 +2681,7 @@ Create atmospheric travel narration that leads into this adventure."""
                     raise ValueError(
                         "Managed candidate contains a link or reparse point"
                     )
-        if os.path.lexists(modules_root / module_name):
+        if not replacing_live and os.path.lexists(modules_root / module_name):
             raise FileExistsError("Managed module final path became occupied")
 
         prior_registry_bytes = Path(self.world_registry_file).read_bytes()
@@ -3187,9 +2707,12 @@ Create atmospheric travel narration that leads into this adventure."""
         elif not isinstance(prior_registry["areas"], dict):
             raise ValueError("World registry shape is invalid")
         conflict_registry = self._registry_with_live_publication_identities(
-            prior_registry
+            prior_registry,
+            exclude_module=module_name if replacing_live else None,
         )
-        if self._registry_references_module(prior_registry, module_name):
+        if self._registry_references_module(prior_registry, module_name) and not (
+            replacing_live and self._is_registry_stub(prior_registry, module_name)
+        ):
             raise ValueError("Allocated module name is already registry-owned")
 
         candidate_text = os.fspath(candidate)
@@ -3204,11 +2727,9 @@ Create atmospheric travel narration that leads into this adventure."""
         if not module_data or not module_data.get("areas"):
             raise ValueError("Managed candidate could not be analyzed")
 
-        captured_areas = self._capture_area_documents_from_path(candidate_text)
         normalized = self._resolve_id_conflicts(
             module_name,
             module_data,
-            _ModuleBackupResult(True, area_documents=captured_areas),
             registry_snapshot=conflict_registry,
             module_path=candidate_text,
         )
@@ -3228,7 +2749,7 @@ Create atmospheric travel narration that leads into this adventure."""
         valid, reason = self._validate_required_publication_files(candidate_text)
         if not valid:
             raise ValueError(reason or "Normalized module files are incomplete")
-        remaining_conflict, conflict_reason = (
+        remaining_conflict, conflict_reason, _colliding = (
             self._detect_legacy_publication_conflicts(
                 module_name,
                 candidate_text,
@@ -3257,7 +2778,12 @@ Create atmospheric travel narration that leads into this adventure."""
             )
         )
         if not safety.allows_integration:
-            raise ValueError(
+            refusal = (
+                _ModuleCheckUnavailable
+                if safety.status is ModuleSafetyStatus.UNAVAILABLE
+                else ValueError
+            )
+            raise refusal(
                 f"Managed module safety {safety.status.value}: "
                 f"{safety.reason or 'No reason supplied'}"
             )
@@ -3279,35 +2805,14 @@ Create atmospheric travel narration that leads into this adventure."""
 
 
 
-    def publish_module(self, module_name: str) -> TargetedPublicationResult:
-        """Transactionally publish one exact module; never perform a scan."""
-        from utils.module_refresh_lock import module_refresh_lock
-
-        if self._target_module_path(module_name) is None:
-            return TargetedPublicationResult(
-                PublicationStatus.INDETERMINATE,
-                module_name,
-                "Invalid or non-contained module name",
-            )
-        with module_refresh_lock() as acquired:
-            if not acquired:
-                return TargetedPublicationResult(
-                    PublicationStatus.INDETERMINATE,
-                    module_name,
-                    "Module publication lock timed out",
-                )
-            return self._publish_module_locked(module_name)
-
     def publish_module_locked(
         self, module_name: str
     ) -> TargetedPublicationResult:
         """Publish one exact module while the caller owns module_refresh_lock.
 
-        This entry point intentionally does not acquire or release the lock. It
-        exists for the builder/publication transaction in ``action_handler``,
-        whose caller must keep one uninterrupted ``module_refresh_lock`` scope
-        around both module construction and this call. Other callers should use
-        :meth:`publish_module`.
+        This entry point intentionally does not acquire or release the lock. Its
+        caller, the startup scan (``_scan_and_integrate_new_modules_locked``),
+        holds ``module_refresh_lock`` for the whole scan.
         """
         if self._target_module_path(module_name) is None:
             return TargetedPublicationResult(
@@ -3416,7 +2921,11 @@ Create atmospheric travel narration that leads into this adventure."""
         # in-memory baseline while candidate construction remains detached.
         self.world_registry = deepcopy(prior_registry)
 
-        referenced = self._registry_references_module(prior_registry, module_name)
+        # A bare stub names the module without integrating it; publish it
+        # through the unregistered path, whose candidate replaces the stub.
+        referenced = self._registry_references_module(
+            prior_registry, module_name
+        ) and not self._is_registry_stub(prior_registry, module_name)
         exact_entry = prior_registry.get("modules", {}).get(module_name)
         if referenced:
             if entry_state != "directory" or os.path.exists(
@@ -3517,11 +3026,28 @@ Create atmospheric travel narration that leads into this adventure."""
                 registry_restoration_proven=True,
             )
 
-        conflict_state, conflict_reason = self._detect_legacy_publication_conflicts(
-            module_name,
-            module_path,
-            prior_registry,
-        )
+        files_refused = ""
+        files_unchecked = False
+        try:
+            conflict_state, conflict_reason, conflicting_modules = (
+                self._detect_legacy_publication_conflicts(
+                    module_name,
+                    module_path,
+                    prior_registry,
+                )
+            )
+        except _ModuleFilesBusy:
+            # Busy is not a property of the module: the scan stays
+            # inconclusive, so the result is INDETERMINATE (issue #608).
+            conflict_state, conflict_reason, conflicting_modules = (
+                None,
+                _MODULE_FILES_BUSY_REASON,
+                (),
+            )
+        except _ModuleFilesRefused as exc:
+            conflict_state, conflict_reason, conflicting_modules = None, "", ()
+            files_refused = str(exc) or "Module reset masters could not be read"
+            files_unchecked = isinstance(exc, _ModuleCheckCouldNotRun)
         entry_valid, entry_reason = self._revalidate_publication_entry(
             module_name,
             module_path,
@@ -3534,6 +3060,23 @@ Create atmospheric travel narration that leads into this adventure."""
                 module_name,
                 "Exact module identity changed during conflict inspection: "
                 f"{entry_reason}",
+            )
+        if files_refused:
+            # Nothing has been written yet: the module's own files failed a
+            # check, or could not be read here, so it is reported as not
+            # joined (issues #609, #639).
+            return TargetedPublicationResult(
+                PublicationStatus.NOT_PUBLISHED,
+                module_name,
+                files_refused,
+                registry_absence_proven=True,
+                registry_restoration_proven=True,
+                module_restoration_proven=True,
+                cause=(
+                    NotJoinedCause.CHECK_UNAVAILABLE
+                    if files_unchecked
+                    else NotJoinedCause.CHECK_REFUSED
+                ),
             )
         if conflict_state is None:
             return TargetedPublicationResult(
@@ -3549,14 +3092,44 @@ Create atmospheric travel narration that leads into this adventure."""
                 registry_absence_proven=True,
                 registry_restoration_proven=True,
                 module_restoration_proven=True,
+                conflicting_modules=conflicting_modules,
             )
 
-        backup_result = _coerce_module_backup_result(
-            self._create_module_backup(
-                module_name,
-                entry_guard=entry_guard,
+        # The receipt is one manifest of the held tree. This path never writes
+        # module files, so the failure proofs need only these hashes to tell
+        # NOT_PUBLISHED from INDETERMINATE; no copy is kept (issue #565).
+        manifest_unchecked = False
+        try:
+            receipt_manifest = self._manifest_exact_module_guard(
+                entry_guard, report_busy=True
             )
-        )
+        except _ModuleFilesBusy:
+            # Busy is not a property of the module: nothing was refused or
+            # written, and the next start tries again (issue #608).
+            return TargetedPublicationResult(
+                PublicationStatus.INDETERMINATE,
+                module_name,
+                _MODULE_FILES_BUSY_REASON,
+            )
+        except _ModuleCheckCouldNotRun:
+            # The held tree could not be read here (issue #639).
+            receipt_manifest = None
+            manifest_unchecked = True
+        if not isinstance(receipt_manifest, dict):
+            backup_result = _ModuleBackupResult(
+                proven=False,
+                reason="Module manifest could not be proven",
+            )
+        elif not any(key.startswith("file:") for key in receipt_manifest):
+            backup_result = _ModuleBackupResult(
+                proven=False,
+                reason="Backup contained no regular files",
+            )
+        else:
+            backup_result = _ModuleBackupResult(
+                proven=True,
+                manifest=receipt_manifest,
+            )
         backup_dir = backup_result
         entry_valid, entry_reason = self._revalidate_publication_entry(
             module_name,
@@ -3576,7 +3149,6 @@ Create atmospheric travel narration that leads into this adventure."""
         if (
             backup_result.proven is not True
             or not isinstance(backup_result.manifest, dict)
-            or not isinstance(backup_result.area_documents, dict)
         ):
             backup_reason = backup_result.reason or (
                 "A complete descriptor-bound snapshot receipt could not be created"
@@ -3588,13 +3160,31 @@ Create atmospheric travel narration that leads into this adventure."""
                 registry_absence_proven=True,
                 registry_restoration_proven=True,
                 module_restoration_proven=True,
+                cause=(
+                    NotJoinedCause.CHECK_UNAVAILABLE
+                    if manifest_unchecked
+                    else NotJoinedCause.CHECK_REFUSED
+                ),
             )
 
         registry_attempted = False
         try:
-            valid, validation_reason = self._validate_required_publication_files(
-                module_path
-            )
+            try:
+                valid, validation_reason = (
+                    self._validate_required_publication_files(
+                        module_path, report_local_errors=True
+                    )
+                )
+            except _ModuleCheckCouldNotRun as exc:
+                # The check could not run here (issue #639).
+                return self._finish_prewrite_failure(
+                    module_name,
+                    backup_dir,
+                    prior_registry,
+                    str(exc),
+                    entry_guard=entry_guard,
+                    cause=NotJoinedCause.CHECK_UNAVAILABLE,
+                )
             if not valid:
                 return self._finish_prewrite_failure(
                     module_name,
@@ -3602,6 +3192,7 @@ Create atmospheric travel narration that leads into this adventure."""
                     prior_registry,
                     validation_reason,
                     entry_guard=entry_guard,
+                    cause=NotJoinedCause.CHECK_REFUSED,
                 )
 
             module_data = self.analyze_module(
@@ -3614,113 +3205,10 @@ Create atmospheric travel narration that leads into this adventure."""
                     prior_registry,
                     "Exact module could not be analyzed",
                     entry_guard=entry_guard,
-                )
-
-            # The conflict helpers may mutate area files. They read a detached
-            # snapshot so self.world_registry remains unchanged until commit.
-            entry_valid, entry_reason = self._revalidate_publication_entry(
-                module_name,
-                module_path,
-                entry_state,
-                entry_guard,
-            )
-            if not entry_valid:
-                return self._finish_entry_identity_failure(
-                    module_name,
-                    backup_dir,
-                    prior_registry,
-                    (
-                        "Exact module identity changed before mutation: "
-                        f"{entry_reason}"
-                    ),
-                    registry_attempted=False,
-                )
-            conflicts_resolved = self._resolve_id_conflicts(
-                module_name,
-                module_data,
-                backup_dir,
-                registry_snapshot=prior_registry,
-            )
-            entry_valid, entry_reason = self._revalidate_publication_entry(
-                module_name,
-                module_path,
-                entry_state,
-                entry_guard,
-            )
-            if not entry_valid:
-                return self._finish_entry_identity_failure(
-                    module_name,
-                    backup_dir,
-                    prior_registry,
-                    (
-                        "Exact module identity changed during mutation: "
-                        f"{entry_reason}"
-                    ),
-                    registry_attempted=False,
-                )
-            if conflicts_resolved:
-                print(f"  - Resolved {conflicts_resolved} ID conflicts")
-                bu_updated = self._update_bu_files_after_conflict_resolution(
-                    module_name
-                )
-                entry_valid, entry_reason = self._revalidate_publication_entry(
-                    module_name,
-                    module_path,
-                    entry_state,
-                    entry_guard,
-                )
-                if not entry_valid:
-                    return self._finish_entry_identity_failure(
-                        module_name,
-                        backup_dir,
-                        prior_registry,
-                        (
-                            "Exact module identity changed while updating "
-                            f"backup files: {entry_reason}"
-                        ),
-                        registry_attempted=False,
-                    )
-                if bu_updated:
-                    print(
-                        f"  - Updated {bu_updated} BU files with corrected location IDs"
-                    )
-                module_data = self.analyze_module(
-                    module_name, include_travel_narration=False
-                )
-                if not module_data or not module_data.get("areas"):
-                    return self._finish_prewrite_failure(
-                        module_name,
-                        backup_dir,
-                        prior_registry,
-                        "Module re-analysis failed after conflict resolution",
-                        entry_guard=entry_guard,
-                    )
-
-            valid, validation_reason = self._validate_required_publication_files(
-                module_path
-            )
-            if not valid:
-                return self._finish_prewrite_failure(
-                    module_name,
-                    backup_dir,
-                    prior_registry,
-                    validation_reason,
-                    entry_guard=entry_guard,
+                    cause=NotJoinedCause.CHECK_REFUSED,
                 )
 
             area_ids = set(module_data.get("areas", {}))
-            unresolved_collisions = area_ids.intersection(
-                prior_registry.get("areas", {})
-            )
-            if unresolved_collisions:
-                return self._finish_prewrite_failure(
-                    module_name,
-                    backup_dir,
-                    prior_registry,
-                    "Unresolved area ID collisions: "
-                    + ", ".join(sorted(unresolved_collisions)),
-                    entry_guard=entry_guard,
-                )
 
             module_data["travelNarration"] = self._generate_travel_narration(
                 module_data
@@ -3748,6 +3236,11 @@ Create atmospheric travel narration that leads into this adventure."""
                         f"{safety_result.reason or 'No reason supplied'}"
                     ),
                     entry_guard=entry_guard,
+                    cause=(
+                        NotJoinedCause.CHECK_UNAVAILABLE
+                        if safety_result.status is ModuleSafetyStatus.UNAVAILABLE
+                        else NotJoinedCause.CHECK_REFUSED
+                    ),
                 )
 
             candidate = self._build_registry_candidate(
@@ -3773,7 +3266,7 @@ Create atmospheric travel narration that leads into this adventure."""
             registry_attempted = True
             try:
                 write_result = safe_write_json(
-                    self.world_registry_file, candidate
+                    self.world_registry_file, candidate, on_read_only="raise"
                 )
             except Exception as exc:
                 return self._finish_registry_attempt_failure(
@@ -3892,10 +3385,6 @@ Create atmospheric travel narration that leads into this adventure."""
                 entry_guard=entry_guard,
             )
 
-    def integrate_module(self, module_name: str) -> bool:
-        """Compatibility adapter for callers that still require a boolean."""
-        return self.publish_module(module_name).published
-
     @staticmethod
     def _capture_area_documents_from_path(
         module_path: str,
@@ -3939,24 +3428,17 @@ Create atmospheric travel narration that leads into this adventure."""
         self,
         module_name: str,
         module_data: Dict[str, Any],
-        backup_result: _ModuleBackupResult,
-        registry_snapshot: Optional[Dict[str, Any]] = None,
-        module_path: Optional[str] = None,
+        registry_snapshot: Dict[str, Any],
+        *,
+        module_path: str,
     ) -> int:
         """Resolve area ID and location ID conflicts by modifying the new module"""
         try:
             conflicts_resolved = 0
-            registry = (
-                registry_snapshot
-                if registry_snapshot is not None
-                else self.world_registry
-            )
+            registry = registry_snapshot
             # Conflict discovery needs a working copy. Mutating the live
             # registry here would violate the publication commit boundary.
             existing_areas = deepcopy(registry.get('areas', {}))
-            module_path = module_path or os.path.join(
-                self.modules_dir, module_name
-            )
             original_area_documents = self._capture_area_documents_from_path(
                 module_path
             )
@@ -4034,10 +3516,6 @@ Create atmospheric travel narration that leads into this adventure."""
                 module_path,
                 current_area_documents,
                 registry_snapshot=registry,
-                fail_closed=(
-                    os.path.abspath(module_path)
-                    != os.path.abspath(os.path.join(self.modules_dir, module_name))
-                ),
             )
             conflicts_resolved += location_conflicts
 
@@ -4232,9 +3710,8 @@ Create atmospheric travel narration that leads into this adventure."""
         self,
         module_name: str,
         module_path: str,
-        backup_area_documents: Dict[str, Dict[str, Any]],
-        registry_snapshot: Optional[Dict[str, Any]] = None,
-        fail_closed: bool = False,
+        pre_reprefix_area_documents: Dict[str, Dict[str, Any]],
+        registry_snapshot: Dict[str, Any],
     ) -> int:
         """
         Ensures all location IDs in a new module are globally unique.
@@ -4243,7 +3720,8 @@ Create atmospheric travel narration that leads into this adventure."""
         Args:
             module_name: Name of the module being integrated
             module_path: Path to the module directory
-            backup_area_documents: Identity-bound original area JSON snapshots
+            pre_reprefix_area_documents: Area JSON documents read from the
+                candidate after area renames and before the location re-prefix
         """
         print(f"DEBUG: [Module Stitcher] Validating global uniqueness of location IDs for {module_name}...")
 
@@ -4252,11 +3730,7 @@ Create atmospheric travel narration that leads into this adventure."""
         # from its JSON areaId: legacy packages may not have matching stems,
         # and silently skipping that lookup would miss a real collision.
         all_existing_loc_ids = set()
-        registry = (
-            registry_snapshot
-            if registry_snapshot is not None
-            else self.world_registry
-        )
+        registry = registry_snapshot
         existing_module_names = {
             area_info.get("module")
             for area_info in registry.get("areas", {}).values()
@@ -4319,11 +3793,16 @@ Create atmospheric travel narration that leads into this adventure."""
         # first character. Reading only loc_id[0] treats 'AA01' as prefix 'A',
         # so start_index lands inside the already-used range and the new module
         # can be handed an already-used two-letter prefix.
+        # The module's own current prefixes count too: a new prefix equal to
+        # one of its old ones (CMS001 C->H while HLF001 still holds H01)
+        # would be rewritten again by the module-wide old->new reference
+        # mapping below, giving duplicate ids.
         max_prefix_index = -1
-        for loc_id in all_existing_loc_ids:
+        for loc_id in all_existing_loc_ids | new_module_loc_ids:
             m = re.match(r'^([A-Za-z]+)\d', loc_id or '')
-            if m:
-                max_prefix_index = max(max_prefix_index, _location_prefix_to_index(m.group(1)))
+            index = _location_prefix_to_index(m.group(1)) if m else None
+            if index is not None:
+                max_prefix_index = max(max_prefix_index, index)
 
         start_index = max_prefix_index + 1
         
@@ -4358,13 +3837,8 @@ Create atmospheric travel narration that leads into this adventure."""
         # After re-prefixing, we need to update all references to the old IDs
         self._update_all_location_references(
             module_name,
-            backup_area_documents,
+            pre_reprefix_area_documents,
             module_path=module_path,
-            update_party_tracker=(
-                os.path.abspath(module_path)
-                == os.path.abspath(os.path.join(self.modules_dir, module_name))
-            ),
-            fail_closed=fail_closed,
         )
 
         return conflicts_resolved
@@ -4408,123 +3882,83 @@ Create atmospheric travel narration that leads into this adventure."""
     def _update_all_location_references(
         self,
         module_name: str,
-        backup_area_documents: Dict[str, Dict[str, Any]],
+        pre_reprefix_area_documents: Dict[str, Dict[str, Any]],
         *,
-        module_path: Optional[str] = None,
-        update_party_tracker: bool = True,
-        fail_closed: bool = False,
+        module_path: str,
     ) -> None:
         """
         Update all internal references to location IDs after re-prefixing using a safe, recursive JSON traversal.
         This function avoids blind text replacement to prevent corrupting external references like 'areaConnectivityId'.
+        Runs only on a publication candidate tree; any failure raises.
         """
-        try:
-            module_path = module_path or os.path.join(
-                self.modules_dir, module_name
+        id_mapping = {}
+
+        # Build ID mapping from the area documents read from the candidate
+        # before the location re-prefix.
+        if not pre_reprefix_area_documents:
+            raise ValueError(
+                "No original area documents are available for ID rewrite"
             )
-            id_mapping = {}
 
-            # Build ID mapping from the immutable area documents captured by
-            # the descriptor-relative backup before any mutation.
-            if not backup_area_documents:
-                if fail_closed:
-                    raise ValueError(
-                        "No original area documents are available for ID rewrite"
-                    )
-                print(f"DEBUG: [Module Stitcher] WARNING: No proven backup area data found for {module_name}, cannot build ID mapping for reference updates.")
-                return
+        current_areas_path = os.path.join(module_path, "areas")
 
-            current_areas_path = os.path.join(module_path, "areas")
+        # Compare captured original data with current re-prefixed files.
+        for filename, backup_data in sorted(pre_reprefix_area_documents.items()):
+            if filename.endswith('.json') and not filename.endswith('_BU.json'):
+                # The filename in the current dir should be the same
+                current_file = os.path.join(current_areas_path, filename)
 
-            # Compare captured original data with current re-prefixed files.
-            for filename, backup_data in sorted(backup_area_documents.items()):
-                if filename.endswith('.json') and not filename.endswith('_BU.json'):
-                    # The filename in the current dir should be the same
-                    current_file = os.path.join(current_areas_path, filename)
+                if os.path.exists(current_file):
+                    current_data = safe_json_load(current_file)
 
-                    if os.path.exists(current_file):
-                        current_data = safe_json_load(current_file)
-
-                        if backup_data and current_data:
-                            # INT-H3: map old->new locationId POSITIONALLY, not by
-                            # location name. update_area_with_prefix re-prefixes IDs
-                            # in place, preserving the locations array's order and
-                            # count, so backup[i] corresponds to current[i]. Two
-                            # locations can share a name (e.g. 'Corridor'); keying
-                            # the mapping by name silently drops one of them and
-                            # leaves its cross-file references pointing at the old ID.
-                            backup_locs = backup_data.get('locations', [])
-                            current_locs = current_data.get('locations', [])
-                            for b_loc, c_loc in zip(backup_locs, current_locs):
-                                if not isinstance(b_loc, dict) or not isinstance(c_loc, dict):
-                                    continue
-                                old_id = b_loc.get('locationId')
-                                new_id = c_loc.get('locationId')
-                                if old_id and new_id and old_id != new_id:
-                                    id_mapping[old_id] = new_id
-            
-            if not id_mapping:
-                print(f"DEBUG: [Module Stitcher] No location ID changes detected for {module_name}. Skipping reference update.")
-                return
-            
-            print(f"DEBUG: [Module Stitcher] Built ID mapping with {len(id_mapping)} entries for {module_name}. Applying updates...")
-
-            # Walk through all JSON files in the module and apply the mapping safely
-            for root, _, files in os.walk(module_path):
-                for filename in files:
-                    if filename.endswith('.json') and not filename.endswith('.bak') and not filename.endswith('_BU.json'):
-                        file_path = os.path.join(root, filename)
-                        try:
-                            data = safe_json_load(file_path)
-                            if not data:
+                    if backup_data and current_data:
+                        # INT-H3: map old->new locationId POSITIONALLY, not by
+                        # location name. update_area_with_prefix re-prefixes IDs
+                        # in place, preserving the locations array's order and
+                        # count, so backup[i] corresponds to current[i]. Two
+                        # locations can share a name (e.g. 'Corridor'); keying
+                        # the mapping by name silently drops one of them and
+                        # leaves its cross-file references pointing at the old ID.
+                        backup_locs = backup_data.get('locations', [])
+                        current_locs = current_data.get('locations', [])
+                        for b_loc, c_loc in zip(backup_locs, current_locs):
+                            if not isinstance(b_loc, dict) or not isinstance(c_loc, dict):
                                 continue
-                            
-                            # Apply the recursive update (id_mapping only contains current module IDs, so external links are safe)
-                            updated_data = self._recursively_update_ids_in_json(data, id_mapping)
-                            
-                            # Check if any changes were made before writing
-                            if data != updated_data:
-                                if safe_write_json(file_path, updated_data) is not True:
-                                    raise OSError(
-                                        f"Could not persist ID references: {file_path}"
-                                    )
-                                if safe_json_load(file_path) != updated_data:
-                                    raise OSError(
-                                        f"ID reference readback differs: {file_path}"
-                                    )
-                                print(f"DEBUG: [Module Stitcher] Updated location ID references in {os.path.relpath(file_path, module_path)}")
-                        
-                        except Exception as e:
-                            if fail_closed:
-                                raise
-                            print(f"DEBUG: [Module Stitcher] WARNING: Could not process {file_path} for ID updates: {e}")
+                            old_id = b_loc.get('locationId')
+                            new_id = c_loc.get('locationId')
+                            if old_id and new_id and old_id != new_id:
+                                id_mapping[old_id] = new_id
 
-            # CRITICAL: Update party_tracker.json if this module is currently active
-            party_tracker_path = self.party_tracker_file
-            if update_party_tracker and os.path.exists(party_tracker_path):
-                try:
-                    party_tracker = safe_json_load(party_tracker_path)
-                    if party_tracker:
-                        active_module = party_tracker.get('module', '').replace(' ', '_')
+        if not id_mapping:
+            print(f"DEBUG: [Module Stitcher] No location ID changes detected for {module_name}. Skipping reference update.")
+            return
 
-                        if active_module == module_name:
-                            world_conditions = party_tracker.get('worldConditions', {})
-                            current_location_id = world_conditions.get('currentLocationId')
+        print(f"DEBUG: [Module Stitcher] Built ID mapping with {len(id_mapping)} entries for {module_name}. Applying updates...")
 
-                            if current_location_id and current_location_id in id_mapping:
-                                new_location_id = id_mapping[current_location_id]
-                                world_conditions['currentLocationId'] = new_location_id
-                                party_tracker['worldConditions'] = world_conditions
-                                safe_write_json(party_tracker_path, party_tracker)
-                                print(f"DEBUG: [Module Stitcher] Updated party_tracker.json: {current_location_id} -> {new_location_id}")
-                except Exception as tracker_error:
-                    print(f"DEBUG: [Module Stitcher] WARNING: Could not update party_tracker.json: {tracker_error}")
+        # Walk through all JSON files in the module and apply the mapping safely
+        for root, _, files in os.walk(module_path):
+            for filename in files:
+                if filename.endswith('.json') and not filename.endswith('.bak') and not filename.endswith('_BU.json'):
+                    file_path = os.path.join(root, filename)
+                    data = safe_json_load(file_path)
+                    if not data:
+                        continue
 
-        except Exception as e:
-            if fail_closed:
-                raise
-            print(f"DEBUG: [Module Stitcher] ERROR: Failed to update location references for {module_name}: {e}")
-    
+                    # Apply the recursive update (id_mapping only contains current module IDs, so external links are safe)
+                    updated_data = self._recursively_update_ids_in_json(data, id_mapping)
+
+                    # Check if any changes were made before writing
+                    if data != updated_data:
+                        if safe_write_json(file_path, updated_data) is not True:
+                            raise OSError(
+                                f"Could not persist ID references: {file_path}"
+                            )
+                        if safe_json_load(file_path) != updated_data:
+                            raise OSError(
+                                f"ID reference readback differs: {file_path}"
+                            )
+                        print(f"DEBUG: [Module Stitcher] Updated location ID references in {os.path.relpath(file_path, module_path)}")
+
     def _validate_module_safety(
         self,
         module_name: str,
@@ -4779,8 +4213,324 @@ Respond with JSON:
             print(f"Warning: Schema validation failed: {e}")
             return False
     
-    def scan_and_integrate_new_modules(self) -> List[str]:
-        """Scan/integrate under the shared module-publication boundary."""
+    _IMPORT_WORKSPACE_PREFIX = ".module_import_"
+
+    def _managed_import_refusal(self, module_name: str) -> Optional[str]:
+        """Why an installed module counts as played, or None when unplayed.
+
+        A played module is never rewritten. Value checks only:
+        ``tracker``: the party's module is this one;
+        ``live_state``: the live record holds a place, occupant or quest of
+        it (typed ids ``kind:<Module>/...``);
+        ``archive``: a campaign archive or summary names it as its
+        moduleName, or the campaign lists it as completed or current;
+        ``saved_games``: its folder holds a save.
+        An unreadable record counts as played (the module is left alone).
+        """
+        try:
+            tracker = safe_json_load(self.party_tracker_file) if os.path.exists(
+                self.party_tracker_file
+            ) else {}
+        except Exception:
+            return "tracker"
+        if isinstance(tracker, dict) and str(
+            tracker.get("module") or ""
+        ).replace(" ", "_") == module_name:
+            return "tracker"
+
+        live_path = os.path.join(self.root_dir, "live_state.json")
+        if os.path.exists(live_path):
+            try:
+                live = safe_json_load(live_path)
+            except Exception:
+                live = None
+            if not isinstance(live, dict):
+                return "live_state"
+            # Engine shape (NQL docs/LIVE_STATE.md, version 3): ``places`` is a
+            # list of typed-id strings (as core/nql/occupants.py:754 reads it);
+            # occupants and quests are records with ``id`` (and ``location``).
+            # Characters and map.visited stand at places, so they are covered.
+            typed_ids = list(live.get("places") or [])
+            for occupant in live.get("occupants") or []:
+                if isinstance(occupant, dict):
+                    typed_ids += [occupant.get("id"), occupant.get("location")]
+            for quest in live.get("quests") or []:
+                if isinstance(quest, dict):
+                    typed_ids.append(quest.get("id"))
+            for typed_id in typed_ids:
+                if isinstance(typed_id, str) and (
+                    typed_id.partition(":")[2].split("/", 1)[0] == module_name
+                ):
+                    return "live_state"
+
+        for record_dir in ("campaign_archives", "campaign_summaries"):
+            directory = os.path.join(self.modules_dir, record_dir)
+            if not os.path.isdir(directory):
+                continue
+            for filename in sorted(os.listdir(directory)):
+                if not filename.endswith(".json"):
+                    continue
+                try:
+                    record = safe_json_load(os.path.join(directory, filename))
+                except Exception:
+                    return "archive"
+                if isinstance(record, dict) and record.get("moduleName") == module_name:
+                    return "archive"
+        campaign_path = os.path.join(self.modules_dir, "campaign.json")
+        if os.path.exists(campaign_path):
+            try:
+                campaign = safe_json_load(campaign_path)
+            except Exception:
+                return "archive"
+            if isinstance(campaign, dict) and (
+                campaign.get("currentModule") == module_name
+                or module_name in (campaign.get("completedModules") or [])
+            ):
+                return "archive"
+
+        saves = os.path.join(self.modules_dir, module_name, "saved_games")
+        if os.path.isdir(saves) and os.listdir(saves):
+            return "saved_games"
+        return None
+
+    @staticmethod
+    def _area_location_ids(module_path: str) -> Dict[str, List[Any]]:
+        """Location ids per live area file, in file order."""
+        areas_dir = os.path.join(module_path, "areas")
+        out = {}
+        for filename in sorted(os.listdir(areas_dir)):
+            if filename.endswith(".json") and not filename.endswith("_BU.json"):
+                area = safe_json_load(os.path.join(areas_dir, filename))
+                locations = area.get("locations", []) if isinstance(area, dict) else []
+                out[filename] = [
+                    location.get("locationId")
+                    for location in locations
+                    if isinstance(location, dict)
+                ]
+        return out
+
+    def _settle_import_workspace(self, workspace: Path, module_name: str) -> bool:
+        """Leave the module live and remove the workspace; never lose the module.
+
+        If the live entry is missing while the retired original is in the
+        workspace (a stop between the two renames), the original is renamed
+        back first. The workspace is removed only once ``modules/<name>``
+        exists. Returns whether the workspace is gone.
+        """
+        from utils.module_publish import _replace_entry
+
+        live_path = Path(self.modules_dir) / module_name
+        retired = workspace / "retired" / module_name
+        if not os.path.lexists(live_path) and os.path.lexists(retired):
+            _replace_entry(retired, live_path)
+            warning(
+                f"Managed import of {module_name} was interrupted between its "
+                "renames; the original module was put back",
+                category="module_integration",
+            )
+        if not os.path.lexists(live_path):
+            error(
+                f"Managed import workspace {workspace.name} kept: {module_name} "
+                "is not live and no original was found in it",
+                category="module_integration",
+            )
+            return False
+        shutil.rmtree(workspace)
+        return True
+
+    def _recover_managed_imports_locked(self) -> int:
+        """Settle every managed import workspace a stopped run left behind."""
+        settled = 0
+        try:
+            entries = sorted(os.listdir(self.modules_dir))
+        except OSError:
+            return settled
+        for entry in entries:
+            if not entry.startswith(self._IMPORT_WORKSPACE_PREFIX):
+                continue
+            workspace = Path(self.modules_dir) / entry
+            try:
+                marker = safe_json_load(str(workspace / "import.json"))
+            except Exception:
+                marker = None
+            module_name = marker.get("module") if isinstance(marker, dict) else None
+            try:
+                if module_name is None:
+                    # The marker is written before anything is moved, so a
+                    # workspace without one holds no original; one with a
+                    # retired entry anyway is kept for a person to look at.
+                    retired_dir = workspace / "retired"
+                    if retired_dir.is_dir() and os.listdir(retired_dir):
+                        error(
+                            f"Managed import workspace {entry} has no marker "
+                            "but holds a retired entry; kept",
+                            category="module_integration",
+                        )
+                        continue
+                    shutil.rmtree(workspace)
+                    settled += 1
+                    continue
+                if self._target_module_path(module_name) is None:
+                    error(
+                        f"Managed import workspace {entry} names an unsafe module",
+                        category="module_integration",
+                    )
+                    continue
+                if self._settle_import_workspace(workspace, module_name):
+                    settled += 1
+            except Exception as exc:
+                error(
+                    f"Managed import workspace {entry} could not be settled: {exc}",
+                    category="module_integration",
+                )
+        return settled
+
+    def _refuse_links_while_copying(
+        self, directory: str, names: List[str]
+    ) -> List[str]:
+        """copytree ``ignore`` hook: raise on a link or reparse point.
+
+        copytree copies a Windows junction's target inline, so a link is
+        refused as copytree reaches it, on every platform (issue #608).
+        """
+        for name in names:
+            path = os.path.join(directory, name)
+            if self._is_symlink_or_reparse(path):
+                raise ValueError(f"Module contains a link or reparse point: {path}")
+        return []
+
+    def _import_colliding_module_locked(self, module_name: str) -> Dict[str, Any]:
+        """Join an unplayed module whose ids collide, renumbering a copy.
+
+        The caller owns module_refresh_lock. A played module is refused. The
+        live folder is copied into a hidden workspace, the copy goes through
+        the hidden-candidate publication path (re-prefix, validation, T032,
+        T033, registry bytes), and only then is it swapped in: live ->
+        retired, candidate -> live, registry bytes. Any failure before the
+        swap leaves the live folder as it was.
+        """
+        from utils.module_publish import (
+            _replace_entry,
+            _replace_exact_bytes,
+            _sync_directory,
+        )
+        from utils.transient_filesystem import retry_transient_filesystem
+
+        refusal = self._managed_import_refusal(module_name)
+        if refusal:
+            return {"status": "refused", "refused_because": refusal}
+
+        live_path = Path(self.modules_dir) / module_name
+        workspace = Path(self.modules_dir) / (
+            f"{self._IMPORT_WORKSPACE_PREFIX}{uuid4().hex}"
+        )
+        candidate = workspace / "candidate" / module_name
+        retired = workspace / "retired" / module_name
+        try:
+            (workspace / "candidate").mkdir(parents=True)
+            (workspace / "retired").mkdir()
+            (workspace / "import.json").write_text(
+                json.dumps({"module": module_name}), encoding="utf-8"
+            )
+            if self._is_symlink_or_reparse(str(live_path)):
+                raise ValueError(
+                    f"Module folder is a link or reparse point: {live_path}"
+                )
+            shutil.copytree(
+                live_path,
+                candidate,
+                symlinks=True,
+                ignore=self._refuse_links_while_copying,
+            )
+            copied = {
+                os.path.relpath(os.path.join(directory, filename), candidate)
+                for directory, _dirs, filenames in os.walk(candidate)
+                for filename in filenames
+            }
+            before = self._area_location_ids(str(candidate))
+            registry_bytes = self.build_publication_registry_bytes(
+                candidate, module_name, replacing_live=True
+            )
+            after = self._area_location_ids(str(candidate))
+            # The rewrite's own .bak copies hold intermediate ids; the
+            # original stays in the workspace until the swap, so they are
+            # not kept in the module.
+            for directory, _dirs, filenames in os.walk(candidate):
+                for filename in filenames:
+                    path = os.path.join(directory, filename)
+                    if filename.endswith(".bak") and (
+                        os.path.relpath(path, candidate) not in copied
+                    ):
+                        os.remove(path)
+            renumbered = sum(
+                old != new
+                for area in before
+                for old, new in zip(before[area], after.get(area, []))
+            )
+            # N4: a module without a declaration is typed (T122) on the
+            # candidate, where its ids are final, so the declaration is
+            # synced and swapped in with it. Never raises; a failure
+            # imports it untyped.
+            from core.generators.module_declaration import type_joining_module
+
+            type_joining_module(candidate, module_name)
+            _sync_directory(candidate)
+            _replace_entry(live_path, retired)
+            _replace_entry(candidate, live_path)
+        except Exception as exc:
+            warning(
+                f"Managed import of {module_name} did not complete; the module "
+                f"is left as it was: {exc}",
+                category="module_integration",
+            )
+            try:
+                self._settle_import_workspace(workspace, module_name)
+            except Exception as settle_exc:
+                error(
+                    f"Managed import workspace {workspace.name} kept for the "
+                    f"next scan: {settle_exc}",
+                    category="module_integration",
+                )
+            if isinstance(exc, _ModuleCheckUnavailable):
+                # The safety check gave no verdict: told apart from a refusal
+                # so the startup line does not blame the module (issue #613).
+                return {
+                    "status": "failed",
+                    "refused_because": NotJoinedCause.CHECK_UNAVAILABLE.value,
+                }
+            return {"status": "failed", "refused_because": "import_failed"}
+
+        # The renumbered module is live; nothing below may undo that.
+        try:
+            retry_transient_filesystem(
+                lambda: _replace_exact_bytes(
+                    Path(self.world_registry_file), registry_bytes
+                )
+            )
+            self.world_registry = json.loads(registry_bytes.decode("utf-8"))
+        except Exception as exc:
+            error(
+                f"Module {module_name} was renumbered and is live, but its "
+                f"registry write failed; the next scan integrates it: {exc}",
+                category="module_integration",
+            )
+        try:
+            self._settle_import_workspace(workspace, module_name)
+        except Exception as exc:
+            warning(
+                f"Managed import workspace {workspace.name} not removed: {exc}",
+                category="module_integration",
+            )
+        return {"status": "imported", "renumbered": renumbered}
+
+    def scan_and_integrate_new_modules(
+        self, priority_module: Optional[str] = None
+    ) -> List[str]:
+        """Scan/integrate under the shared module-publication boundary.
+
+        ``priority_module`` (the party's module) is integrated first, so a
+        module that collides with it is the one left unjoined.
+        """
         from utils.module_refresh_lock import module_refresh_lock
 
         with module_refresh_lock() as acquired:
@@ -4800,16 +4550,52 @@ Respond with JSON:
                     "Module integration blocked by indeterminate lifecycle recovery",
                     category="module_integration",
                 )
+                self._note_lifecycle_blocked(recovery.reason)
                 return []
-            return self._scan_and_integrate_new_modules_locked()
+            return self._scan_and_integrate_new_modules_locked(
+                priority_module=priority_module
+            )
 
-    def _scan_and_integrate_new_modules_locked(self) -> List[str]:
+    def _note_lifecycle_blocked(self, reason) -> None:
+        """List the modules a lifecycle-blocked scan left waiting.
+
+        The scan joins nothing while recovery is INDETERMINATE (an unresolved
+        publication may be on disk), so the startup line can say so. Only the
+        modules that are waiting are listed; when the wait list cannot be
+        read, one entry without a module stands for them (issue #638).
+        """
+        self.import_required = []
+        self.imported = []
+        cause = NotJoinedCause.LIFECYCLE_INDETERMINATE.value
+        try:
+            waiting = self.detect_new_modules(strict=True)
+        except Exception as exc:
+            warning(
+                f"Modules waiting to join could not be listed: {exc}",
+                category="module_integration",
+            )
+            self.not_joined = [{"module": None, "reason": reason, "cause": cause}]
+            return
+        self.not_joined = [
+            {"module": name, "reason": reason, "cause": cause} for name in waiting
+        ]
+
+    def _scan_and_integrate_new_modules_locked(
+        self, priority_module: Optional[str] = None
+    ) -> List[str]:
         """Perform the scan while the caller owns module refresh."""
         integrated_modules = []
+        self.import_required = []
+        self.imported = []
+        self.not_joined = []
         
         try:
+            self._recover_managed_imports_locked()
             # Detect new modules
             new_modules = self.detect_new_modules()
+            if priority_module in new_modules:
+                new_modules.remove(priority_module)
+                new_modules.insert(0, priority_module)
             
             if not new_modules:
                 info("STATE: No new modules detected.", category="module_integration")
@@ -4823,12 +4609,83 @@ Respond with JSON:
                     result = self.publish_module_locked(module_name)
                     if result.status is PublicationStatus.PUBLISHED:
                         integrated_modules.append(module_name)
+                        # N4: a module joining without a declaration is
+                        # typed (T122) in its live folder, still under the
+                        # refresh lock. Never raises; a failure joins it untyped.
+                        from core.generators.module_declaration import type_joining_module
+
+                        type_joining_module(Path(self.modules_dir) / module_name, module_name)
+                    elif result.status is PublicationStatus.IMPORT_REQUIRED:
+                        collides_with = list(result.conflicting_modules)
+                        outcome = self._import_colliding_module_locked(
+                            module_name
+                        )
+                        if outcome["status"] == "imported":
+                            info(
+                                f"Module {module_name} joined after renumbering "
+                                f"{outcome['renumbered']} location ids "
+                                f"(they collided with {', '.join(collides_with)})",
+                                category="module_integration",
+                            )
+                            integrated_modules.append(module_name)
+                            self.imported.append(
+                                {
+                                    "module": module_name,
+                                    "collides_with": collides_with,
+                                    "renumbered": outcome["renumbered"],
+                                }
+                            )
+                        else:
+                            warning(
+                                f"Module {module_name} is installed but not joined "
+                                f"({outcome['refused_because']}): {result.reason}",
+                                category="module_integration",
+                            )
+                            self.import_required.append(
+                                {
+                                    "module": module_name,
+                                    "collides_with": collides_with,
+                                    "refused_because": outcome["refused_because"],
+                                }
+                            )
+                    elif result.status is PublicationStatus.NOT_PUBLISHED:
+                        warning(
+                            f"Module {module_name} is installed but not joined: "
+                            f"{result.reason}",
+                            category="module_integration",
+                        )
+                        # A module removed during the scan is not "installed".
+                        if os.path.isdir(os.path.join(self.modules_dir, module_name)):
+                            self.not_joined.append(
+                                {
+                                    "module": module_name,
+                                    "reason": result.reason,
+                                    "cause": getattr(result.cause, "value", None),
+                                }
+                            )
                     elif result.status is PublicationStatus.INDETERMINATE:
                         error(
                             f"Publication state indeterminate for {module_name}: "
                             f"{result.reason}",
                             category="module_integration",
                         )
+                        # The player is told only what is proven: still
+                        # installed, and not joined in the registry (issue #608).
+                        # A read-only registry is a proven fact at this
+                        # moment, and the player can fix it (issue #654).
+                        if self._module_proven_unjoined(module_name):
+                            cause = (
+                                NotJoinedCause.REGISTRY_READ_ONLY
+                                if replace_target_is_read_only(self.world_registry_file)
+                                else NotJoinedCause.UNPROVEN
+                            )
+                            self.not_joined.append(
+                                {
+                                    "module": module_name,
+                                    "reason": result.reason,
+                                    "cause": cause.value,
+                                }
+                            )
                 except Exception as e:
                     print(f"Failed to integrate module {module_name}: {e}")
                     continue
@@ -5007,16 +4864,13 @@ Respond with JSON:
         self,
         module_name: str,
         *,
-        module_path: Optional[str] = None,
+        module_path: str,
     ) -> int:
         """
         Update BU (backup) files with corrected location IDs after conflict resolution.
         This ensures BU files match the corrected files for all JSON files that have BU versions.
         """
         try:
-            module_path = module_path or os.path.join(
-                self.modules_dir, module_name
-            )
             updated_count = 0
             
             # Walk through all directories in the module

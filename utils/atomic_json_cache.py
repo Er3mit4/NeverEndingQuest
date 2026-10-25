@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from utils.transient_filesystem import raise_if_save_stopped
+
 
 _PROCESS_LOCKS = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
@@ -41,8 +43,8 @@ def _locked_path(path):
                 if lock_file.tell() == 0:
                     lock_file.write(b"\0")
                     lock_file.flush()
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                from utils.path_transaction_lock import wait_for_windows_lock
+                wait_for_windows_lock(lock_file)  # no ten-try cap (#944)
             else:
                 import fcntl
 
@@ -72,6 +74,7 @@ def _read_mapping_unlocked(path: Path):
 
 
 def _write_mapping_unlocked(path: Path, value):
+    raise_if_save_stopped()
     temporary = Path(
         f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
     )

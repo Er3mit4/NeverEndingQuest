@@ -1,0 +1,4502 @@
+{
+ "schema": "srd-progression/2",
+ "ruleset": "SRD 5.2.1",
+ "sources": {
+  "document": "System Reference Document 5.2.1 (SRD_CC_v5.2.1.pdf)",
+  "pdf_sha256": "8974902d109d6e63672d7c490bde9ccf052410503d9cfa768237154fbc5e3d87",
+  "attribution": "This work includes material from the System Reference Document 5.2.1 (\"SRD 5.2.1\") by Wizards of the Coast LLC, available at https://www.dndbeyond.com/srd. The SRD 5.2.1 is licensed under the Creative Commons Attribution 4.0 International License, available at https://creativecommons.org/licenses/by/4.0/legalcode.",
+  "xp_thresholds": {
+   "section": "Character Creation > Level Advancement > Character Advancement table",
+   "page": 23
+  },
+  "proficiency_bonus": {
+   "section": "Character Creation > Level Advancement > Character Advancement table",
+   "page": 23
+  },
+  "hp_at_first_level": {
+   "section": "Character Creation > Level 1 Hit Points by Class table",
+   "page": 22
+  },
+  "hp_per_level_average": {
+   "section": "Character Creation > Level Advancement > Fixed Hit Points by Class table",
+   "page": 23
+  },
+  "classes": {
+   "barbarian": {
+    "features_table": {
+     "section": "Classes > Barbarian > Barbarian Features table",
+     "page": 28
+    },
+    "hit_die": {
+     "section": "Classes > Barbarian > Core Barbarian Traits table",
+     "page": 28
+    }
+   },
+   "bard": {
+    "features_table": {
+     "section": "Classes > Bard > Bard Features table",
+     "page": 31
+    },
+    "hit_die": {
+     "section": "Classes > Bard > Core Bard Traits table",
+     "page": 31
+    }
+   },
+   "cleric": {
+    "features_table": {
+     "section": "Classes > Cleric > Cleric Features table",
+     "page": 36
+    },
+    "hit_die": {
+     "section": "Classes > Cleric > Core Cleric Traits table",
+     "page": 36
+    }
+   },
+   "druid": {
+    "features_table": {
+     "section": "Classes > Druid > Druid Features table",
+     "page": 41
+    },
+    "hit_die": {
+     "section": "Classes > Druid > Core Druid Traits table",
+     "page": 41
+    }
+   },
+   "fighter": {
+    "features_table": {
+     "section": "Classes > Fighter > Fighter Features table",
+     "page": 47
+    },
+    "hit_die": {
+     "section": "Classes > Fighter > Core Fighter Traits table",
+     "page": 47
+    }
+   },
+   "monk": {
+    "features_table": {
+     "section": "Classes > Monk > Monk Features table",
+     "page": 50
+    },
+    "hit_die": {
+     "section": "Classes > Monk > Core Monk Traits table",
+     "page": 49
+    }
+   },
+   "paladin": {
+    "features_table": {
+     "section": "Classes > Paladin > Paladin Features table",
+     "page": 53
+    },
+    "hit_die": {
+     "section": "Classes > Paladin > Core Paladin Traits table",
+     "page": 53
+    }
+   },
+   "ranger": {
+    "features_table": {
+     "section": "Classes > Ranger > Ranger Features table",
+     "page": 58
+    },
+    "hit_die": {
+     "section": "Classes > Ranger > Core Ranger Traits table",
+     "page": 57
+    }
+   },
+   "rogue": {
+    "features_table": {
+     "section": "Classes > Rogue > Rogue Features table",
+     "page": 62
+    },
+    "hit_die": {
+     "section": "Classes > Rogue > Core Rogue Traits table",
+     "page": 61
+    }
+   },
+   "sorcerer": {
+    "features_table": {
+     "section": "Classes > Sorcerer > Sorcerer Features table",
+     "page": 65
+    },
+    "hit_die": {
+     "section": "Classes > Sorcerer > Core Sorcerer Traits table",
+     "page": 64
+    }
+   },
+   "warlock": {
+    "features_table": {
+     "section": "Classes > Warlock > Warlock Features table",
+     "page": 71
+    },
+    "hit_die": {
+     "section": "Classes > Warlock > Core Warlock Traits table",
+     "page": 70
+    }
+   },
+   "wizard": {
+    "features_table": {
+     "section": "Classes > Wizard > Wizard Features table",
+     "page": 77
+    },
+    "hit_die": {
+     "section": "Classes > Wizard > Core Wizard Traits table",
+     "page": 77
+    }
+   }
+  }
+ },
+ "notes": [
+  "Per-level data is keyed by level as a string, \"1\" to \"20\".",
+  "Text is ASCII: curly apostrophes and quotes became straight ones; an em dash (none) became an empty feature list, a null column value or a 0 slot count.",
+  "SRD 5.2.1 gives every caster a fixed Prepared Spells count per level; it has no spells-known lists and no preparation formulas.",
+  "Paladin and Ranger gain Spellcasting at level 1 in SRD 5.2.1, with two level 1 slots.",
+  "Ability Score Improvement levels are 4, 8, 12 and 16 for every class, plus 6 and 14 for Fighter and 10 for Rogue. Level 19 grants Epic Boon (a feat), not an Ability Score Improvement.",
+  "No SRD 5.2.1 class is a third caster; caster_kind third is unused.",
+  "Subclass features appear as the SRD's 'Subclass feature' entry; subclass tables are not included.",
+  "table_columns holds the class table's other columns (for example Rages or Sneak Attack) exactly as printed.",
+  "srd-progression/2 (NUM): classes.<class>.use_pools lists every class feature (not subclass) whose uses are counted and restored by a rest: maximum is {column} (the class table), {fixed}, {by_level}, {ability_modifier, minimum} or {class_level_times}; refresh is a list of steps from a class level, short_rest and long_rest each one, all or null. use_pools_not_modeled names the three whose limits are not a count. ac_formulas: unarmored base Armor Class features. hp_bonuses: typed Hit Point maximum increases (SRD 5.2.1 has no Tough feat). table_names (keyword validation V4): the class table rows printed for a pool's feature (\"Action Surge (one use)\"), each matched as a whole name.",
+  "srd-progression/2 (R2): classes.<class>.feature_activation, for fighter and rogue (every class feature except Ability Score Improvement, Epic Boon and the subclass entries), records how the SRD says the feature is used: activation is bonusAction, action, magicAction, reaction, noAction (used or triggered without taking an action) or passive, with the SRD sentence that says so (evidence) and its source section and page. Other classes have no feature_activation yet. table_names as in use_pools."
+ ],
+ "xp_thresholds": {
+  "1": 0,
+  "2": 300,
+  "3": 900,
+  "4": 2700,
+  "5": 6500,
+  "6": 14000,
+  "7": 23000,
+  "8": 34000,
+  "9": 48000,
+  "10": 64000,
+  "11": 85000,
+  "12": 100000,
+  "13": 120000,
+  "14": 140000,
+  "15": 165000,
+  "16": 195000,
+  "17": 225000,
+  "18": 265000,
+  "19": 305000,
+  "20": 355000
+ },
+ "proficiency_bonus": {
+  "1": 2,
+  "2": 2,
+  "3": 2,
+  "4": 2,
+  "5": 3,
+  "6": 3,
+  "7": 3,
+  "8": 3,
+  "9": 4,
+  "10": 4,
+  "11": 4,
+  "12": 4,
+  "13": 5,
+  "14": 5,
+  "15": 5,
+  "16": 5,
+  "17": 6,
+  "18": 6,
+  "19": 6,
+  "20": 6
+ },
+ "classes": {
+  "barbarian": {
+   "name": "Barbarian",
+   "hit_die": "d12",
+   "hp_at_first_level": "12 + Con modifier",
+   "hp_at_first_level_base": 12,
+   "hp_per_level_average": 7,
+   "hp_per_level_rule": "7 + Con modifier, or roll 1d12 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "none",
+   "spellcasting_feature": null,
+   "spell_slots_by_level": null,
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": null,
+   "prepared_spells_by_level": null,
+   "features_by_level": {
+    "1": [
+     "Rage",
+     "Unarmored Defense",
+     "Weapon Mastery"
+    ],
+    "2": [
+     "Danger Sense",
+     "Reckless Attack"
+    ],
+    "3": [
+     "Barbarian Subclass",
+     "Primal Knowledge"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [
+     "Extra Attack",
+     "Fast Movement"
+    ],
+    "6": [
+     "Subclass feature"
+    ],
+    "7": [
+     "Feral Instinct",
+     "Instinctive Pounce"
+    ],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [
+     "Brutal Strike"
+    ],
+    "10": [
+     "Subclass feature"
+    ],
+    "11": [
+     "Relentless Rage"
+    ],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [
+     "Improved Brutal Strike"
+    ],
+    "14": [
+     "Subclass feature"
+    ],
+    "15": [
+     "Persistent Rage"
+    ],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [
+     "Improved Brutal Strike"
+    ],
+    "18": [
+     "Indomitable Might"
+    ],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Primal Champion"
+    ]
+   },
+   "table_columns": {
+    "Rages": {
+     "1": 2,
+     "2": 2,
+     "3": 3,
+     "4": 3,
+     "5": 3,
+     "6": 4,
+     "7": 4,
+     "8": 4,
+     "9": 4,
+     "10": 4,
+     "11": 4,
+     "12": 5,
+     "13": 5,
+     "14": 5,
+     "15": 5,
+     "16": 5,
+     "17": 6,
+     "18": 6,
+     "19": 6,
+     "20": 6
+    },
+    "Rage Damage": {
+     "1": "+2",
+     "2": "+2",
+     "3": "+2",
+     "4": "+2",
+     "5": "+2",
+     "6": "+2",
+     "7": "+2",
+     "8": "+2",
+     "9": "+3",
+     "10": "+3",
+     "11": "+3",
+     "12": "+3",
+     "13": "+3",
+     "14": "+3",
+     "15": "+3",
+     "16": "+4",
+     "17": "+4",
+     "18": "+4",
+     "19": "+4",
+     "20": "+4"
+    },
+    "Weapon Mastery": {
+     "1": 2,
+     "2": 2,
+     "3": 2,
+     "4": 3,
+     "5": 3,
+     "6": 3,
+     "7": 3,
+     "8": 3,
+     "9": 3,
+     "10": 4,
+     "11": 4,
+     "12": 4,
+     "13": 4,
+     "14": 4,
+     "15": 4,
+     "16": 4,
+     "17": 4,
+     "18": 4,
+     "19": 4,
+     "20": 4
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Rage",
+     "level": 1,
+     "maximum": {
+      "column": "Rages"
+     },
+     "refresh": [
+      {
+       "from_level": 1,
+       "short_rest": "one",
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "the number of times shown for your Barbarian level in the Rages column",
+      "You regain one expended use when you finish a Short Rest, and you regain all expended uses when you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Barbarian > Barbarian Class Features > Level 1: Rage",
+      "page": 28
+     }
+    },
+    {
+     "feature": "Persistent Rage",
+     "level": 15,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 15,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "When you roll Initiative, you can regain all expended uses of Rage. After you regain uses of Rage in this way, you can't do so again until you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Barbarian > Barbarian Class Features > Level 15: Persistent Rage",
+      "page": 30
+     }
+    }
+   ],
+   "ac_formulas": [
+    {
+     "feature": "Unarmored Defense",
+     "level": 1,
+     "formula": {
+      "base": 10,
+      "abilities": [
+       "Dexterity",
+       "Constitution"
+      ],
+      "while": "no armor",
+      "shield": "allowed"
+     },
+     "evidence": "While you aren't wearing any armor, your base Armor Class equals 10 plus your Dexterity and Constitution modifiers. You can use a Shield and still gain this benefit.",
+     "source": {
+      "section": "Classes > Barbarian > Barbarian Class Features > Level 1: Unarmored Defense",
+      "page": 29
+     }
+    }
+   ]
+  },
+  "bard": {
+   "name": "Bard",
+   "hit_die": "d8",
+   "hp_at_first_level": "8 + Con modifier",
+   "hp_at_first_level_base": 8,
+   "hp_per_level_average": 5,
+   "hp_per_level_rule": "5 + Con modifier, or roll 1d8 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "full",
+   "spellcasting_feature": "Spellcasting",
+   "spell_slots_by_level": {
+    "1": {
+     "level1": 2,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "2": {
+     "level1": 3,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "3": {
+     "level1": 4,
+     "level2": 2,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "4": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "5": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 2,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "6": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "7": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 1,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "8": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 2,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "9": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 1,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "10": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "11": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "12": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "13": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 0,
+     "level9": 0
+    },
+    "14": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 0,
+     "level9": 0
+    },
+    "15": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 0
+    },
+    "16": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 0
+    },
+    "17": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "18": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "19": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 2,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "20": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 2,
+     "level7": 2,
+     "level8": 1,
+     "level9": 1
+    }
+   },
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": {
+    "1": 2,
+    "2": 2,
+    "3": 2,
+    "4": 3,
+    "5": 3,
+    "6": 3,
+    "7": 3,
+    "8": 3,
+    "9": 3,
+    "10": 4,
+    "11": 4,
+    "12": 4,
+    "13": 4,
+    "14": 4,
+    "15": 4,
+    "16": 4,
+    "17": 4,
+    "18": 4,
+    "19": 4,
+    "20": 4
+   },
+   "prepared_spells_by_level": {
+    "1": 4,
+    "2": 5,
+    "3": 6,
+    "4": 7,
+    "5": 9,
+    "6": 10,
+    "7": 11,
+    "8": 12,
+    "9": 14,
+    "10": 15,
+    "11": 16,
+    "12": 16,
+    "13": 17,
+    "14": 17,
+    "15": 18,
+    "16": 18,
+    "17": 19,
+    "18": 20,
+    "19": 21,
+    "20": 22
+   },
+   "features_by_level": {
+    "1": [
+     "Bardic Inspiration",
+     "Spellcasting"
+    ],
+    "2": [
+     "Expertise",
+     "Jack of All Trades"
+    ],
+    "3": [
+     "Bard Subclass"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [
+     "Font of Inspiration"
+    ],
+    "6": [
+     "Subclass feature"
+    ],
+    "7": [
+     "Countercharm"
+    ],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [
+     "Expertise"
+    ],
+    "10": [
+     "Magical Secrets"
+    ],
+    "11": [],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [],
+    "14": [
+     "Subclass feature"
+    ],
+    "15": [],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [],
+    "18": [
+     "Superior Inspiration"
+    ],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Words of Creation"
+    ]
+   },
+   "table_columns": {
+    "Bardic Die": {
+     "1": "D6",
+     "2": "D6",
+     "3": "D6",
+     "4": "D6",
+     "5": "D8",
+     "6": "D8",
+     "7": "D8",
+     "8": "D8",
+     "9": "D8",
+     "10": "D10",
+     "11": "D10",
+     "12": "D10",
+     "13": "D10",
+     "14": "D10",
+     "15": "D12",
+     "16": "D12",
+     "17": "D12",
+     "18": "D12",
+     "19": "D12",
+     "20": "D12"
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Bardic Inspiration",
+     "level": 1,
+     "maximum": {
+      "ability_modifier": "Charisma",
+      "minimum": 1
+     },
+     "refresh": [
+      {
+       "from_level": 1,
+       "short_rest": null,
+       "long_rest": "all"
+      },
+      {
+       "from_level": 5,
+       "short_rest": "all",
+       "long_rest": "all",
+       "feature": "Font of Inspiration",
+       "evidence": "You now regain all your expended uses of Bardic Inspiration when you finish a Short or Long Rest."
+      }
+     ],
+     "evidence": [
+      "a number of times equal to your Charisma modifier (minimum of once), and you regain all expended uses when you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Bard > Bard Class Features > Level 1: Bardic Inspiration",
+      "page": 31
+     }
+    }
+   ],
+   "ac_formulas": []
+  },
+  "cleric": {
+   "name": "Cleric",
+   "hit_die": "d8",
+   "hp_at_first_level": "8 + Con modifier",
+   "hp_at_first_level_base": 8,
+   "hp_per_level_average": 5,
+   "hp_per_level_rule": "5 + Con modifier, or roll 1d8 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "full",
+   "spellcasting_feature": "Spellcasting",
+   "spell_slots_by_level": {
+    "1": {
+     "level1": 2,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "2": {
+     "level1": 3,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "3": {
+     "level1": 4,
+     "level2": 2,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "4": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "5": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 2,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "6": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "7": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 1,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "8": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 2,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "9": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 1,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "10": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "11": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "12": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "13": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 0,
+     "level9": 0
+    },
+    "14": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 0,
+     "level9": 0
+    },
+    "15": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 0
+    },
+    "16": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 0
+    },
+    "17": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "18": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "19": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 2,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "20": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 2,
+     "level7": 2,
+     "level8": 1,
+     "level9": 1
+    }
+   },
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": {
+    "1": 3,
+    "2": 3,
+    "3": 3,
+    "4": 4,
+    "5": 4,
+    "6": 4,
+    "7": 4,
+    "8": 4,
+    "9": 4,
+    "10": 5,
+    "11": 5,
+    "12": 5,
+    "13": 5,
+    "14": 5,
+    "15": 5,
+    "16": 5,
+    "17": 5,
+    "18": 5,
+    "19": 5,
+    "20": 5
+   },
+   "prepared_spells_by_level": {
+    "1": 4,
+    "2": 5,
+    "3": 6,
+    "4": 7,
+    "5": 9,
+    "6": 10,
+    "7": 11,
+    "8": 12,
+    "9": 14,
+    "10": 15,
+    "11": 16,
+    "12": 16,
+    "13": 17,
+    "14": 17,
+    "15": 18,
+    "16": 18,
+    "17": 19,
+    "18": 20,
+    "19": 21,
+    "20": 22
+   },
+   "features_by_level": {
+    "1": [
+     "Spellcasting",
+     "Divine Order"
+    ],
+    "2": [
+     "Channel Divinity"
+    ],
+    "3": [
+     "Cleric Subclass"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [
+     "Sear Undead"
+    ],
+    "6": [
+     "Subclass feature"
+    ],
+    "7": [
+     "Blessed Strikes"
+    ],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [],
+    "10": [
+     "Divine Intervention"
+    ],
+    "11": [],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [],
+    "14": [
+     "Improved Blessed Strikes"
+    ],
+    "15": [],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [
+     "Subclass feature"
+    ],
+    "18": [],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Greater Divine Intervention"
+    ]
+   },
+   "table_columns": {
+    "Channel Divinity": {
+     "1": null,
+     "2": 2,
+     "3": 2,
+     "4": 2,
+     "5": 2,
+     "6": 3,
+     "7": 3,
+     "8": 3,
+     "9": 3,
+     "10": 3,
+     "11": 3,
+     "12": 3,
+     "13": 3,
+     "14": 3,
+     "15": 3,
+     "16": 3,
+     "17": 3,
+     "18": 4,
+     "19": 4,
+     "20": 4
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Channel Divinity",
+     "level": 2,
+     "maximum": {
+      "column": "Channel Divinity"
+     },
+     "refresh": [
+      {
+       "from_level": 2,
+       "short_rest": "one",
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "You regain one of its expended uses when you finish a Short Rest, and you regain all expended uses when you finish a Long Rest.",
+      "as shown in the Channel Divinity column of the Cleric Features table"
+     ],
+     "source": {
+      "section": "Classes > Cleric > Cleric Class Features > Level 2: Channel Divinity",
+      "page": 37
+     }
+    },
+    {
+     "feature": "Divine Intervention",
+     "level": 10,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 10,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "You can't use this feature again until you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Cleric > Cleric Class Features > Level 10: Divine Intervention",
+      "page": 38
+     }
+    }
+   ],
+   "ac_formulas": []
+  },
+  "druid": {
+   "name": "Druid",
+   "hit_die": "d8",
+   "hp_at_first_level": "8 + Con modifier",
+   "hp_at_first_level_base": 8,
+   "hp_per_level_average": 5,
+   "hp_per_level_rule": "5 + Con modifier, or roll 1d8 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "full",
+   "spellcasting_feature": "Spellcasting",
+   "spell_slots_by_level": {
+    "1": {
+     "level1": 2,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "2": {
+     "level1": 3,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "3": {
+     "level1": 4,
+     "level2": 2,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "4": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "5": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 2,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "6": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "7": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 1,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "8": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 2,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "9": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 1,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "10": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "11": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "12": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "13": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 0,
+     "level9": 0
+    },
+    "14": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 0,
+     "level9": 0
+    },
+    "15": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 0
+    },
+    "16": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 0
+    },
+    "17": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "18": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "19": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 2,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "20": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 2,
+     "level7": 2,
+     "level8": 1,
+     "level9": 1
+    }
+   },
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": {
+    "1": 2,
+    "2": 2,
+    "3": 2,
+    "4": 3,
+    "5": 3,
+    "6": 3,
+    "7": 3,
+    "8": 3,
+    "9": 3,
+    "10": 4,
+    "11": 4,
+    "12": 4,
+    "13": 4,
+    "14": 4,
+    "15": 4,
+    "16": 4,
+    "17": 4,
+    "18": 4,
+    "19": 4,
+    "20": 4
+   },
+   "prepared_spells_by_level": {
+    "1": 4,
+    "2": 5,
+    "3": 6,
+    "4": 7,
+    "5": 9,
+    "6": 10,
+    "7": 11,
+    "8": 12,
+    "9": 14,
+    "10": 15,
+    "11": 16,
+    "12": 16,
+    "13": 17,
+    "14": 17,
+    "15": 18,
+    "16": 18,
+    "17": 19,
+    "18": 20,
+    "19": 21,
+    "20": 22
+   },
+   "features_by_level": {
+    "1": [
+     "Spellcasting",
+     "Druidic",
+     "Primal Order"
+    ],
+    "2": [
+     "Wild Shape",
+     "Wild Companion"
+    ],
+    "3": [
+     "Druid Subclass"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [
+     "Wild Resurgence"
+    ],
+    "6": [
+     "Subclass feature"
+    ],
+    "7": [
+     "Elemental Fury"
+    ],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [],
+    "10": [
+     "Subclass feature"
+    ],
+    "11": [],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [],
+    "14": [
+     "Subclass feature"
+    ],
+    "15": [
+     "Improved Elemental Fury"
+    ],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [],
+    "18": [
+     "Beast Spells"
+    ],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Archdruid"
+    ]
+   },
+   "table_columns": {
+    "Wild Shape": {
+     "1": null,
+     "2": 2,
+     "3": 2,
+     "4": 2,
+     "5": 2,
+     "6": 3,
+     "7": 3,
+     "8": 3,
+     "9": 3,
+     "10": 3,
+     "11": 3,
+     "12": 3,
+     "13": 3,
+     "14": 3,
+     "15": 3,
+     "16": 3,
+     "17": 4,
+     "18": 4,
+     "19": 4,
+     "20": 4
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Wild Shape",
+     "level": 2,
+     "maximum": {
+      "column": "Wild Shape"
+     },
+     "refresh": [
+      {
+       "from_level": 2,
+       "short_rest": "one",
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "You regain one expended use when you finish a Short Rest, and you regain all expended uses when you finish a Long Rest.",
+      "as shown in the Wild Shape column of the Druid Features table"
+     ],
+     "source": {
+      "section": "Classes > Druid > Druid Class Features > Level 2: Wild Shape",
+      "page": 42
+     }
+    },
+    {
+     "feature": "Wild Resurgence",
+     "level": 5,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 5,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "you can expend one use of Wild Shape (no action required) to give yourself a level 1 spell slot, but you can't do so again until you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Druid > Druid Class Features > Level 5: Wild Resurgence",
+      "page": 43
+     }
+    }
+   ],
+   "ac_formulas": []
+  },
+  "fighter": {
+   "name": "Fighter",
+   "hit_die": "d10",
+   "hp_at_first_level": "10 + Con modifier",
+   "hp_at_first_level_base": 10,
+   "hp_per_level_average": 6,
+   "hp_per_level_rule": "6 + Con modifier, or roll 1d10 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    6,
+    8,
+    12,
+    14,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "none",
+   "spellcasting_feature": null,
+   "spell_slots_by_level": null,
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": null,
+   "prepared_spells_by_level": null,
+   "features_by_level": {
+    "1": [
+     "Fighting Style",
+     "Second Wind",
+     "Weapon Mastery"
+    ],
+    "2": [
+     "Action Surge (one use)",
+     "Tactical Mind"
+    ],
+    "3": [
+     "Fighter Subclass"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [
+     "Extra Attack",
+     "Tactical Shift"
+    ],
+    "6": [
+     "Ability Score Improvement"
+    ],
+    "7": [
+     "Subclass feature"
+    ],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [
+     "Indomitable (one use)",
+     "Tactical Master"
+    ],
+    "10": [
+     "Subclass feature"
+    ],
+    "11": [
+     "Two Extra Attacks"
+    ],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [
+     "Indomitable (two uses)",
+     "Studied Attacks"
+    ],
+    "14": [
+     "Ability Score Improvement"
+    ],
+    "15": [
+     "Subclass feature"
+    ],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [
+     "Action Surge (two uses)",
+     "Indomitable (three uses)"
+    ],
+    "18": [
+     "Subclass feature"
+    ],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Three Extra Attacks"
+    ]
+   },
+   "table_columns": {
+    "Second Wind": {
+     "1": 2,
+     "2": 2,
+     "3": 2,
+     "4": 3,
+     "5": 3,
+     "6": 3,
+     "7": 3,
+     "8": 3,
+     "9": 3,
+     "10": 4,
+     "11": 4,
+     "12": 4,
+     "13": 4,
+     "14": 4,
+     "15": 4,
+     "16": 4,
+     "17": 4,
+     "18": 4,
+     "19": 4,
+     "20": 4
+    },
+    "Weapon Mastery": {
+     "1": 3,
+     "2": 3,
+     "3": 3,
+     "4": 4,
+     "5": 4,
+     "6": 4,
+     "7": 4,
+     "8": 4,
+     "9": 4,
+     "10": 5,
+     "11": 5,
+     "12": 5,
+     "13": 5,
+     "14": 5,
+     "15": 5,
+     "16": 6,
+     "17": 6,
+     "18": 6,
+     "19": 6,
+     "20": 6
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Second Wind",
+     "level": 1,
+     "maximum": {
+      "column": "Second Wind"
+     },
+     "refresh": [
+      {
+       "from_level": 1,
+       "short_rest": "one",
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "You can use this feature twice. You regain one expended use when you finish a Short Rest, and you regain all expended uses when you finish a Long Rest.",
+      "as shown in the Second Wind column of the Fighter Features table"
+     ],
+     "source": {
+      "section": "Classes > Fighter > Fighter Class Features > Level 1: Second Wind",
+      "page": 48
+     }
+    },
+    {
+     "feature": "Action Surge",
+     "table_names": [
+      "Action Surge (one use)",
+      "Action Surge (two uses)"
+     ],
+     "level": 2,
+     "maximum": {
+      "by_level": {
+       "2": 1,
+       "17": 2
+      }
+     },
+     "refresh": [
+      {
+       "from_level": 2,
+       "short_rest": "all",
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "Once you use this feature, you can't do so again until you finish a Short or Long Rest. Starting at level 17, you can use it twice before a rest"
+     ],
+     "source": {
+      "section": "Classes > Fighter > Fighter Class Features > Level 2: Action Surge",
+      "page": 48
+     }
+    },
+    {
+     "feature": "Indomitable",
+     "table_names": [
+      "Indomitable (one use)",
+      "Indomitable (two uses)",
+      "Indomitable (three uses)"
+     ],
+     "level": 9,
+     "maximum": {
+      "by_level": {
+       "9": 1,
+       "13": 2,
+       "17": 3
+      }
+     },
+     "refresh": [
+      {
+       "from_level": 9,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "you can't use this feature again until you finish a Long Rest. You can use this feature twice before a Long Rest starting at level 13 and three times before a Long Rest starting at level 17."
+     ],
+     "source": {
+      "section": "Classes > Fighter > Fighter Class Features > Level 9: Indomitable",
+      "page": 48
+     }
+    }
+   ],
+   "feature_activation": {
+    "Action Surge": {
+     "activation": "noAction",
+     "evidence": [
+      "On your turn, you can take one additional action, except the Magic action."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 2: Action Surge"
+     },
+     "table_names": [
+      "Action Surge (one use)",
+      "Action Surge (two uses)"
+     ]
+    },
+    "Extra Attack": {
+     "activation": "passive",
+     "evidence": [
+      "You can attack twice instead of once whenever you take the Attack action on your turn."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 5: Extra Attack"
+     }
+    },
+    "Fighting Style": {
+     "activation": "passive",
+     "evidence": [
+      "You have honed your martial prowess and gain a Fighting Style feat of your choice (see \"Feats\")."
+     ],
+     "source": {
+      "page": 47,
+      "section": "Classes > Fighter > Fighter Class Features > Level 1: Fighting Style"
+     }
+    },
+    "Indomitable": {
+     "activation": "noAction",
+     "evidence": [
+      "If you fail a saving throw, you can reroll it with a bonus equal to your Fighter level."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 9: Indomitable"
+     },
+     "table_names": [
+      "Indomitable (one use)",
+      "Indomitable (two uses)",
+      "Indomitable (three uses)"
+     ]
+    },
+    "Second Wind": {
+     "activation": "bonusAction",
+     "evidence": [
+      "As a Bonus Action, you can use it to regain Hit Points equal to 1d10 plus your Fighter level."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 1: Second Wind"
+     }
+    },
+    "Studied Attacks": {
+     "activation": "passive",
+     "evidence": [
+      "If you make an attack roll against a creature and miss, you have Advantage on your next attack roll against that creature before the end of your next turn."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 13: Studied Attacks"
+     }
+    },
+    "Tactical Master": {
+     "activation": "passive",
+     "evidence": [
+      "When you attack with a weapon whose mastery property you can use, you can replace that property with the Push, Sap, or Slow property for that attack."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 9: Tactical Master"
+     }
+    },
+    "Tactical Mind": {
+     "activation": "noAction",
+     "evidence": [
+      "When you fail an ability check, you can expend a use of your Second Wind to push yourself toward success."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 2: Tactical Mind"
+     }
+    },
+    "Tactical Shift": {
+     "activation": "passive",
+     "evidence": [
+      "Whenever you activate your Second Wind with a Bonus Action, you can move up to half your Speed without provoking Opportunity Attacks."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 5: Tactical Shift"
+     }
+    },
+    "Three Extra Attacks": {
+     "activation": "passive",
+     "evidence": [
+      "You can attack four times instead of once whenever you take the Attack action on your turn."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 20: Three Extra Attacks"
+     }
+    },
+    "Two Extra Attacks": {
+     "activation": "passive",
+     "evidence": [
+      "You can attack three times instead of once whenever you take the Attack action on your turn."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 11: Two Extra Attacks"
+     }
+    },
+    "Weapon Mastery": {
+     "activation": "passive",
+     "evidence": [
+      "Your training with weapons allows you to use the mastery properties of three kinds of Simple or Martial weapons of your choice."
+     ],
+     "source": {
+      "page": 48,
+      "section": "Classes > Fighter > Fighter Class Features > Level 1: Weapon Mastery"
+     }
+    }
+   },
+   "ac_formulas": []
+  },
+  "monk": {
+   "name": "Monk",
+   "hit_die": "d8",
+   "hp_at_first_level": "8 + Con modifier",
+   "hp_at_first_level_base": 8,
+   "hp_per_level_average": 5,
+   "hp_per_level_rule": "5 + Con modifier, or roll 1d8 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "none",
+   "spellcasting_feature": null,
+   "spell_slots_by_level": null,
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": null,
+   "prepared_spells_by_level": null,
+   "features_by_level": {
+    "1": [
+     "Martial Arts",
+     "Unarmored Defense"
+    ],
+    "2": [
+     "Monk's Focus",
+     "Unarmored Movement",
+     "Uncanny Metabolism"
+    ],
+    "3": [
+     "Deflect Attacks",
+     "Monk Subclass"
+    ],
+    "4": [
+     "Ability Score Improvement",
+     "Slow Fall"
+    ],
+    "5": [
+     "Extra Attack",
+     "Stunning Strike"
+    ],
+    "6": [
+     "Empowered Strikes",
+     "Subclass feature"
+    ],
+    "7": [
+     "Evasion"
+    ],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [
+     "Acrobatic Movement"
+    ],
+    "10": [
+     "Heightened Focus",
+     "Self-Restoration"
+    ],
+    "11": [
+     "Subclass feature"
+    ],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [
+     "Deflect Energy"
+    ],
+    "14": [
+     "Disciplined Survivor"
+    ],
+    "15": [
+     "Perfect Focus"
+    ],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [
+     "Subclass feature"
+    ],
+    "18": [
+     "Superior Defense"
+    ],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Body and Mind"
+    ]
+   },
+   "table_columns": {
+    "Martial Arts": {
+     "1": "1d6",
+     "2": "1d6",
+     "3": "1d6",
+     "4": "1d6",
+     "5": "1d8",
+     "6": "1d8",
+     "7": "1d8",
+     "8": "1d8",
+     "9": "1d8",
+     "10": "1d8",
+     "11": "1d10",
+     "12": "1d10",
+     "13": "1d10",
+     "14": "1d10",
+     "15": "1d10",
+     "16": "1d10",
+     "17": "1d12",
+     "18": "1d12",
+     "19": "1d12",
+     "20": "1d12"
+    },
+    "Focus Points": {
+     "1": null,
+     "2": 2,
+     "3": 3,
+     "4": 4,
+     "5": 5,
+     "6": 6,
+     "7": 7,
+     "8": 8,
+     "9": 9,
+     "10": 10,
+     "11": 11,
+     "12": 12,
+     "13": 13,
+     "14": 14,
+     "15": 15,
+     "16": 16,
+     "17": 17,
+     "18": 18,
+     "19": 19,
+     "20": 20
+    },
+    "Unarmored Movement": {
+     "1": null,
+     "2": "+10 ft.",
+     "3": "+10 ft.",
+     "4": "+10 ft.",
+     "5": "+10 ft.",
+     "6": "+15 ft.",
+     "7": "+15 ft.",
+     "8": "+15 ft.",
+     "9": "+15 ft.",
+     "10": "+20 ft.",
+     "11": "+20 ft.",
+     "12": "+20 ft.",
+     "13": "+20 ft.",
+     "14": "+25 ft.",
+     "15": "+25 ft.",
+     "16": "+25 ft.",
+     "17": "+25 ft.",
+     "18": "+30 ft.",
+     "19": "+30 ft.",
+     "20": "+30 ft."
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Monk's Focus",
+     "level": 2,
+     "maximum": {
+      "column": "Focus Points"
+     },
+     "refresh": [
+      {
+       "from_level": 2,
+       "short_rest": "all",
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "as shown in the Focus Points column of the Monk Features table",
+      "it is unavailable until you finish a Short or Long Rest, at the end of which you regain all your expended points."
+     ],
+     "source": {
+      "section": "Classes > Monk > Monk Class Features > Level 2: Monk's Focus",
+      "page": 50
+     }
+    },
+    {
+     "feature": "Uncanny Metabolism",
+     "level": 2,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 2,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "Once you use this feature, you can't use it again until you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Monk > Monk Class Features > Level 2: Uncanny Metabolism",
+      "page": 51
+     }
+    }
+   ],
+   "ac_formulas": [
+    {
+     "feature": "Unarmored Defense",
+     "level": 1,
+     "formula": {
+      "base": 10,
+      "abilities": [
+       "Dexterity",
+       "Wisdom"
+      ],
+      "while": "no armor",
+      "shield": "not allowed"
+     },
+     "evidence": "While you aren't wearing armor or wielding a Shield, your base Armor Class equals 10 plus your Dexterity and Wisdom modifiers.",
+     "source": {
+      "section": "Classes > Monk > Monk Class Features > Level 1: Unarmored Defense",
+      "page": 50
+     }
+    }
+   ]
+  },
+  "paladin": {
+   "name": "Paladin",
+   "hit_die": "d10",
+   "hp_at_first_level": "10 + Con modifier",
+   "hp_at_first_level_base": 10,
+   "hp_per_level_average": 6,
+   "hp_per_level_rule": "6 + Con modifier, or roll 1d10 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "half",
+   "spellcasting_feature": "Spellcasting",
+   "spell_slots_by_level": {
+    "1": {
+     "level1": 2,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "2": {
+     "level1": 2,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "3": {
+     "level1": 3,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "4": {
+     "level1": 3,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "5": {
+     "level1": 4,
+     "level2": 2,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "6": {
+     "level1": 4,
+     "level2": 2,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "7": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "8": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "9": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 2,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "10": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 2,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "11": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "12": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "13": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 1,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "14": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 1,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "15": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 2,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "16": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 2,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "17": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 1,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "18": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 1,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "19": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "20": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    }
+   },
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": null,
+   "prepared_spells_by_level": {
+    "1": 2,
+    "2": 3,
+    "3": 4,
+    "4": 5,
+    "5": 6,
+    "6": 6,
+    "7": 7,
+    "8": 7,
+    "9": 9,
+    "10": 9,
+    "11": 10,
+    "12": 10,
+    "13": 11,
+    "14": 11,
+    "15": 12,
+    "16": 12,
+    "17": 14,
+    "18": 14,
+    "19": 15,
+    "20": 15
+   },
+   "features_by_level": {
+    "1": [
+     "Lay On Hands",
+     "Spellcasting",
+     "Weapon Mastery"
+    ],
+    "2": [
+     "Fighting Style",
+     "Paladin's Smite"
+    ],
+    "3": [
+     "Channel Divinity",
+     "Paladin Subclass"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [
+     "Extra Attack",
+     "Faithful Steed"
+    ],
+    "6": [
+     "Aura of Protection"
+    ],
+    "7": [
+     "Subclass feature"
+    ],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [
+     "Abjure Foes"
+    ],
+    "10": [
+     "Aura of Courage"
+    ],
+    "11": [
+     "Radiant Strikes"
+    ],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [],
+    "14": [
+     "Restoring Touch"
+    ],
+    "15": [
+     "Subclass feature"
+    ],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [],
+    "18": [
+     "Aura Expansion"
+    ],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Subclass feature"
+    ]
+   },
+   "table_columns": {
+    "Channel Divinity": {
+     "1": null,
+     "2": null,
+     "3": 2,
+     "4": 2,
+     "5": 2,
+     "6": 2,
+     "7": 2,
+     "8": 2,
+     "9": 2,
+     "10": 2,
+     "11": 3,
+     "12": 3,
+     "13": 3,
+     "14": 3,
+     "15": 3,
+     "16": 3,
+     "17": 3,
+     "18": 3,
+     "19": 3,
+     "20": 3
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Lay On Hands",
+     "level": 1,
+     "maximum": {
+      "class_level_times": 5,
+      "unit": "hit points"
+     },
+     "refresh": [
+      {
+       "from_level": 1,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "You have a pool of healing power that replenishes when you finish a Long Rest.",
+      "a total number of Hit Points equal to five times your Paladin level."
+     ],
+     "source": {
+      "section": "Classes > Paladin > Paladin Class Features > Level 1: Lay On Hands",
+      "page": 53
+     }
+    },
+    {
+     "feature": "Paladin's Smite",
+     "level": 2,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 2,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "you can cast it without expending a spell slot, but you must finish a Long Rest before you can cast it in this way again."
+     ],
+     "source": {
+      "section": "Classes > Paladin > Paladin Class Features > Level 2: Paladin's Smite",
+      "page": 54
+     }
+    },
+    {
+     "feature": "Channel Divinity",
+     "level": 3,
+     "maximum": {
+      "column": "Channel Divinity"
+     },
+     "refresh": [
+      {
+       "from_level": 3,
+       "short_rest": "one",
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "You can use this class's Channel Divinity twice. You regain one of its expended uses when you finish a Short Rest, and you regain all expended uses when you finish a Long Rest. You gain an additional use when you reach Paladin level 11."
+     ],
+     "source": {
+      "section": "Classes > Paladin > Paladin Class Features > Level 3: Channel Divinity",
+      "page": 54
+     }
+    },
+    {
+     "feature": "Faithful Steed",
+     "level": 5,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 5,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "You can also cast the spell once without expending a spell slot, and you regain the ability to do so when you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Paladin > Paladin Class Features > Level 5: Faithful Steed",
+      "page": 55
+     }
+    }
+   ],
+   "ac_formulas": []
+  },
+  "ranger": {
+   "name": "Ranger",
+   "hit_die": "d10",
+   "hp_at_first_level": "10 + Con modifier",
+   "hp_at_first_level_base": 10,
+   "hp_per_level_average": 6,
+   "hp_per_level_rule": "6 + Con modifier, or roll 1d10 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "half",
+   "spellcasting_feature": "Spellcasting",
+   "spell_slots_by_level": {
+    "1": {
+     "level1": 2,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "2": {
+     "level1": 2,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "3": {
+     "level1": 3,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "4": {
+     "level1": 3,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "5": {
+     "level1": 4,
+     "level2": 2,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "6": {
+     "level1": 4,
+     "level2": 2,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "7": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "8": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "9": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 2,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "10": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 2,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "11": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "12": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "13": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 1,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "14": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 1,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "15": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 2,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "16": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 2,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "17": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 1,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "18": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 1,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "19": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "20": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    }
+   },
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": null,
+   "prepared_spells_by_level": {
+    "1": 2,
+    "2": 3,
+    "3": 4,
+    "4": 5,
+    "5": 6,
+    "6": 6,
+    "7": 7,
+    "8": 7,
+    "9": 9,
+    "10": 9,
+    "11": 10,
+    "12": 10,
+    "13": 11,
+    "14": 11,
+    "15": 12,
+    "16": 12,
+    "17": 14,
+    "18": 14,
+    "19": 15,
+    "20": 15
+   },
+   "features_by_level": {
+    "1": [
+     "Spellcasting",
+     "Favored Enemy",
+     "Weapon Mastery"
+    ],
+    "2": [
+     "Deft Explorer",
+     "Fighting Style"
+    ],
+    "3": [
+     "Ranger Subclass"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [
+     "Extra Attack"
+    ],
+    "6": [
+     "Roving"
+    ],
+    "7": [
+     "Subclass feature"
+    ],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [
+     "Expertise"
+    ],
+    "10": [
+     "Tireless"
+    ],
+    "11": [
+     "Subclass feature"
+    ],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [
+     "Relentless Hunter"
+    ],
+    "14": [
+     "Nature's Veil"
+    ],
+    "15": [
+     "Subclass feature"
+    ],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [
+     "Precise Hunter"
+    ],
+    "18": [
+     "Feral Senses"
+    ],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Foe Slayer"
+    ]
+   },
+   "table_columns": {
+    "Favored Enemy": {
+     "1": 2,
+     "2": 2,
+     "3": 2,
+     "4": 2,
+     "5": 3,
+     "6": 3,
+     "7": 3,
+     "8": 3,
+     "9": 4,
+     "10": 4,
+     "11": 4,
+     "12": 4,
+     "13": 5,
+     "14": 5,
+     "15": 5,
+     "16": 5,
+     "17": 6,
+     "18": 6,
+     "19": 6,
+     "20": 6
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Favored Enemy",
+     "level": 1,
+     "maximum": {
+      "column": "Favored Enemy"
+     },
+     "refresh": [
+      {
+       "from_level": 1,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "You can cast it twice without expending a spell slot, and you regain all expended uses of this ability when you finish a Long Rest.",
+      "as shown in the Favored Enemy column of the Ranger Features table"
+     ],
+     "source": {
+      "section": "Classes > Ranger > Ranger Class Features > Level 1: Favored Enemy",
+      "page": 58
+     }
+    },
+    {
+     "feature": "Tireless",
+     "level": 10,
+     "maximum": {
+      "ability_modifier": "Wisdom",
+      "minimum": 1
+     },
+     "refresh": [
+      {
+       "from_level": 10,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "a number of times equal to your Wisdom modifier (minimum of once), and you regain all expended uses when you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Ranger > Ranger Class Features > Level 10: Tireless",
+      "page": 59
+     }
+    },
+    {
+     "feature": "Nature's Veil",
+     "level": 14,
+     "maximum": {
+      "ability_modifier": "Wisdom",
+      "minimum": 1
+     },
+     "refresh": [
+      {
+       "from_level": 14,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "a number of times equal to your Wisdom modifier (minimum of once), and you regain all expended uses when you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Ranger > Ranger Class Features > Level 14: Nature's Veil",
+      "page": 59
+     }
+    }
+   ],
+   "ac_formulas": []
+  },
+  "rogue": {
+   "name": "Rogue",
+   "hit_die": "d8",
+   "hp_at_first_level": "8 + Con modifier",
+   "hp_at_first_level_base": 8,
+   "hp_per_level_average": 5,
+   "hp_per_level_rule": "5 + Con modifier, or roll 1d8 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    10,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "none",
+   "spellcasting_feature": null,
+   "spell_slots_by_level": null,
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": null,
+   "prepared_spells_by_level": null,
+   "features_by_level": {
+    "1": [
+     "Expertise",
+     "Sneak Attack",
+     "Thieves' Cant",
+     "Weapon Mastery"
+    ],
+    "2": [
+     "Cunning Action"
+    ],
+    "3": [
+     "Rogue Subclass",
+     "Steady Aim"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [
+     "Cunning Strike",
+     "Uncanny Dodge"
+    ],
+    "6": [
+     "Expertise"
+    ],
+    "7": [
+     "Evasion",
+     "Reliable Talent"
+    ],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [
+     "Subclass feature"
+    ],
+    "10": [
+     "Ability Score Improvement"
+    ],
+    "11": [
+     "Improved Cunning Strike"
+    ],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [
+     "Subclass feature"
+    ],
+    "14": [
+     "Devious Strikes"
+    ],
+    "15": [
+     "Slippery Mind"
+    ],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [
+     "Subclass feature"
+    ],
+    "18": [
+     "Elusive"
+    ],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Stroke of Luck"
+    ]
+   },
+   "table_columns": {
+    "Sneak Attack": {
+     "1": "1d6",
+     "2": "1d6",
+     "3": "2d6",
+     "4": "2d6",
+     "5": "3d6",
+     "6": "3d6",
+     "7": "4d6",
+     "8": "4d6",
+     "9": "5d6",
+     "10": "5d6",
+     "11": "6d6",
+     "12": "6d6",
+     "13": "7d6",
+     "14": "7d6",
+     "15": "8d6",
+     "16": "8d6",
+     "17": "9d6",
+     "18": "9d6",
+     "19": "10d6",
+     "20": "10d6"
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Stroke of Luck",
+     "level": 20,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 20,
+       "short_rest": "all",
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "Once you use this feature, you can't use it again until you finish a Short or Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Rogue > Rogue Class Features > Level 20: Stroke of Luck",
+      "page": 63
+     }
+    }
+   ],
+   "feature_activation": {
+    "Cunning Action": {
+     "activation": "bonusAction",
+     "evidence": [
+      "On your turn, you can take one of the following actions as a Bonus Action: Dash, Disengage, or Hide."
+     ],
+     "source": {
+      "page": 62,
+      "section": "Classes > Rogue > Rogue Class Features > Level 2: Cunning Action"
+     }
+    },
+    "Cunning Strike": {
+     "activation": "passive",
+     "evidence": [
+      "When you deal Sneak Attack damage, you can add one of the following Cunning Strike effects."
+     ],
+     "source": {
+      "page": 63,
+      "section": "Classes > Rogue > Rogue Class Features > Level 5: Cunning Strike"
+     }
+    },
+    "Devious Strikes": {
+     "activation": "passive",
+     "evidence": [
+      "The following effects are now among your Cunning Strike options."
+     ],
+     "source": {
+      "page": 63,
+      "section": "Classes > Rogue > Rogue Class Features > Level 14: Devious Strikes"
+     }
+    },
+    "Elusive": {
+     "activation": "passive",
+     "evidence": [
+      "No attack roll can have Advantage against you unless you have the Incapacitated condition."
+     ],
+     "source": {
+      "page": 63,
+      "section": "Classes > Rogue > Rogue Class Features > Level 18: Elusive"
+     }
+    },
+    "Evasion": {
+     "activation": "passive",
+     "evidence": [
+      "When you're subjected to an effect that allows you to make a Dexterity saving throw to take only half damage, you instead take no damage if you succeed on the saving throw and only half damage if you fail."
+     ],
+     "source": {
+      "page": 63,
+      "section": "Classes > Rogue > Rogue Class Features > Level 7: Evasion"
+     }
+    },
+    "Expertise": {
+     "activation": "passive",
+     "evidence": [
+      "You gain Expertise in two of your skill proficiencies of your choice."
+     ],
+     "source": {
+      "page": 61,
+      "section": "Classes > Rogue > Rogue Class Features > Level 1: Expertise"
+     }
+    },
+    "Improved Cunning Strike": {
+     "activation": "passive",
+     "evidence": [
+      "You can use up to two Cunning Strike effects when you deal Sneak Attack damage, paying the die cost for each effect."
+     ],
+     "source": {
+      "page": 63,
+      "section": "Classes > Rogue > Rogue Class Features > Level 11: Improved Cunning Strike"
+     }
+    },
+    "Reliable Talent": {
+     "activation": "passive",
+     "evidence": [
+      "Whenever you make an ability check that uses one of your skill or tool proficiencies, you can treat a d20 roll of 9 or lower as a 10."
+     ],
+     "source": {
+      "page": 63,
+      "section": "Classes > Rogue > Rogue Class Features > Level 7: Reliable Talent"
+     }
+    },
+    "Slippery Mind": {
+     "activation": "passive",
+     "evidence": [
+      "You gain proficiency in Wisdom and Charisma saving throws."
+     ],
+     "source": {
+      "page": 63,
+      "section": "Classes > Rogue > Rogue Class Features > Level 15: Slippery Mind"
+     }
+    },
+    "Sneak Attack": {
+     "activation": "passive",
+     "evidence": [
+      "Once per turn, you can deal an extra 1d6 damage to one creature you hit with an attack roll if you have Advantage on the roll and the attack uses a Finesse or a Ranged weapon."
+     ],
+     "source": {
+      "page": 61,
+      "section": "Classes > Rogue > Rogue Class Features > Level 1: Sneak Attack"
+     }
+    },
+    "Steady Aim": {
+     "activation": "bonusAction",
+     "evidence": [
+      "As a Bonus Action, you give yourself Advantage on your next attack roll on the current turn."
+     ],
+     "source": {
+      "page": 62,
+      "section": "Classes > Rogue > Rogue Class Features > Level 3: Steady Aim"
+     }
+    },
+    "Stroke of Luck": {
+     "activation": "noAction",
+     "evidence": [
+      "If you fail a D20 Test, you can turn the roll into a 20."
+     ],
+     "source": {
+      "page": 63,
+      "section": "Classes > Rogue > Rogue Class Features > Level 20: Stroke of Luck"
+     }
+    },
+    "Thieves' Cant": {
+     "activation": "passive",
+     "evidence": [
+      "You know Thieves' Cant and one other language of your choice, which you choose from the language tables in \"Character Creation.\""
+     ],
+     "source": {
+      "page": 62,
+      "section": "Classes > Rogue > Rogue Class Features > Level 1: Thieves' Cant"
+     }
+    },
+    "Uncanny Dodge": {
+     "activation": "reaction",
+     "evidence": [
+      "When an attacker that you can see hits you with an attack roll, you can take a Reaction to halve the attack's damage against you (round down)."
+     ],
+     "source": {
+      "page": 63,
+      "section": "Classes > Rogue > Rogue Class Features > Level 5: Uncanny Dodge"
+     }
+    },
+    "Weapon Mastery": {
+     "activation": "passive",
+     "evidence": [
+      "Your training with weapons allows you to use the mastery properties of two kinds of weapons of your choice with which you have proficiency, such as Daggers and Shortbows."
+     ],
+     "source": {
+      "page": 62,
+      "section": "Classes > Rogue > Rogue Class Features > Level 1: Weapon Mastery"
+     }
+    }
+   },
+   "ac_formulas": []
+  },
+  "sorcerer": {
+   "name": "Sorcerer",
+   "hit_die": "d6",
+   "hp_at_first_level": "6 + Con modifier",
+   "hp_at_first_level_base": 6,
+   "hp_per_level_average": 4,
+   "hp_per_level_rule": "4 + Con modifier, or roll 1d6 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "full",
+   "spellcasting_feature": "Spellcasting",
+   "spell_slots_by_level": {
+    "1": {
+     "level1": 2,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "2": {
+     "level1": 3,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "3": {
+     "level1": 4,
+     "level2": 2,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "4": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "5": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 2,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "6": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "7": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 1,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "8": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 2,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "9": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 1,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "10": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "11": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "12": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "13": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 0,
+     "level9": 0
+    },
+    "14": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 0,
+     "level9": 0
+    },
+    "15": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 0
+    },
+    "16": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 0
+    },
+    "17": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "18": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "19": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 2,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "20": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 2,
+     "level7": 2,
+     "level8": 1,
+     "level9": 1
+    }
+   },
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": {
+    "1": 4,
+    "2": 4,
+    "3": 4,
+    "4": 5,
+    "5": 5,
+    "6": 5,
+    "7": 5,
+    "8": 5,
+    "9": 5,
+    "10": 6,
+    "11": 6,
+    "12": 6,
+    "13": 6,
+    "14": 6,
+    "15": 6,
+    "16": 6,
+    "17": 6,
+    "18": 6,
+    "19": 6,
+    "20": 6
+   },
+   "prepared_spells_by_level": {
+    "1": 2,
+    "2": 4,
+    "3": 6,
+    "4": 7,
+    "5": 9,
+    "6": 10,
+    "7": 11,
+    "8": 12,
+    "9": 14,
+    "10": 15,
+    "11": 16,
+    "12": 16,
+    "13": 17,
+    "14": 17,
+    "15": 18,
+    "16": 18,
+    "17": 19,
+    "18": 20,
+    "19": 21,
+    "20": 22
+   },
+   "features_by_level": {
+    "1": [
+     "Spellcasting",
+     "Innate Sorcery"
+    ],
+    "2": [
+     "Font of Magic",
+     "Metamagic"
+    ],
+    "3": [
+     "Sorcerer Subclass"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [
+     "Sorcerous Restoration"
+    ],
+    "6": [
+     "Subclass feature"
+    ],
+    "7": [
+     "Sorcery Incarnate"
+    ],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [],
+    "10": [
+     "Metamagic"
+    ],
+    "11": [],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [],
+    "14": [
+     "Subclass feature"
+    ],
+    "15": [],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [
+     "Metamagic"
+    ],
+    "18": [
+     "Subclass feature"
+    ],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Arcane Apotheosis"
+    ]
+   },
+   "table_columns": {
+    "Sorcery Points": {
+     "1": null,
+     "2": 2,
+     "3": 3,
+     "4": 4,
+     "5": 5,
+     "6": 6,
+     "7": 7,
+     "8": 8,
+     "9": 9,
+     "10": 10,
+     "11": 11,
+     "12": 12,
+     "13": 13,
+     "14": 14,
+     "15": 15,
+     "16": 16,
+     "17": 17,
+     "18": 18,
+     "19": 19,
+     "20": 20
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Innate Sorcery",
+     "level": 1,
+     "maximum": {
+      "fixed": 2
+     },
+     "refresh": [
+      {
+       "from_level": 1,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "You can use this feature twice, and you regain all expended uses of it when you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Sorcerer > Sorcerer Class Features > Level 1: Innate Sorcery",
+      "page": 65
+     }
+    },
+    {
+     "feature": "Font of Magic",
+     "level": 2,
+     "maximum": {
+      "column": "Sorcery Points"
+     },
+     "refresh": [
+      {
+       "from_level": 2,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "You have 2 Sorcery Points, and you gain more as you reach higher levels, as shown in the Sorcery Points column of the Sorcerer Features table.",
+      "You regain all expended Sorcery Points when you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Sorcerer > Sorcerer Class Features > Level 2: Font of Magic",
+      "page": 66
+     }
+    },
+    {
+     "feature": "Sorcerous Restoration",
+     "level": 5,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 5,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "Once you use this feature, you can't do so again until you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Sorcerer > Sorcerer Class Features > Level 5: Sorcerous Restoration",
+      "page": 66
+     }
+    }
+   ],
+   "ac_formulas": [
+    {
+     "feature": "Draconic Resilience",
+     "level": 3,
+     "formula": {
+      "base": 10,
+      "abilities": [
+       "Dexterity",
+       "Charisma"
+      ],
+      "while": "no armor",
+      "shield": "allowed"
+     },
+     "evidence": "While you aren't wearing armor, your base Armor Class equals 10 plus your Dexterity and Charisma modifiers.",
+     "source": {
+      "section": "Classes > Sorcerer > Sorcerer Subclass: Draconic Sorcery > Level 3: Draconic Resilience",
+      "page": 69
+     },
+     "subclass": "Draconic Sorcery"
+    }
+   ]
+  },
+  "warlock": {
+   "name": "Warlock",
+   "hit_die": "d8",
+   "hp_at_first_level": "8 + Con modifier",
+   "hp_at_first_level_base": 8,
+   "hp_per_level_average": 5,
+   "hp_per_level_rule": "5 + Con modifier, or roll 1d8 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "pact",
+   "spellcasting_feature": "Pact Magic",
+   "spell_slots_by_level": null,
+   "pact_slots_by_level": {
+    "1": {
+     "slots": 1,
+     "slot_level": 1
+    },
+    "2": {
+     "slots": 2,
+     "slot_level": 1
+    },
+    "3": {
+     "slots": 2,
+     "slot_level": 2
+    },
+    "4": {
+     "slots": 2,
+     "slot_level": 2
+    },
+    "5": {
+     "slots": 2,
+     "slot_level": 3
+    },
+    "6": {
+     "slots": 2,
+     "slot_level": 3
+    },
+    "7": {
+     "slots": 2,
+     "slot_level": 4
+    },
+    "8": {
+     "slots": 2,
+     "slot_level": 4
+    },
+    "9": {
+     "slots": 2,
+     "slot_level": 5
+    },
+    "10": {
+     "slots": 2,
+     "slot_level": 5
+    },
+    "11": {
+     "slots": 3,
+     "slot_level": 5
+    },
+    "12": {
+     "slots": 3,
+     "slot_level": 5
+    },
+    "13": {
+     "slots": 3,
+     "slot_level": 5
+    },
+    "14": {
+     "slots": 3,
+     "slot_level": 5
+    },
+    "15": {
+     "slots": 3,
+     "slot_level": 5
+    },
+    "16": {
+     "slots": 3,
+     "slot_level": 5
+    },
+    "17": {
+     "slots": 4,
+     "slot_level": 5
+    },
+    "18": {
+     "slots": 4,
+     "slot_level": 5
+    },
+    "19": {
+     "slots": 4,
+     "slot_level": 5
+    },
+    "20": {
+     "slots": 4,
+     "slot_level": 5
+    }
+   },
+   "cantrips_known_by_level": {
+    "1": 2,
+    "2": 2,
+    "3": 2,
+    "4": 3,
+    "5": 3,
+    "6": 3,
+    "7": 3,
+    "8": 3,
+    "9": 3,
+    "10": 4,
+    "11": 4,
+    "12": 4,
+    "13": 4,
+    "14": 4,
+    "15": 4,
+    "16": 4,
+    "17": 4,
+    "18": 4,
+    "19": 4,
+    "20": 4
+   },
+   "prepared_spells_by_level": {
+    "1": 2,
+    "2": 3,
+    "3": 4,
+    "4": 5,
+    "5": 6,
+    "6": 7,
+    "7": 8,
+    "8": 9,
+    "9": 10,
+    "10": 10,
+    "11": 11,
+    "12": 11,
+    "13": 12,
+    "14": 12,
+    "15": 13,
+    "16": 13,
+    "17": 14,
+    "18": 14,
+    "19": 15,
+    "20": 15
+   },
+   "features_by_level": {
+    "1": [
+     "Eldritch Invocations",
+     "Pact Magic"
+    ],
+    "2": [
+     "Magical Cunning"
+    ],
+    "3": [
+     "Warlock Subclass"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [],
+    "6": [
+     "Subclass feature"
+    ],
+    "7": [],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [
+     "Contact Patron"
+    ],
+    "10": [
+     "Subclass feature"
+    ],
+    "11": [
+     "Mystic Arcanum (level 6 spell)"
+    ],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [
+     "Mystic Arcanum (level 7 spell)"
+    ],
+    "14": [
+     "Subclass feature"
+    ],
+    "15": [
+     "Mystic Arcanum (level 8 spell)"
+    ],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [
+     "Mystic Arcanum (level 9 spell)"
+    ],
+    "18": [],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Eldritch Master"
+    ]
+   },
+   "table_columns": {
+    "Eldritch Invocations": {
+     "1": 1,
+     "2": 3,
+     "3": 3,
+     "4": 3,
+     "5": 5,
+     "6": 5,
+     "7": 6,
+     "8": 6,
+     "9": 7,
+     "10": 7,
+     "11": 7,
+     "12": 8,
+     "13": 8,
+     "14": 8,
+     "15": 9,
+     "16": 9,
+     "17": 9,
+     "18": 10,
+     "19": 10,
+     "20": 10
+    }
+   },
+   "use_pools": [
+    {
+     "feature": "Magical Cunning",
+     "level": 2,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 2,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "Once you use this feature, you can't do so again until you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Warlock > Warlock Class Features > Level 2: Magical Cunning",
+      "page": 72
+     }
+    },
+    {
+     "feature": "Contact Patron",
+     "level": 9,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 9,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "Once you cast the spell with this feature, you can't do so in this way again until you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Warlock > Warlock Class Features > Level 9: Contact Patron",
+      "page": 72
+     }
+    }
+   ],
+   "ac_formulas": []
+  },
+  "wizard": {
+   "name": "Wizard",
+   "hit_die": "d6",
+   "hp_at_first_level": "6 + Con modifier",
+   "hp_at_first_level_base": 6,
+   "hp_per_level_average": 4,
+   "hp_per_level_rule": "4 + Con modifier, or roll 1d6 + Con modifier (minimum 1)",
+   "asi_levels": [
+    4,
+    8,
+    12,
+    16
+   ],
+   "epic_boon_level": 19,
+   "subclass_level": 3,
+   "caster_kind": "full",
+   "spellcasting_feature": "Spellcasting",
+   "spell_slots_by_level": {
+    "1": {
+     "level1": 2,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "2": {
+     "level1": 3,
+     "level2": 0,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "3": {
+     "level1": 4,
+     "level2": 2,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "4": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 0,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "5": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 2,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "6": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 0,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "7": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 1,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "8": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 2,
+     "level5": 0,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "9": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 1,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "10": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 0,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "11": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "12": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 0,
+     "level8": 0,
+     "level9": 0
+    },
+    "13": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 0,
+     "level9": 0
+    },
+    "14": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 0,
+     "level9": 0
+    },
+    "15": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 0
+    },
+    "16": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 0
+    },
+    "17": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 2,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "18": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 1,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "19": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 2,
+     "level7": 1,
+     "level8": 1,
+     "level9": 1
+    },
+    "20": {
+     "level1": 4,
+     "level2": 3,
+     "level3": 3,
+     "level4": 3,
+     "level5": 3,
+     "level6": 2,
+     "level7": 2,
+     "level8": 1,
+     "level9": 1
+    }
+   },
+   "pact_slots_by_level": null,
+   "cantrips_known_by_level": {
+    "1": 3,
+    "2": 3,
+    "3": 3,
+    "4": 4,
+    "5": 4,
+    "6": 4,
+    "7": 4,
+    "8": 4,
+    "9": 4,
+    "10": 5,
+    "11": 5,
+    "12": 5,
+    "13": 5,
+    "14": 5,
+    "15": 5,
+    "16": 5,
+    "17": 5,
+    "18": 5,
+    "19": 5,
+    "20": 5
+   },
+   "prepared_spells_by_level": {
+    "1": 4,
+    "2": 5,
+    "3": 6,
+    "4": 7,
+    "5": 9,
+    "6": 10,
+    "7": 11,
+    "8": 12,
+    "9": 14,
+    "10": 15,
+    "11": 16,
+    "12": 16,
+    "13": 17,
+    "14": 18,
+    "15": 19,
+    "16": 21,
+    "17": 22,
+    "18": 23,
+    "19": 24,
+    "20": 25
+   },
+   "features_by_level": {
+    "1": [
+     "Spellcasting",
+     "Ritual Adept",
+     "Arcane Recovery"
+    ],
+    "2": [
+     "Scholar"
+    ],
+    "3": [
+     "Wizard Subclass"
+    ],
+    "4": [
+     "Ability Score Improvement"
+    ],
+    "5": [
+     "Memorize Spell"
+    ],
+    "6": [
+     "Subclass feature"
+    ],
+    "7": [],
+    "8": [
+     "Ability Score Improvement"
+    ],
+    "9": [],
+    "10": [
+     "Subclass feature"
+    ],
+    "11": [],
+    "12": [
+     "Ability Score Improvement"
+    ],
+    "13": [],
+    "14": [
+     "Subclass feature"
+    ],
+    "15": [],
+    "16": [
+     "Ability Score Improvement"
+    ],
+    "17": [],
+    "18": [
+     "Spell Mastery"
+    ],
+    "19": [
+     "Epic Boon"
+    ],
+    "20": [
+     "Signature Spells"
+    ]
+   },
+   "table_columns": {},
+   "use_pools": [
+    {
+     "feature": "Arcane Recovery",
+     "level": 1,
+     "maximum": {
+      "fixed": 1
+     },
+     "refresh": [
+      {
+       "from_level": 1,
+       "short_rest": null,
+       "long_rest": "all"
+      }
+     ],
+     "evidence": [
+      "Once you use this feature, you can't do so again until you finish a Long Rest."
+     ],
+     "source": {
+      "section": "Classes > Wizard > Wizard Class Features > Level 1: Arcane Recovery",
+      "page": 78
+     }
+    }
+   ],
+   "ac_formulas": []
+  }
+ },
+ "use_pools_not_modeled": [
+  {
+   "class": "cleric",
+   "feature": "Greater Divine Intervention",
+   "why": "the wait is a dice roll of Long Rests, not a count of uses"
+  },
+  {
+   "class": "warlock",
+   "feature": "Mystic Arcanum",
+   "why": "one use per arcanum spell, gained at 11, 13, 15 and 17"
+  },
+  {
+   "class": "wizard",
+   "feature": "Signature Spells",
+   "why": "one use per signature spell"
+  }
+ ],
+ "hp_bonuses": [
+  {
+   "name": "Dwarven Toughness",
+   "granted_by": {
+    "kind": "species trait",
+    "species": "Dwarf",
+    "species_key": "dwarf"
+   },
+   "per_character_level": 1,
+   "evidence": "Dwarven Toughness. Your Hit Point maximum increases by 1, and it increases by 1 again whenever you gain a level."
+  },
+  {
+   "name": "Draconic Resilience",
+   "granted_by": {
+    "kind": "subclass feature",
+    "class": "sorcerer",
+    "subclass": "Draconic Sorcery",
+    "level": 3
+   },
+   "per_class_level": 1,
+   "from_class_level": 3,
+   "evidence": "Your Hit Point maximum increases by 3, and it increases by 1 whenever you gain another Sorcerer level."
+  }
+ ]
+}

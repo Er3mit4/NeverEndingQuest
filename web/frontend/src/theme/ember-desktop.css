@@ -95,9 +95,10 @@
 .ember-desktop .neq-ability-name { color: var(--ember-brass); letter-spacing: 0; font: 400 16px/1.2 var(--font-body); }
 .ember-desktop .neq-ability-value { color: var(--ember-text); font: 400 23px/1.1 var(--font-body); }
 .ember-desktop .neq-ability-modifier { width: auto; height: auto; margin-top: 3px; border: 0; border-radius: 0; background: none; color: var(--ember-text); font: 400 17px/1.1 var(--font-body); }
-.ember-desktop .neq-weapons-grid { order: 3; display: block; margin: 0; }
-.ember-desktop .neq-saving-throws { order: 4; }
-.ember-desktop .neq-abilities-grid { order: 5; display: block; margin: 0; }
+.ember-desktop .neq-weapons-grid { order: 4; display: block; margin: 0; }
+.ember-desktop .neq-saving-throws { order: 5; }
+.ember-desktop .neq-skills { order: 6; }
+.ember-desktop .neq-abilities-grid { order: 7; display: block; margin: 0; }
 .ember-desktop .neq-sheet-section, .ember-desktop .neq-saving-throws { margin: 0 10px 4px; padding: 0; border: 0; border-radius: 0; background: none; min-height: 0; }
 .ember-desktop .neq-weapons-grid .neq-sheet-section { min-height: 0; }
 .ember-desktop .neq-sheet-section h4, .ember-desktop .neq-saving-throws h4 { display: flex; align-items: center; gap: 10px; padding: 0; margin: 0; border: 0; color: var(--ember-brass); font: 400 17px/1.3 var(--font-body); text-transform: none; letter-spacing: 0; }
@@ -110,7 +111,8 @@
 .ember-desktop .neq-saving-throws-grid { display: flex; gap: 7px; justify-content: space-between; flex-wrap: wrap; }
 .ember-desktop .neq-saving-throws-grid > div { display: flex; gap: 6px; padding: 0; border: 0; background: none; border-radius: 0; min-height: 0; font: 400 16px/1.4 var(--font-body); }
 .ember-desktop .neq-saving-throws-grid > div > span { color: var(--ember-text); font-weight: 400; }
-.ember-desktop .ember-currency-row { order: 6; display: flex; justify-content: space-around; margin-top: 10px; padding: 9px 0; border-block: 1px solid var(--ember-frame); }
+.ember-desktop .neq-skills-grid > div[data-proficient='false'] > span:first-child { color: var(--ember-muted); }
+.ember-desktop .ember-currency-row { order: 3; display: flex; justify-content: space-around; margin: 0 0 8px; padding: 9px 0; border-block: 1px solid var(--ember-frame); }
 .ember-desktop .ember-currency-row > div, body[data-ember-desktop='true'] .ember-npc-full-card .ember-currency-row > div { display: flex; align-items: center; gap: 7px; }
 .ember-desktop .ember-currency-row > div > span:nth-child(2), body[data-ember-desktop='true'] .ember-npc-full-card .ember-currency-row > div > span:nth-child(2) { color: var(--ember-brass); }
 .ember-desktop .ember-coin, body[data-ember-desktop='true'] .ember-npc-full-card .ember-coin { width: 18px; height: 18px; border: 2px solid #b88a42; outline: 1px solid #52341b; outline-offset: -4px; border-radius: 50%; background: radial-gradient(circle at 30% 20%,#fff0c8,#b57b30 50%,#40260e); box-shadow: inset 0 0 2px #fff9; }
@@ -175,6 +177,9 @@
 .ember-desktop .neq-character-chip:hover > .ember-chip-portrait, .ember-desktop .neq-character-chip[data-active='true'] > .ember-chip-portrait { border-color: #d3a456; box-shadow: 0 0 8px #d78b3033; }
 .ember-desktop .neq-character-chip[data-active='true'] > span:last-child { color: #f2bd79; }
 .ember-desktop .ember-turn-label { display: block; margin-top: 5px; font: 400 14px/1.2 var(--font-body); color: var(--ember-brass); }
+.ember-desktop .ember-turn-label.neq-down-label { color: #e08a8a; }
+.ember-desktop .neq-character-chip[data-down='true'] .ember-chip-portrait { filter: grayscale(1) brightness(0.55); }
+.ember-desktop .neq-character-chip[data-down='true'] > span:last-child { color: var(--ember-muted); }
 .ember-desktop .neq-character-chip[data-chip='init-enemy'] > .ember-chip-portrait { border-color: #87452d; }
 .ember-desktop .ember-nearby-label { color: var(--ember-muted); font-size: 14px; padding-top: 6px; border-top: 1px solid var(--ember-frame); }
 .ember-desktop .neq-combat-box { flex-direction: row; gap: 8px; width: 100%; height: 36px; margin: 0 0 12px; border: 1px solid var(--ember-rule) !important; background: none !important; }
@@ -232,6 +237,22 @@
 /* Compatibility repair below the Ember breakpoint: the legacy desktop rules
    force one unbroken header row and clip the last sheet tabs at tablet widths.
    Keep the existing layout and phone styles; make its controls reachable. */
+.neq-turn-status { margin: 0 0 8px; color: #cbbb99; font-size: 13px; line-height: 1.4; font-style: italic; overflow-wrap: anywhere; display: flex; align-items: center; gap: 8px; }
+/* Thinking mist: a glowing emerald swirl, and a slow green shimmer on the
+   status text, while the DM works. Sized to be noticed on the dark composer. */
+.neq-thinking-mist { position: relative; flex: none; width: 26px; height: 26px; filter: drop-shadow(0 0 6px rgba(80,200,120,.8)); animation: neq-mist-breathe 2.4s ease-in-out infinite; }
+.neq-thinking-mist::before { content: ""; position: absolute; inset: 8px; border-radius: 50%; background: radial-gradient(circle, rgba(190,255,215,.95), rgba(80,200,120,.35) 70%, transparent); }
+.neq-thinking-mist-swirl { position: absolute; inset: 0; border-radius: 50%; filter: blur(.6px);
+  background: conic-gradient(from 0deg, transparent 0deg, rgba(80,200,120,1) 80deg, transparent 160deg, rgba(140,235,175,.8) 240deg, transparent 330deg);
+  animation: neq-mist-spin 1.4s linear infinite; }
+.neq-thinking-mist-swirl--inner { inset: 5px; filter: blur(.4px);
+  background: conic-gradient(from 180deg, transparent 0deg, rgba(200,255,220,1) 100deg, transparent 210deg);
+  animation: neq-mist-spin .9s linear infinite reverse; }
+.neq-turn-status--busy { animation: neq-mist-text 2.4s ease-in-out infinite; }
+@keyframes neq-mist-spin { to { transform: rotate(360deg); } }
+@keyframes neq-mist-breathe { 0%, 100% { transform: scale(.9); opacity: .85; } 50% { transform: scale(1.08); opacity: 1; } }
+@keyframes neq-mist-text { 0%, 100% { color: #cbbb99; } 50% { color: #8fe3b0; } }
+@media (prefers-reduced-motion: reduce) { .neq-thinking-mist, .neq-thinking-mist-swirl, .neq-turn-status--busy { animation: none; } }
 @media (min-width: 761px) and (max-width: 1023px) {
   .neq-app-grid:not(.ember-desktop) .neq-header-actions { flex-wrap: wrap; max-width: 100%; }
   .neq-app-grid:not(.ember-desktop) .neq-tabs { overflow-x: auto; }

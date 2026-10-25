@@ -95,6 +95,12 @@ def create_backup():
                     '.module_transactions',
                     '.publication_transactions',
                     '.module_orphan_quarantine',
+                    # Legacy publication copies nothing reads; #565 stopped writing them (#614).
+                    '.integration_backups',
+                    # Refresh-commit rollback state (utils/commit_state.py); only
+                    # older builds wrote it, and a restored copy would roll back (#813).
+                    '.commit_backups',
+                    'commit_state.json',
                 ])
                 ignored.extend(name for name in files if '.completion' in name)
             return ignored
@@ -106,12 +112,14 @@ def create_backup():
         "party_tracker.json", "campaign.json", "world_registry.json",
         "modules/conversation_history/conversation_history.json", "modules/conversation_history/chat_history.json", "modules/conversation_history/combat_conversation_history.json",
         "modules/conversation_history/conversation_history.json", "current_location.json", "journal.json",
+        "live_state.json", "live_state.json.bak",
         "summary_dump.json", "trimmed_summary_dump.json", "modules/conversation_history/second_model_history.json",
         "modules/conversation_history/third_model_history.json", "debug_encounter_update.json", "debug_initial_response.json",
         "debug_npc_update.json", "debug_player_update.json", "debug_second_model.json",
         "npc_update_debug_log.json", "npc_update_detailed_log.json", "prompt_validation.json",
         "training_data.json", "debug.txt", "claude.txt",
-        "modules/effects_tracker.json", "modules/effects_state.json", "modules/default/effects_tracker.json"
+        "modules/effects_tracker.json", "modules/effects_state.json", "modules/checks_state.json",
+        "modules/default/effects_tracker.json"
     ]
     
     for file in root_files:
@@ -309,6 +317,12 @@ def _reset_global_state_locked(*, reset_prepared=False):
     if os.path.exists("player_storage.json"):
         os.remove("player_storage.json")
         print("  [OK] Removed player_storage.json (will be created fresh)")
+
+    # The engine's location record: a fresh game starts from the seeds
+    for live_state_file in ("live_state.json", "live_state.json.bak"):
+        if os.path.exists(live_state_file):
+            os.remove(live_state_file)
+            print(f"  [OK] Removed {live_state_file} (will be created fresh)")
     
     # Delete campaign state and its transactional metadata under the same
     # lifecycle boundary used by completion/save/restore.
@@ -333,6 +347,8 @@ def _reset_global_state_locked(*, reset_prepared=False):
     effects_tracker_files = [
         "modules/effects_tracker.json",
         "modules/effects_state.json",
+        # A new game starts with no pending checks (#940).
+        "modules/checks_state.json",
         "modules/default/effects_tracker.json",
     ]
     for file in effects_tracker_files:
@@ -358,14 +374,13 @@ def _reset_global_state_locked(*, reset_prepared=False):
         json.dump(starting_location, f, indent=2, ensure_ascii=False)
     print("  [OK] Reset current_location.json to starting point (HH001 A01)")
     
-    # Create empty journal
-    journal_data = {
-        "module": "Keep_of_Doom",
-        "entries": []
-    }
-    with open("journal.json", 'w', encoding='utf-8') as f:
-        json.dump(journal_data, f, indent=2, ensure_ascii=False)
-    print("  [OK] Created empty journal.json")
+    # The chronicle starts fresh: no journal until the first departure,
+    # exactly as on a new install (the departure commit creates it).
+    try:
+        os.remove("journal.json")
+        print("  [OK] Removed journal.json (will be created fresh)")
+    except FileNotFoundError:
+        pass
     
     # Delete world_registry.json - will be recreated
     if os.path.exists("world_registry.json"):
@@ -507,6 +522,11 @@ def perform_reset_logic():
         with _reset_reconciled_boundary():
             return _perform_reset_logic_locked()
     finally:
+        # The reset roster numbers its own [slot] rows; the old turn's pair
+        # is never answered again.
+        from core.ai.action_handler import TurnRoster
+
+        TurnRoster.clear()
         end_invocation_supersession(invocation_barrier)
 
 

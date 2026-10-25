@@ -52,6 +52,7 @@ See LICENSE file for full terms.
 # ============================================================================
 
 import copy
+from core.ai import history_markers as hm
 import json
 import hashlib
 import subprocess
@@ -64,24 +65,26 @@ from uuid import uuid4
 from core.ai import api_client
 import model_config
 from utils.capture.multi_model_capture import capture_and_fanout, register_callsite
-from utils.capture.live_provider_call import LiveProviderSuperseded
+from utils.capture.live_provider_call import (
+    LiveProviderCompletedError,
+    LiveProviderSuperseded,
+)
+from utils.provider_errors import classify_provider_error
 from core.combat.invocation import InvocationSupersededError
-register_callsite("T013", "core/ai/action_handler.py", 1255)
 register_callsite("T012", "core/ai/action_handler.py", 676)
-register_callsite("T014", "core/ai/action_handler.py", 2506)
 import config
-from core.managers.location_manager import get_location_data
+from core.managers.current_location import current_location_data
 from utils.module_path_manager import ModulePathManager
-from updates.plot_update import update_plot
 from utils.encoding_utils import sanitize_text, safe_json_dump, safe_json_load
 from utils.file_operations import safe_read_json, safe_write_json
+from utils.transient_filesystem import ReadOnlySaveStop
 from core.managers.status_manager import (
     status_transitioning_location, status_updating_character, status_updating_party,
     status_updating_plot, status_advancing_time, status_processing_levelup
 )
 from utils.location_path_finder import LocationGraph
-from core.ai.conversation_utils import handle_module_conversation_segmentation
 from utils.enhanced_logger import debug, info, warning, error, set_script_name
+from core.nql.journal import entry_id as journal_entry_id
 
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -157,12 +160,24 @@ ACTION_TRANSITION_LOCATION = "transitionLocation"
 ACTION_LEVEL_UP = "levelUp"
 ACTION_UPDATE_CHARACTER_INFO = "updateCharacterInfo"
 ACTION_REMOVE_EFFECT = "removeEffect"
+ACTION_ROLL_CHECK = "rollCheck"
+ACTION_AWARD_EXPERIENCE = "awardExperience"
 ACTION_UPDATE_PARTY_NPCS = "updatePartyNPCs"
 ACTION_CREATE_NEW_MODULE = "createNewModule"
 ACTION_ESTABLISH_HUB = "establishHub"
 ACTION_STORAGE_INTERACTION = "storageInteraction"
+ACTION_TRANSFER_ITEM = "transferItem"
+ACTION_ACQUIRE_ITEM = "acquireItem"
+ACTION_EXPEND_CHARGES = "expendCharges"
+ACTION_TRANSFER_CURRENCY = "transferCurrency"
+ACTION_SPLIT_CURRENCY = "splitCurrency"
+ACTION_REST = "rest"
 ACTION_UPDATE_PARTY_TRACKER = "updatePartyTracker"
-ACTION_MOVE_BACKGROUND_NPC = "moveBackgroundNPC"
+ACTION_MOVE_BACKGROUND_NPC = "moveBackgroundNPC"  # retired: forwarded to the occupant actions
+ACTION_RESOLVE_OCCUPANT = "resolveOccupant"
+ACTION_SET_OCCUPANT_ATTITUDE = "setOccupantAttitude"
+ACTION_MOVE_OCCUPANT = "moveOccupant"
+ACTION_RETURN_OCCUPANT = "returnOccupant"
 ACTION_SAVE_GAME = "saveGame"
 ACTION_RESTORE_GAME = "restoreGame"
 ACTION_LIST_SAVES = "listSaves"
@@ -191,6 +206,12 @@ class ApprovedTransitionPlan:
     path: tuple
     topology_identity: str
     evidence_identity: str
+    # "engine": the engine's map approved the move (C10b) and travel commits
+    # it; "snapshot": NEQ's own route check did (the engine was unavailable).
+    authority: str = "snapshot"
+    # The engine's trip time in game minutes at SRD normal pace (C11); None
+    # under NEQ's own route check (the DM's estimate stands).
+    travel_minutes: object = None
 
 
 @dataclass(frozen=True)
@@ -277,6 +298,8 @@ def _approved_transition_plan(
     plot_data,
     location_graph,
     topology_identity=None,
+    authority="snapshot",
+    travel_minutes=None,
 ):
     return ApprovedTransitionPlan(
         origin_location_id=str(origin_location_id),
@@ -293,12 +316,96 @@ def _approved_transition_plan(
         evidence_identity=_transition_evidence_identity(
             path_analysis, plot_data
         ),
+        authority=str(authority),
+        travel_minutes=travel_minutes if type(travel_minutes) is int else None,
     )
 
 
 def _write_location_transition_checkpoint(checkpoint):
     """Durably publish the small, non-secret within-module recovery record."""
     safe_json_dump(checkpoint, PENDING_LOCATION_TRANSITION_FILE)
+
+
+def _read_journal_setting_aside(
+    tail, before_rename=None, after_failed_rename=None, after_rename=None
+):
+    """Read journal.json, setting an unreadable one aside (then None).
+
+    The chronicle is play history, not a rule input: an unreadable one
+    must not stop travel (#620, #636). Its bytes are set aside, never
+    overwritten, and the caller goes on as for a missing chronicle
+    (D-620-1, D-636-2); `tail` ends the WARNING. A busy file is waited for
+    and read again (D-303-2); if the set-aside itself is refused, the parse
+    error stands as before. `before_rename` runs just before the rename and
+    `after_failed_rename` first when it fails, so a caller's own record can
+    bracket the rename alone; `after_rename(aside)` runs once it succeeded. A journal that parses but fails its schema
+    counts as unreadable, since every departure would refuse it (#633)."""
+    from utils.transient_filesystem import is_transient_filesystem_error
+    from utils.capture.live_provider_call import (
+        _interruptible_wait, get_live_provider_scope,
+    )
+    from core.ai import adv_summary
+
+    while True:
+        try:
+            journal = safe_json_load("journal.json")
+            failure = None
+            if journal is not None:
+                try:
+                    failure = adv_summary.journal_schema_failure(journal)
+                except adv_summary.DepartureSummaryError:
+                    failure = None  # no schema to judge by: read as before
+            if failure is not None:
+                raise ValueError("does not match its schema: %s" % failure[:200])
+            break
+        except ValueError as exc:
+            aside = "journal.json.unreadable-%s-%s" % (
+                datetime.now().strftime("%Y%m%d-%H%M%S"), uuid4().hex
+            )
+            if before_rename is not None:
+                before_rename()
+            try:
+                os.rename("journal.json", aside)
+            except OSError as rename_exc:
+                if after_failed_rename is not None:
+                    after_failed_rename()
+                if not is_transient_filesystem_error(rename_exc, allow_missing=True):
+                    raise exc from rename_exc
+            else:
+                warning(
+                    "TRAVEL: journal.json unreadable (%s); set aside as %s, "
+                    % (exc, aside) + tail,
+                    category="location_transitions",
+                )
+                if after_rename is not None:
+                    try:
+                        after_rename(aside)
+                    except Exception as note_exc:
+                        warning(
+                            "TRAVEL: could not note the set-aside chronicle for the "
+                            "companion-memory upgrade: %s" % note_exc,
+                            category="location_transitions",
+                        )
+                journal = None
+                break
+        except OSError as exc:
+            if not is_transient_filesystem_error(exc):
+                raise
+        _interruptible_wait(
+            0.25, get_live_provider_scope(), "Reading the chronicle..."
+        )
+    return journal
+
+
+def mark_upgrade_journal_replaced(aside):
+    """Tell an in-progress companion-memory upgrade its chronicle was replaced.
+
+    Passed as `after_rename` only by the callers that start a new chronicle
+    (#653); the departure-marker recovery rebuilds the same one and does not.
+    """
+    from core.npc.episodic_upgrade import mark_journal_replaced
+
+    mark_journal_replaced(aside)
 
 
 def _new_current_transition_checkpoint(
@@ -314,8 +421,17 @@ def _new_current_transition_checkpoint(
     conversation_history,
     deferred_actions,
     origin_party_tracker,
+    path=None,
+    authority="snapshot",
+    travel_minutes=None,
 ):
-    """Build the approved v2 record without content-derived authority."""
+    """Build the approved v2 record without content-derived authority.
+    `path` is the approved route, origin to destination (location ids): the
+    engine's party walks it after the commit (core/nql/travel.py). With
+    authority "engine" the engine approved the move and travels it, so no
+    path is recorded to walk. `travel_minutes` is the engine's approved trip
+    time (C11), kept for the commit's check; the deferred updateTime already
+    carries the applied time (travel.timed_deferred)."""
     operation_id = str(uuid4())
     persisted_history = safe_json_load(
         "modules/conversation_history/conversation_history.json"
@@ -325,14 +441,14 @@ def _new_current_transition_checkpoint(
     segment_start = 0
     for index in range(len(persisted_history) - 1, -1, -1):
         message = persisted_history[index]
-        content = message.get("content", "") if isinstance(message, dict) else ""
-        if isinstance(message, dict) and message.get("role") == "user" and (
-            "Location transition:" in content or "Module transition:" in content
-        ):
+        if hm.is_marker(message, hm.LOCATION_TRANSITION, *hm.MODULE_KINDS):
             segment_start = index + 1
             break
     origin_segment = persisted_history[segment_start:]
-    journal = safe_json_load("journal.json")
+    journal = _read_journal_setting_aside(
+        "and the chronicle starts again from the next recorded departure",
+        after_rename=mark_upgrade_journal_replaced,
+    )
     journal_entries = (
         journal.get("entries", [])
         if isinstance(journal, dict) and isinstance(journal.get("entries"), list)
@@ -349,6 +465,8 @@ def _new_current_transition_checkpoint(
         "time": world.get("time", "N/A"),
         "location": sanitize_text(origin_location_name),
         "summary": None,
+        # J2: the prose is keyed by the engine's departure entry id.
+        "id": journal_entry_id(str(module_name), operation_id, "departure"),
     }
     path_manager = ModulePathManager(str(module_name))
     action_records = []
@@ -456,6 +574,9 @@ def _new_current_transition_checkpoint(
         "destination_location_name": sanitize_text(destination_location_name),
         "destination_area_id": str(destination_area_id),
         "destination_area_name": sanitize_text(destination_area_name),
+        "path": [str(item) for item in (path or ())],
+        "authority": str(authority),
+        "travel_minutes": travel_minutes if type(travel_minutes) is int else None,
         "origin_history_boundary": segment_start,
         "origin_segment_before": json.loads(json.dumps(origin_segment)),
         "departure_summary": {"status": "pending", "text": None, "provider_response_id": None},
@@ -470,7 +591,8 @@ def _new_current_transition_checkpoint(
             "journal_entry_after": staged_journal_entry,
         },
         "location_reconciliation": {
-            "status": "pending",
+            # T091 retired (P4-f): the engine's record is the origin roster.
+            "status": "not_applicable",
             "operation_id": str(uuid4()),
             "area_path": path_manager.get_area_path(str(origin_area_id)),
             "location_id": str(origin_location_id),
@@ -509,6 +631,25 @@ def _new_current_transition_checkpoint(
     }
 
 
+class ModuleNotJoinedError(ValueError):
+    """The destination module is installed but not joined to the world (#720),
+    or the value is not a module id at all (#1287): then the joined ids are
+    returned to the agent, never guessed from the value."""
+
+    def __init__(self, module_name, joined_ids=None):
+        self.module_name = module_name
+        if joined_ids is not None:
+            super().__init__(
+                "module %r is not a module id; the joined module ids are: %s"
+                % (module_name, ", ".join(sorted(joined_ids)))
+            )
+            return
+        super().__init__(
+            "module %s is installed but not joined to this world, so it is "
+            "not a travel destination" % module_name
+        )
+
+
 def resolve_cross_module_target_projection(target_module, parameters):
     """Resolve one represented module destination to canonical IDs and names.
 
@@ -517,8 +658,26 @@ def resolve_cross_module_target_projection(target_module, parameters):
     prose nor silently combines an area from one location with a location from
     another.  Invalid structured references return facts to the agent before
     any checkpoint or gameplay mutation exists.
+
+    The destination must be a joined module (#720): one whose joining was
+    refused, never checked, or blocked keeps only a bare registry stub, and
+    its files on disk are not part of the world.
     """
     parameters = parameters if isinstance(parameters, dict) else {}
+    from core.generators.module_stitcher import ModuleStitcher
+    registry = safe_json_load(os.path.join("modules", "world_registry.json"))
+    if not isinstance(registry, dict) or not isinstance(registry.get("modules"), dict):
+        import errno
+        raise OSError(errno.EIO, "World registry could not be verified")
+    # #1287: the exact folder id only; a display form is refused, never stored.
+    target_module = str(target_module or "")
+    if target_module not in registry["modules"]:
+        raise ModuleNotJoinedError(target_module, joined_ids=[
+            key for key in registry["modules"]
+            if ModuleStitcher.is_joined_registry_module(registry, key)
+        ])
+    if not ModuleStitcher.is_joined_registry_module(registry, target_module):
+        raise ModuleNotJoinedError(target_module)
     from utils.path_encounter_analyzer import build_active_module_snapshot
     snapshot = build_active_module_snapshot(target_module)
     supplied = {
@@ -538,7 +697,7 @@ def resolve_cross_module_target_projection(target_module, parameters):
                 raise OSError(errno.EAGAIN if busy else errno.EIO, "Target module records could not be verified")
             raise ValueError("Target module has no live destination records")
         default_location_id, default_location_name, default_area_id, default_area_name = (
-            get_module_starting_location(target_module)
+            get_module_starting_location(target_module, snapshot=snapshot)
         )
         supplied = {
             "currentAreaId": str(default_area_id),
@@ -624,6 +783,17 @@ def stage_cross_module_root_checkpoint(
     parameters.update(target_values)
     parameters["module"] = target_module
     source_world = party_tracker_data.get("worldConditions") or {}
+    # C12: the switch travels over the join of the two modules; a later
+    # crossing's updateTime takes the engine's floor.
+    from core.nql import travel as _travel
+    crossing = _travel.crossing(
+        source_module,
+        str(source_world.get("currentLocationId") or ""),
+        target_module,
+        target_values["currentLocationId"],
+        clock_action,
+    )
+    clock_action = crossing["clock_action"]
     checkpoint = _new_current_transition_checkpoint(
         module_name=source_module,
         origin_area_id=source_world.get("currentAreaId", ""),
@@ -636,8 +806,14 @@ def stage_cross_module_root_checkpoint(
         conversation_history=conversation_history,
         deferred_actions=[clock_action],
         origin_party_tracker=party_tracker_data,
+        authority="engine" if crossing["join"] is not None else "snapshot",
+        travel_minutes=crossing["minutes"],
     )
     checkpoint["movement_kind"] = "cross_module_root"
+    if crossing["join"] is not None:
+        join = dict(crossing["join"])
+        join["operationId"] = join.get("operationId") or checkpoint["operation_id"]
+        checkpoint["join"] = join
     source_projection = {
         "module": source_module,
         **{
@@ -677,6 +853,49 @@ def stage_cross_module_root_checkpoint(
     return checkpoint
 
 
+_PARTY_NPCS_DROP_WARNED = set()
+
+
+def _drop_stored_party_npcs(checkpoint):
+    """An updatePartyTracker stored before occupant ids may carry partyNPCs,
+    which no writer may replace the roster with now. The key is dropped from
+    the module handoff's parameters, a deferred record's action parameters
+    and a prepared receipt's parameters, in memory only (the loader never
+    writes); the rest of the stored change applies. One WARN per operation
+    id per process, only when a key was removed."""
+    removed = False
+    handoff = checkpoint.get("module_handoff")
+    if isinstance(handoff, dict) and isinstance(handoff.get("parameters"), dict):
+        if "partyNPCs" in handoff["parameters"]:
+            handoff["parameters"].pop("partyNPCs")
+            removed = True
+    deferred = checkpoint.get("deferred_actions")
+    records = deferred.get("actions") if isinstance(deferred, dict) else None
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict):
+            continue
+        action = record.get("action")
+        if record.get("family") == ACTION_UPDATE_PARTY_TRACKER and isinstance(action, dict) \
+                and isinstance(action.get("parameters"), dict) and "partyNPCs" in action["parameters"]:
+            action["parameters"].pop("partyNPCs")
+            removed = True
+        receipt = record.get("receipt")
+        if isinstance(receipt, dict) and receipt.get("kind") == ACTION_UPDATE_PARTY_TRACKER \
+                and isinstance(receipt.get("parameters"), dict) and "partyNPCs" in receipt["parameters"]:
+            receipt["parameters"].pop("partyNPCs")
+            removed = True
+    operation = checkpoint.get("operation_id")
+    if removed and operation not in _PARTY_NPCS_DROP_WARNED:
+        _PARTY_NPCS_DROP_WARNED.add(operation)
+        warning(
+            "TRAVEL: stored updatePartyTracker of %s carries partyNPCs; the key is "
+            "dropped (the roster changes only through updatePartyNPCs) and the rest "
+            "applies" % operation,
+            category="location_transitions",
+        )
+    return checkpoint
+
+
 def load_current_transition_checkpoint(operation_id=None):
     checkpoint = safe_json_load(PENDING_LOCATION_TRANSITION_FILE)
     if not isinstance(checkpoint, dict):
@@ -685,7 +904,7 @@ def load_current_transition_checkpoint(operation_id=None):
         return None
     if operation_id and checkpoint.get("operation_id") != operation_id:
         return None
-    return checkpoint
+    return _drop_stored_party_npcs(checkpoint)
 
 
 def prepare_current_transition_actions(operation_id):
@@ -703,72 +922,192 @@ def prepare_current_transition_actions(operation_id):
             "storageInteraction",
             "updatePartyNPCs",
             "updatePartyTracker",
+            "moveOccupant",
+            "resolveOccupant",
+            "setOccupantAttitude",
+            "returnOccupant",
         } or record.get(
             "receipt"
         ) is not None:
             continue
         parameters = record["action"].get("parameters", {})
-        if family == "updatePlot":
-            from updates.plot_update import prepare_plot_update
+        if family in (
+            "moveOccupant",
+            "resolveOccupant",
+            "setOccupantAttitude",
+            "returnOccupant",
+        ):
+            # P4-g: an escort (moveOccupant to the destination) rides the
+            # travel receipt; any other occupant action is refused here with
+            # its reason and never applied. The travel is never blocked.
+            from core.nql import occupants as _occupants
 
-            receipt = prepare_plot_update(
-                parameters.get("plotPointId"),
-                parameters.get("newStatus"),
-                parameters.get("plotImpact"),
+            receipt = _occupants.prepare_travel_action(
+                family,
+                parameters,
+                "dm:travel:%s:%d:%s" % (operation_id, index, family),
+                str(checkpoint.get("module_name") or ""),
+                str(checkpoint.get("origin_location_id") or ""),
+                str(checkpoint.get("destination_location_id") or ""),
+            )
+            checkpoint = load_current_transition_checkpoint(operation_id)
+            checkpoint["deferred_actions"]["actions"][index]["receipt"] = receipt
+            _write_location_transition_checkpoint(checkpoint)
+            continue
+        if family == "updatePlot":
+            # QS: the quest record is the engine's. The local checks run
+            # before movement; the engine line is sent after arrival. A
+            # refusal is recorded on the receipt and never stops travel.
+            from utils import quest_record as _quest_record
+
+            receipt = _quest_record.prepare_travel_update(
+                parameters,
+                "dm:travel:%s:%d:updatePlot" % (operation_id, index),
+                str(checkpoint.get("module_name") or ""),
             )
             receipt["quest_projection"] = {"status": "pending"}
         elif family == "moveBackgroundNPC":
-            receipt = prepare_background_npc_movement(
-                parameters.get("npcName"),
-                parameters.get("context", ""),
-                parameters.get("currentLocation"),
-                safe_json_load("party_tracker.json"),
-            )
+            # Retired (P4-e): the occupant record is the engine's. A travel
+            # turn carries no roster outcome; the record is applied as a no-op.
+            receipt = {
+                "kind": "moveBackgroundNPC",
+                "retired": True,
+                "npc_name": parameters.get("npcName"),
+                "before": None,
+                "after": None,
+            }
         elif family == "updateCharacterInfo":
-            from core.managers.effects_runtime import prepare_character_update
+            from core.managers.effects_runtime import (
+                CharacterProposalDropped,
+                prepare_character_update,
+            )
+            from updates.update_character_info import EngineRefusedChange
 
             party = safe_json_load("party_tracker.json") or {}
             character_name = (
                 parameters.get("characterName")
                 or parameters.get("npcName")
-                or next(iter(party.get("partyMembers", []) or []), None)
             )
             changes = parameters.get("changes")
             if isinstance(changes, dict):
                 changes = json.dumps(changes)
-            receipt = prepare_character_update(
-                character_name, changes, party
-            )
+            try:
+                if not character_name:
+                    # #914: no named character; dropped like an unworkable
+                    # update, never written to a default character.
+                    raise CharacterProposalDropped("A party member")
+                receipt = prepare_character_update(
+                    character_name, changes, party,
+                    affects=parameters.get("affects"),
+                    casting_resource=parameters.get("castingResource"),
+                )
+            except CharacterProposalDropped as dropped:
+                # #855: no usable proposal within the bounded tries. The
+                # change is dropped, the travel goes on, and the player is
+                # told once after arrival.
+                warning(
+                    "TRAVEL: no usable sheet update for %s; dropped after "
+                    "the bounded tries, travel goes on" % dropped.owner,
+                    category="location_transitions",
+                )
+                receipt = {
+                    "kind": "updateCharacterInfo",
+                    "character_status": "dropped",
+                    "owner": dropped.owner,
+                    "message_id": str(uuid4()),
+                }
+            except EngineRefusedChange as refusal:
+                # #855: the rules engine refused the change. It is dropped,
+                # the travel goes on, and the arrival notice gives the
+                # engine's reason.
+                warning(
+                    "TRAVEL: the rules refused the sheet update for %s; "
+                    "dropped, travel goes on" % character_name,
+                    category="location_transitions",
+                )
+                receipt = {
+                    "kind": "updateCharacterInfo",
+                    "character_status": "dropped",
+                    "owner": character_name,
+                    "reason_code": "engine_refused",
+                    "engine_reason": str(refusal.reason),
+                    "message_id": str(uuid4()),
+                }
         elif family == "storageInteraction":
             from core.managers.storage_processor import process_storage_request
             from core.managers.storage_manager import StorageManager
 
-            party = safe_json_load("party_tracker.json") or {}
-            character_name = parameters.get("characterName") or next(
-                iter(party.get("partyMembers", []) or []), None
-            )
-            if not character_name:
-                raise ValueError("storageInteraction requires a character")
-            description = parameters.get("description")
-            if not isinstance(description, str) or not description.strip():
-                raise ValueError("storageInteraction requires a description")
-            proposal = process_storage_request(
-                description,
-                character_name,
-                structural_reissue=True,
-            )
-            if not proposal.get("success"):
-                raise RuntimeError("required storage proposal was not accepted")
-            receipt = StorageManager(
-                ensure_storage=False
-            ).prepare_staged_operation(
-                proposal["operation"], record["operation_id"]
-            )
-            receipt["message_id"] = str(uuid4())
+            # Never a default character (#959).
+            character_name = parameters.get("characterName")
+            try:
+                if not character_name:
+                    raise ValueError("storageInteraction requires a character")
+                description = parameters.get("description")
+                if not isinstance(description, str) or not description.strip():
+                    raise ValueError("storageInteraction requires a description")
+                proposal = process_storage_request(
+                    description,
+                    character_name,
+                    structural_reissue=True,
+                )
+                if not proposal.get("success"):
+                    raise RuntimeError("required storage proposal was not accepted")
+                receipt = StorageManager(
+                    ensure_storage=False
+                ).prepare_staged_operation(
+                    proposal["operation"], record["operation_id"]
+                )
+                receipt["message_id"] = str(uuid4())
+            except _TRAVEL_PREPARE_PASSTHROUGH:
+                raise
+            except (ValueError, RuntimeError) as exc:
+                # #855: dropped like a sheet update; the travel goes on.
+                owner = character_name or "Your character"
+                warning(
+                    "TRAVEL: no usable storage change for %s; dropped after "
+                    "the bounded tries, travel goes on (%s: %s)"
+                    % (owner, type(exc).__name__, exc),
+                    category="location_transitions",
+                )
+                receipt = {
+                    "kind": "storageInteraction",
+                    "storage_status": "dropped",
+                    "owner": owner,
+                    "message_id": str(uuid4()),
+                }
         elif family == "updatePartyNPCs":
-            receipt = prepare_party_npc_update(
-                parameters, record["operation_id"]
-            )
+            try:
+                receipt = prepare_party_npc_update(
+                    parameters, record["operation_id"]
+                )
+            except _TRAVEL_PREPARE_PASSTHROUGH:
+                raise
+            except (ValueError, RuntimeError) as exc:
+                # #855: a party change that cannot be prepared (no sheet
+                # could be made, or a malformed request) is dropped and the
+                # travel goes on. A failed add is told on arrival.
+                npc = parameters.get("npc")
+                npc_name = npc.get("name") if isinstance(npc, dict) else None
+                owner = (
+                    npc_name.strip()
+                    if isinstance(npc_name, str) and npc_name.strip()
+                    else None
+                )
+                warning(
+                    "TRAVEL: no usable party change for %s; dropped, travel "
+                    "goes on (%s: %s)"
+                    % (owner or "an unnamed NPC", type(exc).__name__, exc),
+                    category="location_transitions",
+                )
+                receipt = {
+                    "kind": "updatePartyNPCs",
+                    "npc_status": "dropped",
+                    "operation": parameters.get("operation"),
+                    "owner": owner,
+                    "message_id": str(uuid4()),
+                }
+                if isinstance(exc, PartyChangeUnplanned):
+                    receipt["npc_drop"] = "unplanned"
         else:
             source_module = str(checkpoint.get("module_name") or "")
             target_module = str(parameters.get("module") or "")
@@ -832,49 +1171,92 @@ def update_current_transition_checkpoint(operation_id, **changes):
 
 
 def resolve_current_transition_reconciliation(operation_id, transition_context):
-    """Resolve advisory T091 and durably receipt its exact owned values."""
+    """The origin roster is the engine's record (P4-f); T091 is retired. The
+    receipt is kept for old checkpoints: a pending one resolves as not
+    applicable, a committed one stays as it is."""
     checkpoint = load_current_transition_checkpoint(operation_id)
     if checkpoint is None:
         raise RuntimeError("current transition checkpoint is unavailable")
     receipt = checkpoint["location_reconciliation"]
-    if receipt.get("status") in {"committed", "attempted_unavailable"}:
+    if receipt.get("status") in {"committed", "attempted_unavailable", "not_applicable"}:
         return receipt["status"]
-
-    from utils import reconcile_location_state
-    from utils.capture.live_provider_call import LiveProviderUnavailable
-
-    try:
-        proposal = reconcile_location_state.prepare_reconciliation(
-            checkpoint["origin_area_id"],
-            checkpoint["origin_location_id"],
-            transition_context["origin_history_segment"],
-        )
-    except LiveProviderUnavailable:
-        receipt["status"] = "attempted_unavailable"
-        _write_location_transition_checkpoint(checkpoint)
-        return receipt["status"]
-    receipt.update(
-        {
-            "status": "pending",
-            "area_path": proposal["area_path"],
-            "location_id": proposal["location_id"],
-            "monsters_before": proposal["monsters_before"],
-            "monsters_after": proposal["monsters_after"],
-        }
-    )
-    _write_location_transition_checkpoint(checkpoint)
-    outcome = reconcile_location_state.apply_reconciliation(receipt)
-    receipt["status"] = (
-        "committed" if outcome in {"committed", "already_committed"}
-        else "blocked_conflict"
-    )
-    checkpoint["phase"] = (
-        "reconciliation_resolved"
-        if receipt["status"] == "committed"
-        else "blocked_conflict"
-    )
+    receipt["status"] = "not_applicable"
+    checkpoint["phase"] = "reconciliation_resolved"
     _write_location_transition_checkpoint(checkpoint)
     return receipt["status"]
+
+
+def _departure_projection_status(action_record):
+    """The workflow_status T016 sees for one deferred action (#686).
+
+    A character update the engine has already staged (its typed receipt is
+    in the record, applied on arrival) is the outcome of an action taken at
+    the place being left, e.g. the item a scored check found (#594), so it
+    is shown as staged_on_arrival. Everything else keeps the record's own
+    status. The checkpoint record itself is never changed.
+    """
+    status = str(action_record.get("status") or "pending")
+    receipt = action_record.get("receipt")
+    if isinstance(receipt, dict) and "dropped" in (
+        receipt.get("character_status"),
+        receipt.get("storage_status"),
+        receipt.get("npc_status"),
+    ):
+        # #855: dropped before movement; it is never applied on arrival.
+        return "dropped"
+    if (
+        status == "pending"
+        and isinstance(receipt, dict)
+        and receipt.get("kind") == "updateCharacterInfo"
+        and receipt.get("status") == "staged"
+    ):
+        return "staged_on_arrival"
+    return status
+
+
+def _commit_departure_journal_only(
+    checkpoint, summary_record, commit_record, journal_data, area_detail
+):
+    """Commit a departure whose area is left as it is (#1072, D-1072-1).
+
+    The skip is recorded in the checkpoint before the journal is written, so a
+    retry after a crash takes this path again even if the area reads cleanly
+    by then; the entry at its staged index marks the commit done.
+    """
+    if not isinstance(journal_data, dict) or not isinstance(
+        journal_data.get("entries"), list
+    ):
+        raise RuntimeError("journal is unavailable during departure commit")
+    if not commit_record.get("area_skipped"):
+        warning(
+            "FALLBACK: departure area left as it is for %s: %s; the journal "
+            "records the departure" % (checkpoint["origin_location_id"], area_detail),
+            category="location_transitions",
+        )
+        commit_record["area_skipped"] = area_detail
+        _write_location_transition_checkpoint(checkpoint)
+    journal_index = commit_record["journal_entry_index"]
+    entries = journal_data["entries"]
+    if not (
+        journal_index < len(entries)
+        and entries[journal_index] == commit_record["journal_entry_after"]
+    ):
+        if len(entries) != journal_index:
+            commit_record["status"] = "blocked_conflict"
+            checkpoint["phase"] = "blocked_conflict"
+            _write_location_transition_checkpoint(checkpoint)
+            raise RuntimeError("departure journal changed outside the staged operation")
+        from core.ai import adv_summary
+
+        journal_after = copy.deepcopy(journal_data)
+        journal_after["entries"].append(
+            copy.deepcopy(commit_record["journal_entry_after"])
+        )
+        adv_summary.commit_departure_journal(journal_after)
+    commit_record["status"] = "committed"
+    checkpoint["phase"] = "departure_committed"
+    _write_location_transition_checkpoint(checkpoint)
+    return summary_record["text"]
 
 
 def resolve_current_transition_departure(operation_id, transition_context):
@@ -888,6 +1270,47 @@ def resolve_current_transition_departure(operation_id, transition_context):
         return summary_record.get("text")
 
     from core.ai import adv_summary
+
+    # An interrupted commit's marker is resolved first, from its own
+    # snapshots, before anything here reads the area or the journal (#636,
+    # D-636-11). An unreadable journal under it is set aside and rebuilt
+    # from the marker (D-636-10).
+    try:
+        os.stat(adv_summary.PENDING_DEPARTURE_SUMMARY_FILE)
+    except OSError:
+        pass
+    else:
+        adv_summary.resolve_prior_departure_summary(
+            lambda: _read_journal_setting_aside(
+                "and the chronicle is rebuilt from the interrupted commit's record"
+            )
+        )
+
+    # An unreadable chronicle must not stop the departure from finishing
+    # (#636, D-636-2): it is set aside and the staged entry becomes entry 0
+    # of a fresh one. The index is rebased just before the rename and put
+    # back at once if the rename fails. While a departure-summary marker
+    # exists, or cannot be checked, the journal is left as it is (D-636-5).
+    try:
+        os.stat(adv_summary.PENDING_DEPARTURE_SUMMARY_FILE)
+    except FileNotFoundError:
+        staged_index = commit_record["journal_entry_index"]
+
+        def rebase(index):
+            if commit_record["journal_entry_index"] != index:
+                commit_record["journal_entry_index"] = index
+                _write_location_transition_checkpoint(checkpoint)
+
+        _read_journal_setting_aside(
+            "and the chronicle starts again with the interrupted departure "
+            "from %s (its entry, staged at index %s, is now entry 0)"
+            % (commit_record["journal_entry_after"].get("location"), staged_index),
+            before_rename=lambda: rebase(0),
+            after_failed_rename=lambda: rebase(staged_index),
+            after_rename=mark_upgrade_journal_replaced,
+        )
+    except OSError:
+        pass
 
     if summary_record.get("status") != "accepted":
         action_projection = [
@@ -903,8 +1326,8 @@ def resolve_current_transition_departure(operation_id, transition_context):
             projected_action = copy.deepcopy(action_record.get("action"))
             if not isinstance(projected_action, dict):
                 continue
-            projected_action["workflow_status"] = str(
-                action_record.get("status") or "pending"
+            projected_action["workflow_status"] = _departure_projection_status(
+                action_record
             )
             action_projection.append(projected_action)
         proposal = adv_summary.prepare_departure_summary(
@@ -914,12 +1337,7 @@ def resolve_current_transition_departure(operation_id, transition_context):
             checkpoint["origin_area_id"],
             checkpoint["origin_location_id"],
             structured_actions=action_projection,
-        )
-        area_before = proposal["area_before"]
-        location_index = next(
-            index
-            for index, location in enumerate(area_before["locations"])
-            if location.get("locationId") == checkpoint["origin_location_id"]
+            destination_location_name=checkpoint.get("destination_location_name"),
         )
         summary_record.update(
             {
@@ -932,27 +1350,56 @@ def resolve_current_transition_departure(operation_id, transition_context):
             commit_record["journal_entry_after"]
         )
         staged_journal_entry["summary"] = proposal["summary"]
-        commit_record.update(
-            {
-                "status": "staged",
-                "area_path": proposal["area_path"],
-                "area_owned_before": copy.deepcopy(
-                    proposal["area_before"]["locations"][location_index]
-                ),
-                "area_owned_after": copy.deepcopy(
-                    proposal["area_after"]["locations"][location_index]
-                ),
-                "journal_entry_after": staged_journal_entry,
-            }
-        )
+        if proposal["area_before"] is None:
+            # #1072: the area could not be read strictly; only the journal
+            # entry is committed and the area is left as it is.
+            commit_record.update(
+                {
+                    "status": "staged",
+                    "area_path": proposal["area_path"],
+                    "area_skipped": proposal["area_unreadable"],
+                    "journal_entry_after": staged_journal_entry,
+                }
+            )
+        else:
+            area_before = proposal["area_before"]
+            location_index = next(
+                index
+                for index, location in enumerate(area_before["locations"])
+                if location.get("locationId") == checkpoint["origin_location_id"]
+            )
+            commit_record.update(
+                {
+                    "status": "staged",
+                    "area_path": proposal["area_path"],
+                    "area_owned_before": copy.deepcopy(
+                        proposal["area_before"]["locations"][location_index]
+                    ),
+                    "area_owned_after": copy.deepcopy(
+                        proposal["area_after"]["locations"][location_index]
+                    ),
+                    "journal_entry_after": staged_journal_entry,
+                }
+            )
         checkpoint["phase"] = "departure_pending"
         _write_location_transition_checkpoint(checkpoint)
 
-    area_data = safe_json_load(commit_record["area_path"])
+    area_status, area_data, area_detail = adv_summary.read_departure_area(
+        transition_context["origin_party_tracker"],
+        commit_record["area_path"],
+        checkpoint["origin_area_id"],
+        checkpoint["origin_location_id"],
+    )
+    if area_status not in (adv_summary.OK, adv_summary.UNREADABLE):
+        area_data = safe_json_load(commit_record["area_path"])
     journal_exists = os.path.exists("journal.json")
     journal_data = safe_json_load("journal.json")
     if not journal_exists and journal_data is None:
         journal_data = {"entries": []}
+    if area_status == adv_summary.UNREADABLE or commit_record.get("area_skipped"):
+        return _commit_departure_journal_only(
+            checkpoint, summary_record, commit_record, journal_data, area_detail
+        )
     if not isinstance(area_data, dict) or not isinstance(
         area_data.get("locations"), list
     ):
@@ -1129,32 +1576,92 @@ def apply_current_transition_action(operation_id, action_index):
         return "committed"
     family = record.get("family")
     receipt = record.get("receipt")
+    if family in (
+        "moveOccupant",
+        "resolveOccupant",
+        "setOccupantAttitude",
+        "returnOccupant",
+    ):
+        # P4-g: the occupant record is the engine's; the staged escort is
+        # applied by its request id (a replay is answered as historical). A
+        # refusal or an unavailable engine is recorded and the arrival goes
+        # on. A checkpoint from before P4-g (no receipt) resolves as not
+        # applicable.
+        from core.nql import occupants as _occupants
+
+        if not isinstance(receipt, dict):
+            outcome = "not_applicable"
+            record["receipt"] = {"kind": family, "status": outcome}
+        else:
+            outcome = _occupants.apply_travel_receipt(
+                receipt, str(checkpoint.get("module_name") or "")
+            )
+        record["status"] = "committed"
+        deferred["cursor"] = action_index + 1
+        deferred["receipts"].append(
+            {
+                "operation_id": record["operation_id"],
+                "kind": family,
+                "status": "committed",
+                "occupant_status": outcome,
+            }
+        )
+        if deferred["cursor"] >= len(records):
+            deferred["status"] = "committed"
+        _write_location_transition_checkpoint(checkpoint)
+        return "committed"
     if not isinstance(receipt, dict):
         raise RuntimeError(
             "deferred action family %s has no approved v2 receipt" % family
         )
 
     from core.managers.campaign_manager import _party_module_transition_lock
-    from updates.update_world_time import apply_staged_world_time
 
     if family == "updatePlot":
-        from updates.plot_update import apply_staged_plot_update
+        # QS: the quest record is the engine's. The prepared line is sent
+        # by its travel request id (a replay is historical); a refusal or an
+        # unavailable engine is recorded and the arrival goes on. T090's
+        # journal steps run only after a committed change. A checkpoint from
+        # before the switch (a T077 receipt: target_id, before, after) is
+        # mapped to the same line first.
+        from utils import quest_record as _quest_record
         from utils.quest_player_formatter import (
             apply_staged_player_quests,
             prepare_player_quests,
             refresh_staged_player_quest_source,
         )
 
-        if receipt.get("status") != "plot_committed":
-            with _party_module_transition_lock():
-                outcome = apply_staged_plot_update(receipt)
-                if outcome == "blocked_conflict":
-                    record["status"] = "blocked_conflict"
-                    checkpoint["phase"] = "blocked_conflict"
-                    _write_location_transition_checkpoint(checkpoint)
-                    return outcome
-                receipt["status"] = "plot_committed"
-                _write_location_transition_checkpoint(checkpoint)
+        if receipt.get("kind") != "updatePlot" or "line" not in receipt:
+            legacy_projection = receipt.get("quest_projection") or {"status": "pending"}
+            receipt = _quest_record.receipt_from_legacy(
+                receipt, "dm:travel:%s:%d:updatePlot" % (operation_id, action_index)
+            )
+            receipt["quest_projection"] = legacy_projection
+            record["receipt"] = receipt
+            _write_location_transition_checkpoint(checkpoint)
+        if receipt.get("quest_status") == "prepared":
+            quest_outcome = _quest_record.apply_travel_receipt(receipt)
+            _write_location_transition_checkpoint(checkpoint)
+        else:
+            # refused before movement, or already committed / attempted on
+            # a resumed checkpoint (the checkpoint owns receipt["status"])
+            quest_outcome = str(receipt.get("quest_status") or "refused")
+        if quest_outcome != "committed":
+            record["status"] = "committed"
+            deferred = checkpoint["deferred_actions"]
+            deferred["cursor"] = action_index + 1
+            deferred["receipts"].append(
+                {
+                    "operation_id": record["operation_id"],
+                    "kind": family,
+                    "status": "committed",
+                    "quest_status": quest_outcome,
+                }
+            )
+            if deferred["cursor"] >= len(deferred["actions"]):
+                deferred["status"] = "committed"
+            _write_location_transition_checkpoint(checkpoint)
+            return "committed"
 
         checkpoint = load_current_transition_checkpoint(operation_id)
         record = checkpoint["deferred_actions"]["actions"][action_index]
@@ -1275,15 +1782,22 @@ def apply_current_transition_action(operation_id, action_index):
         return "committed"
 
     if family == "moveBackgroundNPC":
-        if receipt.get("before") is None:
-            materialize_staged_background_npc_movement(receipt)
-            _write_location_transition_checkpoint(checkpoint)
-        outcome = apply_staged_background_npc_movement(receipt)
-        if outcome == "blocked_conflict":
-            record["status"] = "blocked_conflict"
-            checkpoint["phase"] = "blocked_conflict"
-            _write_location_transition_checkpoint(checkpoint)
-            return outcome
+        # Retired (P4-e). A receipt materialized before the retirement (an
+        # in-flight checkpoint) still applies its frozen area value; any other
+        # is a no-op, so an old checkpoint never blocks the arrival.
+        if receipt.get("after") is not None:
+            outcome = apply_staged_background_npc_movement(receipt)
+            if outcome == "blocked_conflict":
+                record["status"] = "blocked_conflict"
+                checkpoint["phase"] = "blocked_conflict"
+                _write_location_transition_checkpoint(checkpoint)
+                return outcome
+        else:
+            info(
+                "moveBackgroundNPC for %s in a travel turn is retired; nothing applied"
+                % receipt.get("npc_name"),
+                category="npc_management",
+            )
         record["status"] = "committed"
         deferred["cursor"] = action_index + 1
         deferred["receipts"].append(
@@ -1371,7 +1885,8 @@ def apply_current_transition_action(operation_id, action_index):
     if family == "updateCharacterInfo":
         from core.managers.effects_runtime import apply_staged_character_update
 
-        outcome = apply_staged_character_update(receipt)
+        dropped = receipt.get("character_status") == "dropped"
+        outcome = None if dropped else apply_staged_character_update(receipt)
         if outcome == "blocked_conflict":
             record["status"] = "blocked_conflict"
             checkpoint["phase"] = "blocked_conflict"
@@ -1386,23 +1901,37 @@ def apply_current_transition_action(operation_id, action_index):
                 "status": "committed",
             }
         )
+        if dropped:
+            deferred["receipts"][-1]["character_status"] = "dropped"
         if deferred["cursor"] >= len(records):
             deferred["status"] = "committed"
         _write_location_transition_checkpoint(checkpoint)
+        if dropped:
+            # After the checkpoint write: shown at most once, never again
+            # on a resume (the cursor is past this record).
+            if receipt.get("reason_code") == "engine_refused":
+                notice = _DROPPED_SHEET_RULES_NOTICE % (
+                    receipt["owner"], receipt.get("engine_reason") or "no reason given"
+                )
+            else:
+                notice = _DROPPED_SHEET_NOTICE % receipt["owner"]
+            _show_transition_notice(receipt["message_id"], notice)
         return "committed"
 
     if family == "storageInteraction":
         from core.managers.storage_manager import StorageManager
 
-        outcome = StorageManager.apply_staged_operation(receipt)
-        if outcome == "blocked_conflict":
-            record["status"] = "blocked_conflict"
-            checkpoint["phase"] = "blocked_conflict"
-            _write_location_transition_checkpoint(checkpoint)
-            return outcome
-        _publish_stable_transition_message(
-            receipt["message_id"], "Storage: %s" % receipt["message"]
-        )
+        dropped = receipt.get("storage_status") == "dropped"
+        if not dropped:
+            outcome = StorageManager.apply_staged_operation(receipt)
+            if outcome == "blocked_conflict":
+                record["status"] = "blocked_conflict"
+                checkpoint["phase"] = "blocked_conflict"
+                _write_location_transition_checkpoint(checkpoint)
+                return outcome
+            _publish_stable_transition_message(
+                receipt["message_id"], "Storage: %s" % receipt["message"]
+            )
         record["status"] = "committed"
         deferred["cursor"] = action_index + 1
         deferred["receipts"].append(
@@ -1412,13 +1941,75 @@ def apply_current_transition_action(operation_id, action_index):
                 "status": "committed",
             }
         )
+        if dropped:
+            deferred["receipts"][-1]["storage_status"] = "dropped"
         if deferred["cursor"] >= len(records):
             deferred["status"] = "committed"
         _write_location_transition_checkpoint(checkpoint)
+        if dropped:
+            _show_transition_notice(
+                receipt["message_id"], _DROPPED_STORAGE_NOTICE % receipt["owner"]
+            )
         return "committed"
 
     if family == "updatePartyNPCs":
         party = safe_json_load("party_tracker.json")
+        if receipt.get("npc_status") != "dropped" and "outcome_kind" not in receipt:
+            # A receipt staged before occupant ids: adapted through the
+            # planner at the commit location and written back before the
+            # compare-and-swap, so a resume finds the same adapted receipt.
+            if not isinstance(party, dict) or not isinstance(
+                party.get("partyNPCs"), list
+            ):
+                raise RuntimeError("party roster is unavailable")
+            try:
+                adapted = _adapt_party_receipt(
+                    receipt, party, action_index, checkpoint.get("operation_id")
+                )
+            except _TRAVEL_PREPARE_PASSTHROUGH:
+                raise
+            except (ValueError, RuntimeError) as exc:
+                warning(
+                    "TRAVEL: no usable party change for %s; dropped (%s: %s)"
+                    % (receipt.get("npc_name") or "an unnamed NPC", type(exc).__name__, exc),
+                    category="location_transitions",
+                )
+                adapted = None
+            if not adapted:
+                receipt.update(
+                    {
+                        "npc_status": "dropped",
+                        "owner": receipt.get("npc_name"),
+                        "message_id": str(uuid4()),
+                    }
+                )
+                if adapted is False:
+                    receipt["npc_drop"] = "unplanned"
+            _write_location_transition_checkpoint(checkpoint)
+        if receipt.get("npc_status") == "dropped":
+            # #855: dropped before movement; the roster is not touched.
+            record["status"] = "committed"
+            deferred["cursor"] = action_index + 1
+            deferred["receipts"].append(
+                {
+                    "operation_id": record["operation_id"],
+                    "kind": family,
+                    "status": "committed",
+                    "npc_status": "dropped",
+                }
+            )
+            if deferred["cursor"] >= len(records):
+                deferred["status"] = "committed"
+            _write_location_transition_checkpoint(checkpoint)
+            if receipt.get("owner") and receipt.get("operation") in ("add", "remove"):
+                if receipt.get("operation") == "remove":
+                    notice = _DROPPED_NPC_LEAVE_NOTICE
+                elif receipt.get("npc_drop") == "unplanned":
+                    notice = _UNPLANNED_NPC_NOTICE
+                else:
+                    notice = _DROPPED_NPC_NOTICE
+                _show_transition_notice(receipt["message_id"], notice % receipt["owner"])
+            return "committed"
         if not isinstance(party, dict) or not isinstance(
             party.get("partyNPCs"), list
         ):
@@ -1434,6 +2025,17 @@ def apply_current_transition_action(operation_id, action_index):
                     outcome = "committed"
         elif party["partyNPCs"] == receipt["roster_after"]:
             outcome = "committed"
+        elif "legacy_roster_after" in receipt and party["partyNPCs"] == receipt["legacy_roster_after"]:
+            # The code before occupant ids already wrote its roster: the
+            # adapted roster (the row with its id) replaces it.
+            with _party_module_transition_lock():
+                latest = safe_json_load("party_tracker.json")
+                if latest.get("partyNPCs") != receipt["legacy_roster_after"]:
+                    outcome = "blocked_conflict"
+                else:
+                    latest["partyNPCs"] = copy.deepcopy(receipt["roster_after"])
+                    safe_json_dump(latest, "party_tracker.json")
+                    outcome = "committed"
         else:
             outcome = "blocked_conflict"
         if outcome == "blocked_conflict":
@@ -1443,16 +2045,50 @@ def apply_current_transition_action(operation_id, action_index):
             return outcome
         receipt["phase"] = "roster_committed"
         _write_location_transition_checkpoint(checkpoint)
-        lifecycle_ok = _apply_party_npc_lifecycle(
-            safe_json_load("party_tracker.json") or party,
-            receipt["operation"],
-            receipt["npc_name"],
-            receipt["npc_path"],
-            receipt.get("lifecycle_context"),
-            receipt["operation_id"],
+        kind = receipt.get("outcome_kind")
+        if kind == "noop":
+            receipt["lifecycle_status"] = "not_applicable"
+        else:
+            lifecycle_ok = _apply_party_npc_lifecycle(
+                safe_json_load("party_tracker.json") or party,
+                "remove" if kind == "leave" else "add",
+                receipt["npc_name"],
+                receipt["npc_path"],
+                receipt.get("lifecycle_context"),
+                receipt["operation_id"],
+                seed_profile=kind in ("join", "join_new"),
+            )
+            receipt["lifecycle_status"] = (
+                "committed" if lifecycle_ok else "attempted_unavailable"
+            )
+        # The companion's occupant follows the roster (P4-e); best effort.
+        # The lines are built again at the commit location from the
+        # receipt's frozen fields (never the live roster, already written).
+        from core.nql import occupants as _occupants
+
+        _lc_party = safe_json_load("party_tracker.json") or party
+        _lc_module = str(_lc_party.get("module") or "")
+        _lc_location = str((_lc_party.get("worldConditions") or {}).get("currentLocationId") or "")
+        _lc_context = receipt.get("lifecycle_context")
+        _commit = plan_party_change(
+            receipt["roster_before"],
+            {
+                "operation": receipt.get("operation"),
+                "occupantId": receipt.get("occupant_id"),
+                "npc": {"name": receipt.get("npc_name")},
+                "lifecycleContext": _lc_context,
+            },
+            _occupants.party_world(_lc_module, _lc_location, create=False),
+            turn_roster=receipt["roster_before"],
+            module=_lc_module,
+            location=_lc_location,
+            request_id="dm:%s:party" % receipt["operation_id"],
+            frozen_kind=kind,
         )
-        receipt["lifecycle_status"] = (
-            "committed" if lifecycle_ok else "attempted_unavailable"
+        _occupants.party_change(
+            _commit["engine_lines"],
+            _commit["request_id"],
+            reason=_commit.get("reason"),
         )
         receipt["phase"] = "lifecycle_resolved"
         record["status"] = "committed"
@@ -1493,14 +2129,14 @@ def apply_current_transition_action(operation_id, action_index):
         history = safe_json_load(
             "modules/conversation_history/conversation_history.json"
         ) or []
-        marker = {
-            "role": "user",
-            "content": "Module transition: %s to %s"
-            % (source["module"], target["module"]),
-        }
+        marker = hm.marker(
+            "user",
+            "Module transition: %s to %s" % (source["module"], target["module"]),
+            hm.MODULE_TRANSITION,
+        )
         if current == source:
             transition_history = list(history)
-            if not transition_history or transition_history[-1] != marker:
+            if not transition_history or not hm.same_message(transition_history[-1], marker):
                 transition_history.append(marker)
             original, updated = CampaignManager().publish_party_module_transition(
                 source["module"],
@@ -1559,12 +2195,11 @@ def apply_current_transition_action(operation_id, action_index):
         )
 
     with _party_module_transition_lock():
-        outcome = apply_staged_world_time(receipt["before"], receipt["after"])
-        if outcome == "blocked_conflict":
-            record["status"] = "blocked_conflict"
-            checkpoint["phase"] = "blocked_conflict"
-            _write_location_transition_checkpoint(checkpoint)
-            return outcome
+        # #1420: the trip's arrival was committed when the engine trip
+        # committed (commit_current_transition_arrival); the staged time is
+        # reconciled to it and nothing is sent again.
+        if type(receipt.get("arrivedTick")) is not int:
+            _apply_staged_travel_time(checkpoint, record, receipt)
         record["status"] = "committed"
         deferred["cursor"] = action_index + 1
         deferred["receipts"].append(
@@ -1578,6 +2213,64 @@ def apply_current_transition_action(operation_id, action_index):
             deferred["status"] = "committed"
         _write_location_transition_checkpoint(checkpoint)
     return "committed"
+
+
+def _apply_staged_travel_time(checkpoint, record, receipt):
+    """D4: the clock reaches the approved arrival through the engine (its
+    trip ticks count toward it); the id makes a resume historical. The
+    tracker follows the document and never moves backwards. #1420: the
+    receipt keeps the clock at this commit, before any later sibling moves
+    it; the travel narration states the trip from `before` to here."""
+    from core.nql import game_clock
+
+    game_clock.apply_staged(
+        receipt,
+        "travel:%s:time" % record["operation_id"],
+        arrival=journal_entry_id(
+            str(checkpoint.get("module_name") or ""),
+            str(checkpoint.get("operation_id") or ""),
+            "arrival",
+        ),
+    )
+    arrived = game_clock.clock_tick()
+    if arrived is not None:
+        receipt["arrivedTick"] = arrived
+    return arrived
+
+
+def commit_current_transition_arrival(operation_id):
+    """#1420: one committed arrival per trip, right after the engine trip
+    commits and before any narration. The turn's first updateTime (the
+    travel-owned one) is applied by its own request id and the clock then
+    recorded on its receipt as `arrivedTick`, written once; the deferred
+    loop later marks it committed without sending it again. Reloads the
+    checkpoint under the transition lock (realign runs outside it). Returns
+    the arrival tick, or None when the trip has no travel updateTime."""
+    from core.managers.campaign_manager import _party_module_transition_lock
+
+    with _party_module_transition_lock():
+        checkpoint = load_current_transition_checkpoint(operation_id)
+        if checkpoint is None:
+            return None
+        deferred = checkpoint.get("deferred_actions")
+        records = deferred.get("actions") if isinstance(deferred, dict) else None
+        record = next(
+            (
+                item
+                for item in (records if isinstance(records, list) else [])
+                if isinstance(item, dict) and item.get("family") == "updateTime"
+            ),
+            None,
+        )
+        receipt = record.get("receipt") if record is not None else None
+        if not isinstance(receipt, dict):
+            return None
+        if type(receipt.get("arrivedTick")) is int or record.get("status") == "committed":
+            arrived = receipt.get("arrivedTick")
+            return arrived if type(arrived) is int else None
+        arrived = _apply_staged_travel_time(checkpoint, record, receipt)
+        _write_location_transition_checkpoint(checkpoint)
+        return arrived
 
 
 def recover_pending_location_transition(party_tracker_data, conversation_history):
@@ -1767,7 +2460,7 @@ def recover_pending_location_transition(party_tracker_data, conversation_history
         None,
     )
     if marker_index is None:
-        conversation_history.append({"role": "user", "content": marker})
+        conversation_history.append(hm.marker("user", marker, hm.LOCATION_TRANSITION))
         marker_index = len(conversation_history) - 1
 
     # A saved assistant message after our exact marker proves T013 completed.
@@ -1995,7 +2688,145 @@ def pre_validate_transition(
         transition_atlas = ""
 
         # Load plot data
-        plot_data = safe_read_json(path_manager.get_plot_path()) or {}
+        from utils import quest_record as _quest_record
+
+        plot_data = _quest_record.module_plot(current_module) or {}
+
+        # C10b: the engine's map leads the in-module move (Q5 rule A: the
+        # party stops at every place it has not visited, and passes visited
+        # places freely unless a hostile is present). With no engine answer
+        # the route check below stays NEQ's own (T021).
+        from core.nql import travel as _travel
+
+        engine = _travel.engine_route(
+            current_module, current_location_id, new_location_id, path
+        )
+        if engine is not None:
+            nodes = snapshot.get("nodes", {})
+
+            def place_name(location_id):
+                return (nodes.get(location_id) or {}).get(
+                    "location_name", location_id
+                )
+
+            verdict = engine["verdict"]
+            info(
+                "TRAVEL: engine route %s -> %s: %s"
+                % (current_location_id, new_location_id, verdict),
+                category="transition_validation",
+            )
+            if verdict == "halt":
+                stop = engine["stop"]
+                stop_name = place_name(stop)
+                # #1351: who holds the stop is DM-only (occupants carry no
+                # disclosure flag); the encounter flow reveals it, not travel.
+                reason = "the party stops at %s on the way first" % stop_name
+                return finish(
+                    False,
+                    "[TRAVEL SYSTEM] Travel stops early: %s. Transition only to "
+                    "%s (%s) this turn." % (reason, stop, stop_name),
+                    reason_code="intermediate_stop",
+                    facts={
+                        "original_destination_id": str(new_location_id),
+                        "stop_location_id": str(stop),
+                        "stop_location_name": str(stop_name),
+                        "reason": reason,
+                        "stop_reason": "hostile_presence",
+                        "authority": "engine",
+                    },
+                    intermediate_destination_id=stop,
+                    intermediate_destination_name=stop_name,
+                )
+            if verdict == "unvisited_stop":
+                stop = engine.get("stop")
+                fresh = [
+                    {"id": loc, "name": place_name(loc)}
+                    for loc in engine.get("fresh") or []
+                ]
+                if stop is None and not fresh:
+                    return finish(
+                        False,
+                        "No route reaches that place from here through places "
+                        "the party can travel now.",
+                        reason_code="no_valid_route",
+                        facts={
+                            "requested_destination_id": str(new_location_id),
+                            "route_reason": "no reachable place on the way",
+                            "must_not_move": True,
+                            "authority": "engine",
+                        },
+                    )
+                stop_name = place_name(stop) if stop else ""
+                reason = (
+                    "the way to %s crosses places the party has not visited; "
+                    "the party stops at each one first"
+                    % place_name(new_location_id)
+                )
+                return finish(
+                    False,
+                    "[TRAVEL SYSTEM] Travel stops early: %s." % reason,
+                    reason_code="unvisited_stop",
+                    facts={
+                        "original_destination_id": str(new_location_id),
+                        "stop_location_id": str(stop or ""),
+                        "stop_location_name": str(stop_name),
+                        "reachable_unvisited": fresh,
+                        "reason": reason,
+                        "authority": "engine",
+                    },
+                    intermediate_destination_id=stop or "",
+                    intermediate_destination_name=stop_name,
+                )
+            plan = _approved_transition_plan(
+                origin_location_id=current_location_id,
+                destination_location_id=new_location_id,
+                module_name=current_module,
+                path=path,
+                path_analysis=path_analysis,
+                plot_data=plot_data,
+                location_graph=location_graph,
+                topology_identity=snapshot.get("topology_identity")
+                or snapshot.get("snapshot_hash"),
+                authority="engine",
+                travel_minutes=engine.get("minutes"),
+            )
+            travel_minutes = plan.travel_minutes
+            return finish(
+                True,
+                "",
+                plan,
+                reason_code="approved",
+                facts={
+                    "module": current_module,
+                    "destination_location_id": str(new_location_id),
+                    "destination_location_name": nodes[new_location_id]["location_name"],
+                    "destination_area_id": nodes[new_location_id]["area_id"],
+                    "destination_area_name": nodes[new_location_id]["area_name"],
+                    # Never ticks: the validator read raw route ticks as
+                    # minutes (C10b live run). The trip time is given in
+                    # game minutes (C11).
+                    "engine_route": {"stops": engine.get("stops")},
+                    **(
+                        {
+                            "travel_minutes": travel_minutes,
+                            "min_travel_minutes": _travel.floor_minutes(travel_minutes),
+                            "travel_time_rule": (
+                                "travel_minutes is the trip at SRD normal pace, in game "
+                                "minutes: use it as the travel-owned updateTime. A slow "
+                                "pace, difficult terrain or a detour adds time. Only a "
+                                "fast pace the narration shows (the party hurries) may "
+                                "go lower, to min_travel_minutes. The code applies at "
+                                "least min_travel_minutes and raises a lower value "
+                                "itself."
+                            ),
+                        }
+                        if travel_minutes is not None
+                        else {}
+                    ),
+                    "authority": "engine",
+                    "provisional_until_semantic_validation": True,
+                },
+            )
 
         # Get party level
         party_level = 1
@@ -2020,8 +2851,9 @@ def pre_validate_transition(
             player_request = turn_context.get("player_input")
         else:
             for msg in reversed(conversation_history):
-                if msg.get("role") == "user" and not msg.get("content", "").startswith("Error Note:"):
-                    player_request = msg.get("content", "")
+                words = hm.player_input(msg)
+                if words:
+                    player_request = words
                     break
 
         # Call transition intelligence agent
@@ -2211,9 +3043,9 @@ def verify_approved_transition_plan(
     path_analysis = analyze_path_for_encounters(
         path, location_graph, current_module, snapshot=snapshot
     )
-    plot_data = safe_read_json(
-        ModulePathManager(current_module).get_plot_path()
-    ) or {}
+    from utils import quest_record as _quest_record
+
+    plot_data = _quest_record.module_plot(current_module) or {}
     topology_identity = str(
         snapshot.get("topology_identity") or snapshot.get("snapshot_hash") or ""
     )
@@ -2282,212 +3114,712 @@ def validate_location_transition(location_graph, current_location_id, destinatio
     except Exception as e:
         return False, f"Location validation failed with exception: {str(e)}", None
 
-def update_party_npcs(party_tracker_data, operation, npc):
-    """Update NPC party members (add or remove)"""
-    if operation == "add":
-        # Get the correct module from party tracker
-        module_name = party_tracker_data.get("module", "").replace(" ", "_")
-        path_manager = ModulePathManager(module_name)
-        
-        # Use fuzzy matching to find the NPC file
-        from updates.update_character_info import find_character_file_fuzzy
-        matched_name = find_character_file_fuzzy(npc['name'])
-        
-        if matched_name:
-            npc_file = path_manager.get_character_path(matched_name)
-        else:
-            # If no match found, use the original name for potential creation
-            npc_file = path_manager.get_character_path(npc['name'])
-        
-        if not os.path.exists(npc_file):
-            # NPC file doesn't exist, so we need to create it
-            try:
-                # Get party level as default if no level specified
-                default_level = ''
-                if not npc.get('level'):
-                    # Get the first party member's level as default
-                    if party_tracker_data.get("partyMembers"):
-                        player_name = party_tracker_data["partyMembers"][0]
-                        # Normalize name for file access
-                        from updates.update_character_info import normalize_character_name
-                        player_name_normalized = normalize_character_name(player_name)
-                        player_file = path_manager.get_character_path(player_name_normalized)
-                        if os.path.exists(player_file):
-                            try:
-                                from utils.encoding_utils import safe_json_load
-                                player_data = safe_json_load(player_file)
-                                if player_data and 'level' in player_data:
-                                    default_level = str(player_data['level'])
-                                    debug(f"STATE_CHANGE: Using party level {default_level} as default for NPC {npc['name']}", category="character_updates")
-                            except Exception as e:
-                                warning(f"FAILURE: Could not get party level, using default: {e}", category="character_updates")
-                
-                npc_level = str(npc.get('level', default_level))
-                
-                # Add this debug line right before the subprocess.run call
-                debug(f"SUBPROCESS: Calling npc_builder.py with arguments: {npc['name']} {npc.get('race', '')} {npc.get('class', '')} {npc_level} {npc.get('background', '')}", category="character_updates")
+def _recruit_identity(party, occupant_id):
+    """The authored record of the person a recruit's occupant id names, read
+    before the occupant is resolved as joined (#534); None when there is none."""
+    from core.nql import occupants as _occupants
 
-                subprocess.run([
-                    sys.executable, _generator_script_path("npc_builder.py"),
-                    npc['name'],
-                    npc.get('race', ''),
-                    npc.get('class', ''),
-                    npc_level,
-                    npc.get('background', '')
-                ], check=True, stdin=subprocess.DEVNULL)
-                info(f"SUCCESS: NPC profile created for {npc['name']}", category="character_updates")
-            except subprocess.CalledProcessError as e:
-                error(f"FAILURE: Failed to create NPC profile for {npc['name']}: {e}", category="character_updates")
-                return
-
-        # Now we can add the NPC to the party
-        # Create entry matching the party_schema.json requirements (name and role)
-        npc_entry = {
-            "name": npc.get('name'),
-            "role": npc.get('role', npc.get('class', 'Companion'))  # Use role if provided, else class, else default
-        }
-        
-        # Load the actual NPC data to get the correct display name
-        from utils.encoding_utils import safe_json_load
-        from updates.update_character_info import normalize_character_name, find_character_file_fuzzy
-        
-        # Use fuzzy matching to find the correct NPC file
-        matched_name = find_character_file_fuzzy(npc['name'])
-        if matched_name:
-            npc_file = path_manager.get_character_path(matched_name)
-        else:
-            # Fallback to normalized name if no match found
-            normalized_name = normalize_character_name(npc['name'])
-            npc_file = path_manager.get_character_path(normalized_name)
-        
-        if os.path.exists(npc_file):
-            npc_data = safe_json_load(npc_file)
-            if npc_data and 'name' in npc_data:
-                # Use the name from the character file for consistency
-                npc_entry['name'] = npc_data['name']
-                debug(f"STATE_CHANGE: Using character file name '{npc_data['name']}' for party tracker", category="character_updates")
-        
-        # Idempotent add: skip if this NPC (by resolved display name) is already
-        # on the roster, so a duplicate add is a true no-op (T105 lifecycle relies
-        # on before/after roster equality to decide whether to fire).
-        _existing_names = {
-            str(x.get("name")) for x in party_tracker_data["partyNPCs"]
-        }
-        if npc_entry["name"] not in _existing_names:
-            party_tracker_data["partyNPCs"].append(npc_entry)
-    elif operation == "remove":
-        party_tracker_data["partyNPCs"] = [x for x in party_tracker_data["partyNPCs"] if x["name"] != npc["name"]]
-
-    safe_json_dump(party_tracker_data, "party_tracker.json")
-    info(f"STATE_CHANGE: Party NPCs updated - {operation} {npc['name']}", category="character_updates")
+    return _occupants.person_identity(str(party.get("module") or ""), str(occupant_id or ""))
 
 
-def prepare_party_npc_update(parameters, operation_id):
-    """Freeze one roster mutation and its canonical sheet before movement."""
-    operation = parameters.get("operation")
-    npc = parameters.get("npc")
-    if operation not in {"add", "remove"} or not isinstance(npc, dict):
-        raise ValueError("updatePartyNPCs requires add/remove and an npc object")
-    npc_name = npc.get("name")
-    if not isinstance(npc_name, str) or not npc_name.strip():
-        raise ValueError("updatePartyNPCs requires an exact NPC name")
+# Party companions by occupant id -------------------------------------------
+#
+# Every partyNPCs entry carries the occupant id of its person ("occupantId").
+# One planner decides what an updatePartyNPCs does, by ids, slot numbers and
+# entry equality only; one line builder assembles its engine lines; one
+# finishing step builds the sheet at commit; occupants.party_change sends the
+# lines. A row saved before ids has none: the party line numbers those rows
+# as [slot n], counted from the roster the turn's DM note showed.
+
+_PARTY_ERROR_TAIL = (
+    "Later actions from this response have not executed. Do not repeat "
+    "earlier completed actions."
+)
+
+
+def turn_key(invocation_claim):
+    """The turn identity a TurnRoster pair is keyed by ("" without one)."""
+    return str(getattr(invocation_claim, "logical_invocation_id", "") or "").strip()
+
+
+def _current_roster():
     party = safe_json_load("party_tracker.json")
-    if not isinstance(party, dict) or not isinstance(party.get("partyNPCs"), list):
-        raise RuntimeError("party roster is unavailable")
-    roster_before = copy.deepcopy(party["partyNPCs"])
-    module_name = str(party.get("module", "")).replace(" ", "_")
-    path_manager = ModulePathManager(module_name)
-    from updates.update_character_info import (
-        find_character_file_fuzzy,
-        normalize_character_name,
-    )
+    roster = party.get("partyNPCs") if isinstance(party, dict) else None
+    return copy.deepcopy(roster) if isinstance(roster, list) else []
 
-    matched_name = find_character_file_fuzzy(npc_name)
-    npc_path = path_manager.get_character_path(
-        matched_name or normalize_character_name(npc_name)
-    )
-    sheet = safe_json_load(npc_path) if os.path.exists(npc_path) else None
-    if operation == "add" and not isinstance(sheet, dict):
-        from core.generators.npc_builder import build_npc_file, load_schema
 
-        schema = load_schema("schemas/char_schema.json")
-        if not isinstance(schema, dict):
-            raise RuntimeError("NPC character schema is unavailable")
-        party_level = None
-        members = party.get("partyMembers") or []
-        if members:
-            player_path = path_manager.get_character_path(
-                normalize_character_name(str(members[0]))
-            )
-            player_sheet = safe_json_load(player_path)
-            if isinstance(player_sheet, dict):
-                party_level = player_sheet.get("level")
-        sheet = build_npc_file(
-            npc_name,
-            schema,
-            npc.get("race"),
-            npc.get("class"),
-            npc.get("level") or party_level,
-            npc.get("background"),
-            path_manager=path_manager,
-            structural_reissue=True,
-        )
-        if not isinstance(sheet, dict):
-            raise RuntimeError("required NPC sheet was not accepted")
-        resolved_name = sheet.get("name") or npc_name
-        npc_path = path_manager.get_character_path(
-            normalize_character_name(resolved_name)
-        )
-        sheet = safe_json_load(npc_path) or sheet
-    elif operation == "remove" and not isinstance(sheet, dict):
-        # Removal still uses the canonical roster display identity. A missing
-        # sheet is retained as an explicit lifecycle-unavailable fact rather
-        # than causing code to invent another NPC identity.
-        roster_match = next(
-            (
-                item
-                for item in roster_before
-                if isinstance(item, dict) and item.get("name") == npc_name
-            ),
-            None,
-        )
-        if roster_match is None:
-            raise ValueError("NPC is not present in the party roster")
+class TurnRoster:
+    """The roster a turn's slot numbers count from: one (key, roster) pair.
 
-    display_name = (
-        sheet.get("name") if isinstance(sheet, dict) else npc_name
-    ) or npc_name
-    roster_after = copy.deepcopy(roster_before)
-    if operation == "add":
-        if not any(
-            isinstance(item, dict) and item.get("name") == display_name
-            for item in roster_after
-        ):
-            roster_after.append(
-                {
-                    "name": display_name,
-                    "role": npc.get("role", npc.get("class", "Companion")),
-                }
-            )
+    The DM note build records the roster it rendered; bind() pairs it with
+    the turn's logical invocation id when the turn claim begins (the current
+    roster when no note rendered one). get() answers every response of that
+    turn, its needs_response follow-ups included, from the pair; a key with
+    no pair binds the current roster in its place. Nothing is kept under an
+    empty key. Load, restore and reset clear it."""
+
+    _lock = threading.Lock()
+    _pair = None
+    _rendered = None
+
+    @classmethod
+    def record(cls, roster):
+        with cls._lock:
+            cls._rendered = copy.deepcopy(roster) if isinstance(roster, list) else None
+
+    @classmethod
+    def bind(cls, key):
+        with cls._lock:
+            roster, cls._rendered = cls._rendered, None
+            if roster is None:
+                roster = _current_roster()
+            if key:
+                cls._pair = (key, roster)
+            return copy.deepcopy(roster)
+
+    @classmethod
+    def get(cls, key):
+        with cls._lock:
+            if key and cls._pair is not None and cls._pair[0] == key:
+                return copy.deepcopy(cls._pair[1])
+            roster = _current_roster()
+            if key:
+                cls._pair = (key, roster)
+            return copy.deepcopy(roster)
+
+    @classmethod
+    def clear(cls):
+        with cls._lock:
+            cls._pair = None
+            cls._rendered = None
+
+
+def _row_id(entry):
+    oid = entry.get("occupantId") if isinstance(entry, dict) else None
+    return oid if isinstance(oid, str) and oid else ""
+
+
+def _roster_ids(roster):
+    return {_row_id(entry) for entry in roster or [] if _row_id(entry)}
+
+
+def _turn_rows(turn_roster, roster):
+    """The roster that numbers the [slot] rows: the turn's roster, or, when
+    there is none, the roster being rendered or resolved. Every renderer and
+    the slot resolver take it from here, so they number alike."""
+    return roster if turn_roster is None else turn_roster
+
+
+def _roster_slot(value):
+    """A rosterSlot as a number: an integer, or a string of ASCII digits;
+    None for anything else."""
+    if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+        return int(value.strip())
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _slot_numbers(turn_roster):
+    """[(entry, n)]: the turn roster's rows without an id, numbered from 1."""
+    slots = []
+    for entry in turn_roster or []:
+        if isinstance(entry, dict) and not _row_id(entry):
+            slots.append((entry, len(slots) + 1))
+    return slots
+
+
+def party_rows(roster, turn_roster):
+    """Each row as the party line shows it: "Name (role) [occ:...]", or
+    "Name (role) [slot n]" numbered from the turn roster ("Name (role)" for
+    a row without an id that the turn roster does not hold)."""
+    slots = _slot_numbers(turn_roster)
+    used = set()
+    rows = []
+    for entry in roster or []:
+        if not isinstance(entry, dict):
+            continue
+        text = "%s (%s)" % (entry.get("name"), entry.get("role"))
+        if _row_id(entry):
+            rows.append("%s [%s]" % (text, _row_id(entry)))
+            continue
+        number = next((n for e, n in slots if n not in used and e == entry), None)
+        if number is not None:
+            used.add(number)
+            text += " [slot %d]" % number
+        rows.append(text)
+    return rows
+
+
+def party_note_lines(party_tracker, world, turn_roster, *, record=False):
+    """(party_span, orphan_sentence) for the DM note, the validator and the
+    corrections: "Party NPCs: <rows>." and, whenever joined people of this
+    module are carried by no roster row, the sentence that goes
+    after Party stats ("" when there are none). Only the DM note build
+    passes record=True, which keeps the rendered roster for TurnRoster."""
+    from core.nql import occupants as _occupants
+
+    party = party_tracker if isinstance(party_tracker, dict) else {}
+    roster = party.get("partyNPCs")
+    roster = roster if isinstance(roster, list) else []
+    if record:
+        TurnRoster.record(roster)
+    rows = party_rows(roster, _turn_rows(turn_roster, roster))
+    span = "Party NPCs: %s." % (", ".join(rows) if rows else "None")
+    orphans = _occupants.party_orphans(world, str(party.get("module") or ""), _roster_ids(roster))
+    if not orphans:
+        return span, ""
+    listed = "; ".join("%s (%s)" % (o.get("id"), o.get("name")) for o in orphans)
+    if any(isinstance(entry, dict) and not _row_id(entry) for entry in roster):
+        sentence = (
+            " Joined people with no party id (each may be the world person of a [slot] "
+            "companion above): %s. When a [slot] companion who is one of them leaves, pass "
+            "that id with the slot. Use returnOccupant only for someone who already left "
+            "the party in the story and is not a [slot] companion." % listed
+        )
     else:
-        roster_after = [
-            item
-            for item in roster_after
-            if not isinstance(item, dict) or item.get("name") != npc_name
-        ]
+        sentence = (
+            " Joined people with no party id: %s. Use returnOccupant for someone who already "
+            "left the party in the story, or add them again by id if they are with the party."
+            % listed
+        )
+    return span, sentence
+
+
+def _party_error(operation, text):
+    """A refused updatePartyNPCs as the DM is told it (with the standard tail)."""
+    return "Party Error: updatePartyNPCs %s did not complete: %s Nothing changed in the party roster. %s" % (
+        operation if operation in ("add", "remove") else "change", text, _PARTY_ERROR_TAIL,
+    )
+
+
+def _party_sheet_path(module, name, *, wait=None):
+    """The sheet path a companion name resolves to (the name lookup the
+    sheets already use; the sheet gate keeps it one-to-one). With ``wait``,
+    a busy sheet or listing waits (P3a)."""
+    from updates.update_character_info import find_character_file_fuzzy, normalize_character_name
+
+    name = str(name or "")
+    path_manager = ModulePathManager(str(module or "").replace(" ", "_"))
+    return path_manager.get_character_path(
+        find_character_file_fuzzy(name, wait=wait) or normalize_character_name(name)
+    )
+
+
+def _party_id_suffix(invocation_claim, action_context):
+    """c<t>i<k> for an id built while no world can be read: t the first 8
+    characters of the hex after the last ":" of the turn's logical
+    invocation id (a fresh uuid hex without one), k the action index."""
+    turn_id = turn_key(invocation_claim)
+    hex_part = turn_id.rpartition(":")[2][:8] if turn_id else uuid4().hex[:8]
+    index = (action_context or {}).get("current_index") if isinstance(action_context, dict) else None
+    return "c%si%d" % (hex_part, index if isinstance(index, int) else 0)
+
+
+def _new_party_id(name, module, location, world, taken, id_suffix):
+    """A new person's id here: the name's slug at this place (-2, -3 ... when
+    taken); with no world, the slug with the typed suffix."""
+    from core.nql import occupants as _occupants
+    from utils.roster_conversion import slug
+
+    place = _occupants.place_id(module, location or "unplaced")
+    taken = set(taken) | {
+        o.get("id") for o in (world or {}).get("occupants") or [] if isinstance(o, dict)
+    }
+    stem = slug(name)
+    if world is None:
+        stem = "%s-%s" % (stem, id_suffix or "c%si0" % uuid4().hex[:8])
+    return _occupants._unique_id(place, stem, taken)
+
+
+def build_lines(kind, occupant_id, display_name, module, location, world, *, reason=None):
+    """The engine lines of one planned party change, the only place they
+    are assembled: at plan time, and at a staged commit with the stored
+    kind. A join resolves the person as joined (a "new" one is created here
+    first); a re-add of a companion whose person was left behind (present,
+    not joined) joins it again. A leave brings the person back here: an id
+    of another module creates a new person here (that module's person stays
+    joined); a joined person returns with its join reason, moved here when
+    elsewhere; a person present but not joined is moved here; a person with
+    another recorded fate gets no line (the fate stands); an id the world
+    does not hold is created here."""
+    from core.nql import occupants as _occupants
+    from utils.roster_conversion import q
+
+    oid = str(occupant_id or "")
+    if not oid:
+        return []
+    place = _occupants.place_id(module, location or "unplaced")
+    why = _occupants._reason(reason)
+    join = "resolve occupant %s as joined%s;" % (q(oid), " because %s" % q(why) if why else "")
+
+    def create(ident):
+        return "create occupant %s named %s at %s { person; attitude friendly; };" % (
+            q(ident), q(str(display_name or "")), q(place))
+
+    def move():
+        return "move occupant %s to %s;" % (q(oid), q(place))
+
+    occupant = _occupants.world_occupant(world, oid)
+    if kind == "noop":
+        if occupant is not None and occupant.get("count") != 0 and _occupants.joined_entry(occupant) is None:
+            return [join]
+        return []
+    if kind == "join":
+        return [join]
+    if kind == "join_new":
+        return [create(oid), join]
+    if kind != "leave":
+        return []
+    if not oid.startswith("occ:%s/" % str(module or "").replace(" ", "_")):
+        return [create(_new_party_id(display_name, module, location, world, (), None))]
+    if occupant is None:
+        return [create(oid)]
+    entry = _occupants.joined_entry(occupant)
+    if entry is not None:
+        lines = ["return occupant %s from joined%s;" % (
+            q(oid), " %s" % q(entry["reason"]) if entry.get("reason") else "")]
+        if occupant.get("location") != place:
+            lines.append(move())
+        return lines
+    if occupant.get("count") != 0 and occupant.get("location") != place:
+        return [move()]
+    return []
+
+
+def plan_party_change(roster_before, parameters, world, *, turn_roster, module, location,
+                      request_id, id_suffix=None, frozen_kind=None):
+    """What one updatePartyNPCs does, decided by ids, slot numbers and entry
+    equality only, with no write: exactly one outcome {"kind": "noop" |
+    "join" | "heal" | "leave" | "correction", ...}. "outcome_kind" is the
+    stored kind ("join_new" for an add of "new"). `world` is the engine
+    document (party_world), or None when neither the engine nor
+    live_state.json can be read. `turn_roster` numbers the [slot] rows.
+    `id_suffix` is the typed suffix of an id built with no world. With
+    `frozen_kind` (a staged commit) nothing is validated: the stored kind and
+    occupant id give the engine lines at this location."""
+    from core.nql import occupants as _occupants
+
+    p = parameters if isinstance(parameters, dict) else {}
+    operation = p.get("operation")
+    npc = p.get("npc") if isinstance(p.get("npc"), dict) else {}
+    context = p.get("lifecycleContext")
+    reason = context.get("reason") if isinstance(context, dict) else None
+    roster = [entry for entry in roster_before] if isinstance(roster_before, list) else []
+    turn_roster = _turn_rows(turn_roster, roster)
+    oid = p.get("occupantId")
+    oid = oid.strip() if isinstance(oid, str) else ""
+    base = {
+        "roster_before": copy.deepcopy(roster),
+        "roster_after": copy.deepcopy(roster),
+        "turn_roster": copy.deepcopy(turn_roster),
+        "request_id": request_id,
+        "module": module,
+        "location": location,
+        "reason": reason,
+        "engine_lines": [],
+    }
+
+    def outcome(kind, outcome_kind, **fields):
+        result = dict(copy.deepcopy(base), kind=kind, outcome_kind=outcome_kind)
+        result.update(fields)
+        return result
+
+    def refused(text):
+        return outcome("correction", None, text=text)
+
+    def lines(kind, ident, name):
+        return build_lines(kind, ident, name, module, location, world, reason=reason)
+
+    if frozen_kind is not None:
+        name = npc.get("name")
+        return outcome("join" if frozen_kind == "join_new" else frozen_kind, frozen_kind,
+                       occupant_id=oid or None, display_name=name,
+                       engine_lines=lines(frozen_kind, oid, name))
+
+    carried = _roster_ids(roster)
+    if operation == "add":
+        name = str(npc.get("name") or "")
+        if oid and oid in carried:
+            # Already on the roster by this id: a silent no-op (#534).
+            row = next(entry for entry in roster if _row_id(entry) == oid)
+            return outcome("noop", "noop", occupant_id=oid, display_name=row.get("name"),
+                           engine_lines=lines("noop", oid, row.get("name")))
+        module_key = str(module or "").replace(" ", "_")
+        prefix = "occ:%s/" % module_key
+        parts = oid[len(prefix):].split("/") if oid.startswith(prefix) else []
+        if oid != "new" and not (len(parts) == 2 and all(parts)):
+            return refused(_not_recruitable(oid, world, module, location))
+        npc_path = _party_sheet_path(module, name)
+        for entry in roster:
+            if isinstance(entry, dict) and entry.get("name") and \
+                    _party_sheet_path(module, entry["name"]) == npc_path:
+                return refused(_already_with_party(name, entry, turn_roster))
+        sheet = safe_json_load(npc_path) if os.path.exists(npc_path) else None
+        display_name = (sheet.get("name") if isinstance(sheet, dict) else None) or name
+        role = npc.get("role", npc.get("class", "Companion"))
+
+        def joined(kind, outcome_kind, ident, engine_lines):
+            entry = {"name": display_name, "role": role, "occupantId": ident}
+            return outcome(kind, outcome_kind, roster_after=copy.deepcopy(roster) + [entry],
+                           entry=copy.deepcopy(entry), occupant_id=ident,
+                           display_name=display_name, npc_path=npc_path,
+                           engine_lines=engine_lines)
+
+        if oid == "new":
+            ident = _new_party_id(name, module, location, world, carried, id_suffix)
+            return joined("join", "join_new", ident, lines("join_new", ident, display_name))
+        if world is None:
+            # An engine outage never stops the roster: a well-formed id is
+            # taken as given.
+            return joined("join", "join", oid, lines("join", oid, display_name))
+        occupant = _occupants.world_occupant(world, oid)
+        if occupant is not None and occupant.get("kind") == "person" and occupant.get("count") != 0 \
+                and str(occupant.get("location") or "").startswith("loc:%s/" % module_key):
+            return joined("join", "join", oid, lines("join", oid, display_name))
+        if occupant is not None and any(o.get("id") == oid for o in _occupants.party_orphans(world, module, carried)):
+            # A joined person no row carries: the row is written, the world
+            # already has them joined.
+            return joined("heal", "heal", oid, [])
+        return refused(_not_recruitable(oid, world, module, location))
+
+    if operation == "remove":
+        slot = _roster_slot(p.get("rosterSlot"))
+        listing = " " + "".join(party_note_lines({"partyNPCs": roster, "module": module}, world, turn_roster))
+        carrier = next((entry for entry in roster if oid and _row_id(entry) == oid), None)
+        if carrier is not None:
+            if slot is not None:
+                warning("PARTY: rosterSlot %s ignored; %s is carried by a roster row" % (slot, oid),
+                        category="character_updates")
+            removed, ident = carrier, oid
+        elif slot is not None:
+            removed = next((entry for entry, n in _slot_numbers(turn_roster) if n == slot), None)
+            if removed is None or removed not in roster:
+                slot_rows = party_rows([entry for entry in roster if not _row_id(entry)], turn_roster)
+                return refused("No companion in the party is [slot %d] now. Companions with a [slot]: %s."
+                               % (slot, ", ".join(slot_rows) or "none"))
+            if oid:
+                orphan_ids = {o.get("id") for o in _occupants.party_orphans(world, module, carried)}
+                if world is not None and oid not in orphan_ids:
+                    return refused("%s is not one of the joined people with no party id. Pass rosterSlot "
+                                   "alone for that companion, or with an id from that list.%s" % (oid, listing))
+                ident = oid
+            else:
+                ident = _new_party_id(removed.get("name"), module, location, world, carried, id_suffix)
+        elif oid:
+            return refused(
+                "No companion in the party carries %s. For a companion shown with a [slot], pass "
+                "rosterSlot (and this id if it is that companion's person). To return someone who "
+                "already left the party in the story, use returnOccupant.%s" % (oid, listing))
+        else:
+            return refused("A remove names the companion by the occupantId or the rosterSlot the "
+                           "party line shows.%s" % listing)
+        roster_after = copy.deepcopy(roster)
+        roster_after.remove(removed)
+        name = removed.get("name")
+        return outcome("leave", "leave", roster_after=roster_after, removed_entry=copy.deepcopy(removed),
+                       occupant_id=ident, display_name=name, npc_path=_party_sheet_path(module, name),
+                       engine_lines=lines("leave", ident, name))
+
+    # Neither add nor remove changes nothing, as before.
+    return outcome("noop", "noop", occupant_id=None)
+
+
+def party_change_companion(parameters, roster, turn_roster):
+    """The companion an updatePartyNPCs names, for the review facts: the
+    added npc's name, or the name of the roster row a remove's occupantId
+    or rosterSlot points at (the npc's name when neither is found)."""
+    p = parameters if isinstance(parameters, dict) else {}
+    npc = p.get("npc") if isinstance(p.get("npc"), dict) else {}
+    if p.get("operation") == "remove":
+        oid = p.get("occupantId")
+        row = next((entry for entry in roster or [] if oid and _row_id(entry) == oid), None)
+        slot = _roster_slot(p.get("rosterSlot"))
+        if row is None and slot is not None:
+            row = next((entry for entry, n in _slot_numbers(_turn_rows(turn_roster, roster)) if n == slot), None)
+        if isinstance(row, dict) and row.get("name"):
+            return row["name"]
+    return npc.get("name")
+
+
+def _not_recruitable(oid, world, module, location):
+    from core.nql import occupants as _occupants
+
+    place = _occupants.place_id(module, location)
+    people = [
+        o for o in (world or {}).get("occupants") or []
+        if isinstance(o, dict) and o.get("kind") == "person" and o.get("location") == place
+        and o.get("count") != 0
+    ]
+    listed = "; ".join("%s (%s)" % (o.get("id"), o.get("name")) for o in people) or "none"
+    return (
+        "%s is not a person you can recruit here. People present: %s. Pass one of those ids, "
+        "or \"new\" for a companion who is not listed." % (oid or "(no occupantId)", listed)
+    )
+
+
+def _already_with_party(name, entry, turn_roster):
+    row = (party_rows([entry], turn_roster) or [""])[0]
+    return (
+        "%s is already with the party (%s). No add is needed. To recruit a different person, "
+        "give them a distinct name." % (name, row)
+    )
+
+
+def _build_party_sheet(npc, name, party, identity):
+    """Build a companion's sheet in process (T035), as the travel path and
+    combat_builder build (#534), by the npc_builder.py command's argument
+    rules: a placeholder is blank, and a level other than a whole number
+    builds no sheet. The level defaults to the party's. Raises when no sheet
+    was accepted."""
+    from core.generators.npc_builder import UNSPECIFIED_ARGUMENTS, build_npc_file, load_schema
+    from updates.update_character_info import normalize_character_name
+
+    path_manager = ModulePathManager(str(party.get("module") or "").replace(" ", "_"))
+    default_level = ""
+    if not npc.get("level") and party.get("partyMembers"):
+        player_file = path_manager.get_character_path(
+            normalize_character_name(str(party["partyMembers"][0]))
+        )
+        if os.path.exists(player_file):
+            try:
+                player_data = safe_json_load(player_file)
+                if player_data and "level" in player_data:
+                    default_level = str(player_data["level"])
+                    debug(f"STATE_CHANGE: Using party level {default_level} as default for NPC {name}", category="character_updates")
+            except Exception as e:
+                warning(f"FAILURE: Could not get party level, using default: {e}", category="character_updates")
+    npc_level = str(npc.get("level") or default_level)
+
+    def _given(value):
+        text = str(value)
+        return "" if text.strip().lower() in UNSPECIFIED_ARGUMENTS else text
+
+    level_text = _given(npc_level)
+    level = None
+    if level_text:
+        if not level_text.isdigit():
+            raise ValueError(f"level {npc_level!r} is not a whole number")
+        level = int(level_text)
+    debug(f"STATE_CHANGE: Building NPC {name}: {npc.get('race', '')} {npc.get('class', '')} {npc_level} {npc.get('background', '')}", category="character_updates")
+    schema = load_schema("schemas/char_schema.json")
+    if not schema:
+        raise RuntimeError("NPC character schema is unavailable")
+    sheet = build_npc_file(
+        name,
+        schema,
+        _given(npc.get("race", "")),
+        _given(npc.get("class", "")),
+        level,
+        str(npc.get("background", "")),
+        path_manager=path_manager,
+        npc_identity=identity,
+    )
+    if not isinstance(sheet, dict):
+        raise RuntimeError("no sheet was accepted")
+    info(f"SUCCESS: NPC profile created for {name}", category="character_updates")
+    return sheet
+
+
+def finish_party_entry(outcome, parameters, *, party):
+    """The one finishing step of a join or heal, run at commit on every path
+    (in place, a staged prepare, an adapted receipt), never in a projection:
+    build the sheet when none exists (T035; an existing sheet is never
+    rebuilt), take the entry name from the sheet's own name, and run the
+    sheet gate again on a built sheet's path. Returns the finished outcome,
+    or a correction when the built sheet is already a companion's (it stays
+    as an unbound sheet). Raises when no sheet could be built."""
+    if not isinstance(outcome, dict) or outcome.get("kind") not in ("join", "heal"):
+        return outcome
+    finished = copy.deepcopy(outcome)
+    module = finished.get("module")
+    path = finished.get("npc_path") or _party_sheet_path(module, finished.get("display_name"))
+    if not os.path.exists(path):
+        p = parameters if isinstance(parameters, dict) else {}
+        npc = p.get("npc") if isinstance(p.get("npc"), dict) else {}
+        name = str(npc.get("name") or finished.get("display_name") or "")
+        identity = None
+        if finished.get("outcome_kind") != "join_new":
+            identity = _recruit_identity(party, finished.get("occupant_id"))
+        sheet = _build_party_sheet(npc, name, party, identity)
+        built_name = sheet.get("name") or name
+        path = _party_sheet_path(module, built_name)
+        for entry in finished.get("roster_before") or []:
+            if isinstance(entry, dict) and entry.get("name") and _party_sheet_path(module, entry["name"]) == path:
+                finished.update(kind="correction", outcome_kind=None, engine_lines=[],
+                                roster_after=copy.deepcopy(finished.get("roster_before") or []),
+                                text=_already_with_party(built_name, entry, finished.get("turn_roster")))
+                return finished
+    sheet = safe_json_load(path) if os.path.exists(path) else None
+    name = (sheet.get("name") if isinstance(sheet, dict) else None) or finished.get("display_name")
+    if name != finished.get("display_name"):
+        debug(f"STATE_CHANGE: Using character file name '{name}' for party tracker", category="character_updates")
+    finished["display_name"] = name
+    finished["npc_path"] = path
+    finished["sheet"] = copy.deepcopy(sheet) if isinstance(sheet, dict) else None
+    finished["entry"]["name"] = name
+    finished["roster_after"] = copy.deepcopy(finished.get("roster_before") or []) + [copy.deepcopy(finished["entry"])]
+    if finished.get("outcome_kind") == "join_new":
+        # The created person takes the companion's final name.
+        finished["engine_lines"] = build_lines(
+            "join_new", finished.get("occupant_id"), name, module, finished.get("location"), None,
+            reason=finished.get("reason"),
+        )
+    return finished
+
+
+def update_party_npcs(party_tracker_data, parameters, *, turn_roster, request_id, id_suffix=None):
+    """The in-place updatePartyNPCs: plan it on the world, finish a join or
+    heal (its sheet) and write the roster. Returns the outcome (the caller
+    fires its hooks by kind and sends its engine lines), or None only when
+    an add's character sheet could not be built (nothing changed)."""
+    from core.nql import occupants as _occupants
+
+    module = str(party_tracker_data.get("module") or "")
+    location = str((party_tracker_data.get("worldConditions") or {}).get("currentLocationId") or "")
+    roster = party_tracker_data.get("partyNPCs")
+    world = _occupants.party_world(module, location)
+    outcome = plan_party_change(
+        roster if isinstance(roster, list) else [], parameters, world,
+        turn_roster=turn_roster, module=module, location=location,
+        request_id=request_id, id_suffix=id_suffix,
+    )
+    if outcome["kind"] in ("join", "heal"):
+        try:
+            outcome = finish_party_entry(outcome, parameters, party=party_tracker_data)
+        except (LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop):
+            # A superseded live turn ends the turn by its own handler (#893).
+            raise
+        except Exception as e:
+            error(f"FAILURE: Failed to create NPC profile for {outcome.get('display_name')}: {e}", category="character_updates")
+            return None
+    if outcome["kind"] in ("join", "heal", "leave"):
+        party_tracker_data["partyNPCs"] = copy.deepcopy(outcome["roster_after"])
+        safe_json_dump(party_tracker_data, "party_tracker.json")
+        info(f"STATE_CHANGE: Party NPCs updated - {outcome['kind']} {outcome.get('display_name')} ({outcome.get('occupant_id')})", category="character_updates")
+    return outcome
+
+
+def _party_receipt(outcome, parameters, operation_id):
+    path = outcome.get("npc_path") or ""
+    sheet = outcome.get("sheet")
+    if sheet is None and path and os.path.exists(path):
+        sheet = safe_json_load(path)
     return {
         "kind": "updatePartyNPCs",
         "operation_id": operation_id,
         "phase": "sheet_ready",
-        "operation": operation,
-        "npc_name": display_name,
-        "npc_path": npc_path,
-        "sheet": copy.deepcopy(sheet),
-        "roster_before": roster_before,
-        "roster_after": roster_after,
+        "operation": parameters.get("operation"),
+        "npc_name": outcome.get("display_name"),
+        "npc_path": path,
+        "sheet": copy.deepcopy(sheet) if isinstance(sheet, dict) else None,
+        "roster_before": copy.deepcopy(outcome["roster_before"]),
+        "roster_after": copy.deepcopy(outcome["roster_after"]),
         "lifecycle_context": copy.deepcopy(parameters.get("lifecycleContext")),
         "lifecycle_status": "pending",
+        "occupant_id": outcome.get("occupant_id"),
+        "outcome_kind": outcome.get("outcome_kind"),
     }
+
+
+class PartyChangeUnplanned(ValueError):
+    """A staged updatePartyNPCs that cannot be worked out (a malformed
+    request or a planner correction), as opposed to a sheet that could not
+    be made."""
+
+
+def prepare_party_npc_update(parameters, operation_id):
+    """Freeze one roster change, planned like the in-place one, and its
+    canonical sheet before movement. The engine lines are built at apply,
+    at the commit location, from the receipt's frozen fields."""
+    from core.nql import occupants as _occupants
+
+    operation = parameters.get("operation")
+    if operation not in {"add", "remove"}:
+        raise PartyChangeUnplanned("updatePartyNPCs requires add or remove")
+    if operation == "add":
+        npc = parameters.get("npc")
+        npc_name = npc.get("name") if isinstance(npc, dict) else None
+        if not isinstance(npc_name, str) or not npc_name.strip():
+            raise PartyChangeUnplanned("updatePartyNPCs add requires an exact NPC name")
+        from updates.update_character_info import name_refusal
+        refusal = name_refusal(npc_name)
+        if refusal:
+            raise PartyChangeUnplanned(f"updatePartyNPCs add refused: {refusal}")
+    party = safe_json_load("party_tracker.json")
+    if not isinstance(party, dict) or not isinstance(party.get("partyNPCs"), list):
+        raise RuntimeError("party roster is unavailable")
+    roster_before = copy.deepcopy(party["partyNPCs"])
+    module = str(party.get("module") or "")
+    location = str((party.get("worldConditions") or {}).get("currentLocationId") or "")
+    world = _occupants.party_world(module, location, create=False)
+    outcome = plan_party_change(
+        roster_before, parameters, world, turn_roster=roster_before,
+        module=module, location=location, request_id="dm:%s:party" % operation_id,
+    )
+    if outcome["kind"] in ("join", "heal"):
+        outcome = finish_party_entry(outcome, parameters, party=party)
+    if outcome["kind"] == "correction":
+        raise PartyChangeUnplanned(outcome["text"])
+    return _party_receipt(outcome, parameters, operation_id)
+
+
+def _adapt_party_receipt(receipt, party, record_index, checkpoint_operation_id=None):
+    """A receipt staged before occupant ids (no outcome_kind), adapted
+    through the planner at the commit location: the added row (the
+    roster_after entry absent from roster_before, by equality) as an add of
+    "new"; the removed row (the roster_before entry absent from
+    roster_after) as a leave with no link, so a new person is created here;
+    no difference: a noop. The receipt takes the finished fields in place;
+    when the adapted roster_after differs, the old one is kept as
+    legacy_roster_after, the roster the old code may already have written.
+    A fallback id takes <t> from the checkpoint's operation id. Returns
+    False for a correction (the receipt is then dropped)."""
+    from core.nql import occupants as _occupants
+
+    before = receipt.get("roster_before") if isinstance(receipt.get("roster_before"), list) else []
+    after = receipt.get("roster_after") if isinstance(receipt.get("roster_after"), list) else []
+    added = [entry for entry in after if entry not in before]
+    removed = [entry for entry in before if entry not in after]
+    module = str(party.get("module") or "")
+    location = str((party.get("worldConditions") or {}).get("currentLocationId") or "")
+    context = receipt.get("lifecycle_context")
+    if receipt.get("operation") == "add" and added and isinstance(added[0], dict):
+        parameters = {"operation": "add", "occupantId": "new",
+                      "npc": {"name": added[0].get("name"), "role": added[0].get("role")},
+                      "lifecycleContext": context}
+    elif receipt.get("operation") == "remove" and removed:
+        slot = next((n for entry, n in _slot_numbers(before) if entry == removed[0]), None)
+        if slot is None:
+            return False
+        parameters = {"operation": "remove", "rosterSlot": slot, "lifecycleContext": context}
+    else:
+        receipt.update(occupant_id=None, outcome_kind="noop", engine_lines=[])
+        return True
+    world = _occupants.party_world(module, location, create=False)
+    op_hex = str(checkpoint_operation_id or "").replace("-", "")[:8]
+    outcome = plan_party_change(
+        before, parameters, world, turn_roster=before, module=module, location=location,
+        request_id="dm:%s:party" % receipt.get("operation_id"),
+        id_suffix="c%si%d" % (op_hex, record_index) if op_hex else None,
+    )
+    if outcome["kind"] in ("join", "heal"):
+        outcome = finish_party_entry(outcome, parameters, party=party)
+    if outcome["kind"] == "correction":
+        warning("TRAVEL: a staged party change from before occupant ids could not be "
+                "adapted; dropped: %s" % outcome.get("text"), category="location_transitions")
+        return False
+    if outcome["roster_after"] != after:
+        receipt["legacy_roster_after"] = copy.deepcopy(after)
+    receipt.update(
+        occupant_id=outcome.get("occupant_id"),
+        outcome_kind=outcome.get("outcome_kind"),
+        roster_after=copy.deepcopy(outcome["roster_after"]),
+        npc_name=outcome.get("display_name"),
+        npc_path=outcome.get("npc_path") or receipt.get("npc_path"),
+        engine_lines=list(outcome.get("engine_lines") or []),
+    )
+    return True
 
 
 def _apply_party_npc_lifecycle(
@@ -2497,8 +3829,12 @@ def _apply_party_npc_lifecycle(
     npc_file,
     lifecycle_context,
     source_turn_id,
+    *,
+    seed_profile=True,
 ):
-    """Best-effort post-commit lifecycle hook; never rolls back the roster."""
+    """Best-effort post-commit lifecycle hook; never rolls back the roster.
+    seed_profile=False (a heal: the row of a person who already joined) marks
+    the arrival without seeding the T107 profile."""
     try:
         from core.npc.profile_service import seed_profile_best_effort
         from core.npc.relationship_store import RelationshipStore, game_day_ordinal
@@ -2597,13 +3933,14 @@ def _apply_party_npc_lifecycle(
                     "expectedDuration", "unknown"
                 ),
             }
-            seed_profile_best_effort(
-                store=store,
-                npc_id=npc_id,
-                npc_name=npc_name,
-                sheet=sheet,
-                lifecycle=lifecycle_source,
-            )
+            if seed_profile:
+                seed_profile_best_effort(
+                    store=store,
+                    npc_id=npc_id,
+                    npc_name=npc_name,
+                    sheet=sheet,
+                    lifecycle=lifecycle_source,
+                )
         elif operation == "remove":
             store.mark_departed(
                 npc_id,
@@ -2629,7 +3966,7 @@ def _apply_party_npc_lifecycle(
             complete = (
                 identity.get("active") is True
                 and edge_key in final["relationships"]
-                and npc_id in final["profiles"]
+                and (npc_id in final["profiles"] or not seed_profile)
                 and final_event.get("kind") in {"join", "rejoin"}
                 and final_event.get("sourceTurnId") == source_turn_id
                 and (
@@ -2712,9 +4049,27 @@ def _cache_module_starting_location(
         safe_json_dump(world_registry, registry_path)
         return True
 
-def get_module_starting_location(module_name: str) -> tuple:
-    """Get the starting location for a module using AI analysis with caching"""
+def get_module_starting_location(module_name: str, snapshot=None) -> tuple:
+    """Get the starting location for a module using AI analysis with caching.
+
+    snapshot: the module's build_active_module_snapshot, when the caller
+    already holds it; a model-chosen start is checked against it (#308)."""
     try:
+        # The entry the module declares, when it resolves in its area files,
+        # comes before a cached or model-chosen one.
+        from utils import roster_conversion
+
+        path_manager = ModulePathManager(module_name)
+        declared = roster_conversion.declared_start(path_manager.module_dir)
+        if declared and declared["areaId"] in (path_manager.get_area_ids() or []):
+            area_data = safe_json_load(path_manager.get_area_path(declared["areaId"])) or {}
+            locations = area_data.get("locations") if isinstance(area_data, dict) else None
+            location = next((loc for loc in locations or [] if isinstance(loc, dict)
+                             and loc.get("locationId") == declared["locationId"]), None)
+            if location is not None and area_data.get("areaName") and location.get("name"):
+                debug(f"FILE_OP: Using declared entry for {module_name}", category="module_loading")
+                return (declared["locationId"], location["name"], declared["areaId"], area_data["areaName"])
+
         # Check world registry for cached starting location
         world_registry_path = "modules/world_registry.json"
         world_registry = safe_json_load(world_registry_path)
@@ -2774,8 +4129,9 @@ def get_module_starting_location(module_name: str) -> tuple:
         
         # Load plot data
         try:
-            plot_file = path_manager.get_plot_path()
-            plot_data = safe_json_load(plot_file)
+            from utils import quest_record as _quest_record
+
+            plot_data = _quest_record.module_plot(module_name)
             if plot_data:
                 # Include key plot information
                 module_analysis_data["plotData"] = {
@@ -2786,10 +4142,29 @@ def get_module_starting_location(module_name: str) -> tuple:
             warning(f"FILE_OP: Could not load plot data: {e}", category="file_operations")
         
         # Use AI to determine starting location
-        starting_location = _ai_analyze_starting_location(module_analysis_data)
-        
-        # Cache the result in world registry
-        if starting_location and world_registry:
+        starting_location, chosen_by = _ai_analyze_starting_location(module_analysis_data)
+        if chosen_by == "model":
+            resolved, reason = _resolved_model_start(module_name, starting_location, snapshot)
+            if resolved is None:
+                why = (f"the model's start {starting_location[2]}:{starting_location[0]} "
+                       f"for {module_name} {reason}")
+                starting_location = _get_fallback_starting_location(module_analysis_data)
+                chosen_by = "fallback"
+            else:
+                starting_location = resolved
+        else:
+            why = f"start analysis failed for {module_name}"
+        if chosen_by == "fallback":
+            # The fallback is code's own substitute, so it must be a start the
+            # resolver accepts: checked against the snapshot, else the first
+            # valid node (#821).
+            starting_location, replaced = _checked_fallback(module_name, starting_location, snapshot)
+            warning(f"STARTING_LOCATION: {why}; using {starting_location[2]}:{starting_location[0]} "
+                    f"for this entry, not cached{replaced}", category="module_loading")
+
+        # Cache only a start the model chose and the resolver accepts (#308):
+        # a fallback is used once, and the model is asked again next entry.
+        if chosen_by == "model" and world_registry:
             try:
                 cached = _cache_module_starting_location(
                     module_name,
@@ -2800,6 +4175,8 @@ def get_module_starting_location(module_name: str) -> tuple:
                     info(f"SUCCESS: Cached AI-determined starting location for {module_name}", category="module_loading")
                 else:
                     warning(f"FILE_OP: Starting-location cache skipped for {module_name}; registry changed or refresh was busy", category="module_loading")
+            except ReadOnlySaveStop:
+                raise
             except Exception as cache_err:
                 # INT-H5: a cache-WRITE failure must not discard an already-valid
                 # starting location and strand the player; log and continue.
@@ -2807,20 +4184,81 @@ def get_module_starting_location(module_name: str) -> tuple:
 
         return starting_location
 
+    except ReadOnlySaveStop:
+        raise
     except Exception as e:
-        error(f"FAILURE: Could not get starting location for {module_name}: {e}", category="module_loading")
         # INT-H5: recover a REAL location from the module's area files rather
         # than writing placeholder IDs (A01/AREA001) that resolve to no area
-        # file and strand the player at a non-existent location.
+        # file and strand the player at a non-existent location. It is checked
+        # against the snapshot like the other fallbacks (#821).
         real = _first_real_location_from_files(module_name)
+        replaced = ""
         if real:
-            warning(f"STARTING_LOCATION: falling back to first real location "
-                    f"{real[2]}:{real[0]} for {module_name}", category="module_loading")
+            try:
+                real, replaced = _checked_fallback(module_name, real, snapshot)
+            except ReadOnlySaveStop:
+                raise
+            except Exception:
+                pass  # this route must not raise again; keep the file start
+        cause = f"looking up the start for {module_name} raised {type(e).__name__}: {e}"
+        if real:
+            error(f"STARTING_LOCATION: {cause}; using {real[2]}:{real[0]} for this entry, "
+                  f"not cached{replaced}", exception=e, category="module_loading")
             return real
+        error(f"STARTING_LOCATION: {cause}; no real location in its files, using the placeholder "
+              f"AREA001:A01", exception=e, category="module_loading")
         return ("A01", "Unknown Location", "AREA001", "Unknown Area")
 
+def _resolved_model_start(module_name, start, snapshot=None):
+    """(start, None) as the transition resolver would accept it: the
+    location is a valid node of the module's snapshot, and the area and names
+    come from that node. (None, reason) when it does not resolve or the
+    snapshot cannot be read (#308)."""
+    if snapshot is None:
+        try:
+            from utils.path_encounter_analyzer import build_active_module_snapshot
+            snapshot = build_active_module_snapshot(module_name)
+        except OSError as exc:
+            return None, f"could not be checked ({exc})"
+    location_id = str(start[0])
+    node = (snapshot.get("nodes") or {}).get(location_id)
+    if node is None or location_id in (snapshot.get("invalid_location_ids") or ()):
+        return None, "is not a valid location of the module"
+    return (node["location_id"], node["location_name"], node["area_id"], node["area_name"]), None
+
+
+def _first_valid_snapshot_start(snapshot):
+    """The first valid node of the snapshot, in its own order, as a start
+    tuple; None when it has no valid node (#821)."""
+    invalid = set(snapshot.get("invalid_location_ids") or ())
+    for node in (snapshot.get("nodes") or {}).values():
+        if node["location_id"] not in invalid:
+            return (node["location_id"], node["location_name"], node["area_id"], node["area_name"])
+    return None
+
+
+def _checked_fallback(module_name, start, snapshot):
+    """(start, replaced) for a start code chose itself: the node when it is a
+    valid location of the snapshot, else the snapshot's first valid node, else
+    the start unchanged. replaced names the start the first valid node took
+    the place of, else "". No snapshot: (start, "") (#821)."""
+    if snapshot is None:
+        return start, ""
+    checked, _ = _resolved_model_start(module_name, start, snapshot)
+    if checked is not None:
+        return checked, ""
+    checked = _first_valid_snapshot_start(snapshot)
+    if checked is None:
+        return start, ""
+    return checked, (f" (the first-area fallback {start[2]}:{start[0]} "
+                     f"is not a valid location of the module)")
+
+
 def _ai_analyze_starting_location(module_data: dict) -> tuple:
-    """Use AI to analyze module data and determine the best starting location"""
+    """Use AI to analyze module data and determine the best starting location.
+
+    Returns (start, "model") for the model's answer and (start, "fallback")
+    for the first-location fallback (#308)."""
     try:
         system_prompt = """You are an expert 5th edition adventure module analyst. Analyze the provided module data to determine the most logical starting location for player characters entering this adventure module.
 
@@ -2925,7 +4363,7 @@ Determine the most logical starting location based on adventure flow, area types
                     result['locationName'],
                     result['areaId'], 
                     result['areaName']
-                )
+                ), "model"
             else:
                 print(f"ERROR: AI response missing required fields: {result}")
                 
@@ -2935,11 +4373,11 @@ Determine the most logical starting location based on adventure flow, area types
         
         # Fallback to first area/location if AI analysis fails
         print("WARNING: AI analysis failed, falling back to first available location")
-        return _get_fallback_starting_location(module_data)
+        return _get_fallback_starting_location(module_data), "fallback"
         
     except Exception as e:
         print(f"ERROR: AI starting location analysis failed: {e}")
-        return _get_fallback_starting_location(module_data)
+        return _get_fallback_starting_location(module_data), "fallback"
 
 def _get_fallback_starting_location(module_data: dict) -> tuple:
     """Fallback method to get first available location if AI analysis fails"""
@@ -3008,6 +4446,230 @@ def get_travel_narration(target_module: str) -> str:
     except:
         return f"The party travels to the {target_module} region, where new adventures await."
 
+def _engine_request_id(invocation_claim, action_context, suffix):
+    """A deterministic engine request id for one typed occupant action of
+    one accepted turn: dm:<turn id>:<action index>:<suffix>, so a retried
+    turn is answered as already applied. Without a turn identity the id is
+    unique instead (the action still runs; only replay protection is lost)."""
+    turn_id = str(getattr(invocation_claim, "logical_invocation_id", "") or "").strip()
+    index = (action_context or {}).get("current_index") if isinstance(action_context, dict) else None
+    if not turn_id or not isinstance(index, int):
+        return "dm:%s:%s" % (uuid4(), suffix)
+    return "dm:%s:%d:%s" % (turn_id, index, suffix)
+
+
+def _show_rest_receipt(content):
+    """Show the player the hit dice the engine rolled on a short rest (#840)."""
+    from web.shared_state import emit_player_output
+
+    if emit_player_output({"type": "narration", "channel": "system", "content": content}) is not True:
+        print(content)
+
+
+# Shown to the player when a travel turn drops a change it could not work out
+# (#855, the #841 voice).
+_DROPPED_SHEET_NOTICE = (
+    "%s's character sheet was not changed: the update could not be worked "
+    "out. If it still matters (for example damage taken on the road), say so "
+    "in your next message."
+)
+_DROPPED_STORAGE_NOTICE = (
+    "%s's storage change was not made: it could not be worked out. If it "
+    "still matters, say so in your next message."
+)
+_DROPPED_SHEET_RULES_NOTICE = (
+    "%s's character sheet was not changed: the rules did not allow it (%s). "
+    "If it still matters, say so in your next message."
+)
+_DROPPED_NPC_NOTICE = (
+    "%s did not join the party: their character sheet could not be made. If "
+    "it still matters, say so in your next message."
+)
+_UNPLANNED_NPC_NOTICE = (
+    "%s did not join the party: the change could not be worked out. If it "
+    "still matters, say so in your next message."
+)
+_DROPPED_NPC_LEAVE_NOTICE = (
+    "%s did not leave the party: the change could not be worked out. If it "
+    "still matters, say so in your next message."
+)
+# Raised from a travel prepare step, these are never a dropped change: the
+# turn was superseded, the save is read-only, or the provider refused (#855).
+_TRAVEL_PREPARE_PASSTHROUGH = (
+    LiveProviderSuperseded,
+    InvocationSupersededError,
+    LiveProviderCompletedError,
+    ReadOnlySaveStop,
+)
+
+
+def _retire_unmoved_transition_checkpoint(operation_id):
+    """Remove this move's own checkpoint after its prepare step failed (#855).
+
+    Only this operation's record, with the party still at its origin (the
+    rule recovery uses for a planned move), is removed; anything else is left
+    to recovery, with one warning.
+    """
+    from core.managers.campaign_manager import _party_module_transition_lock
+
+    try:
+        with _party_module_transition_lock():
+            checkpoint = safe_json_load(PENDING_LOCATION_TRANSITION_FILE)
+            party = safe_json_load("party_tracker.json")
+            world = party.get("worldConditions") if isinstance(party, dict) else None
+            if (
+                isinstance(checkpoint, dict)
+                and checkpoint.get("operation_id") == operation_id
+                and checkpoint.get("kind") == "current_transition"
+                and isinstance(world, dict)
+                and str(world.get("currentLocationId", ""))
+                == str(checkpoint.get("origin_location_id", ""))
+            ):
+                _remove_location_transition_checkpoint()
+                return True
+    except ReadOnlySaveStop:
+        raise
+    except OSError as exc:
+        # #943: a locked or vanished file must not replace the curated
+        # prepare failure; the record is left for recovery.
+        warning(
+            "TRAVEL: the failed move's record was left for recovery (could "
+            "not read or remove it: %s: %s)" % (type(exc).__name__, exc),
+            category="location_transitions",
+        )
+        return False
+    warning(
+        "TRAVEL: the failed move's record was left for recovery",
+        category="location_transitions",
+    )
+    return False
+
+
+def _travel_prepare_failure(exc):
+    """The curated error for a move whose prepare step failed (#855)."""
+    response_data = {
+        "error_message": "The move could not be prepared; nothing changed.",
+        "retryable": False,
+        "transition_recovery_required": False,
+    }
+    if isinstance(exc, LiveProviderCompletedError):
+        # A provider refusal (#240): its class picks the account text the
+        # player can act on (#432), as on the direct path.
+        refusal = classify_provider_error(exc)
+        response_data["provider_refusal"] = refusal["category"]
+        response_data["provider_refusal_provider"] = refusal["provider"]
+    return response_data
+
+
+def _show_transition_notice(message_id, content):
+    """Show the player one travel notice (#855).
+
+    A frontend sink gets it with its message id. A sink that rejects it gets
+    no console copy: its stdout scraper would show an untracked duplicate
+    (the combat_manager pattern). Only a plain terminal, with no sink, prints.
+    """
+    from web.shared_state import emit_player_output, has_player_output_sink
+
+    has_sink = has_player_output_sink()
+    if emit_player_output({
+        "type": "narration",
+        "channel": "system",
+        "content": content,
+        "message_id": message_id,
+    }) is True:
+        return
+    if has_sink:
+        warning(
+            "TRAVEL: the frontend did not accept the travel notice",
+            category="location_transitions",
+        )
+        return
+    print(content)
+
+
+# The turn whose fight already failed to start once (#444). It is only ever
+# compared with the current turn's id, so a value left from an earlier turn
+# is harmless.
+_last_failed_combat_turn = None
+
+# Why a fight did not start, as the DM is told it. Fixed phrases only: never
+# raw error text, and nothing parses them.
+COMBAT_START_REASONS = {
+    "builder_failed": "the combat builder failed",
+    "builder_no_encounter": "the combat builder did not save an encounter",
+    "location_unreadable": "the current location could not be loaded",
+    "combat_not_started": "the combat could not start",
+}
+
+
+def _combat_start_failed(reason, conversation_history, invocation_claim):
+    """Close a createEncounter that ended without a finished fight (#444).
+
+    The tracker decides. A fight still active there stays saved and resumes
+    at the next start, so the turn ends with the one failure line ("error").
+    When no fight was activated the DM is told once per turn and answers
+    again ("needs_response"). A second failure in the same turn, a turn with
+    no identity, or an unreadable tracker ends with the failure line, so this
+    can never loop.
+    """
+    global _last_failed_combat_turn
+    error(
+        "FAILURE: Combat did not start: %s" % COMBAT_START_REASONS[reason],
+        category="combat_processing",
+    )
+    party = safe_json_load("party_tracker.json")
+    world = party.get("worldConditions") if isinstance(party, dict) else None
+    turn_id = str(getattr(invocation_claim, "logical_invocation_id", "") or "").strip()
+    if (
+        not isinstance(world, dict)
+        or world.get("activeCombatEncounter")
+        or not turn_id
+        or turn_id == _last_failed_combat_turn
+    ):
+        return {"status": "error", "needs_update": False}
+    _last_failed_combat_turn = turn_id
+    conversation_history.append({
+        "role": "user",
+        "content": (
+            "Combat Error: the encounter you requested could not be set up "
+            "(%s), so no fight has started and nothing changed. Answer the "
+            "player's last action again without this fight; request it again "
+            "only if it still fits." % COMBAT_START_REASONS[reason]
+        ),
+    })
+    return {"status": "needs_response", "needs_update": True}
+
+
+def _built_encounter(result_path, returncode):
+    """The encounter id the combat builder saved, or the reason it has none (#812).
+
+    Decided only from the builder's typed result file and exit code, never
+    from its printed lines (colored text broke the old parse). A saved id
+    counts only when its encounter file names the same id.
+    """
+    try:
+        with open(result_path, "r", encoding="utf-8") as result_file:
+            result = json.load(result_file)
+    except (OSError, ValueError):
+        return None, "builder_failed"
+    if not isinstance(result, dict) or result.get("version") != 1:
+        return None, "builder_failed"
+    if result.get("status") != "saved":
+        return None, "builder_no_encounter"
+    encounter_id = result.get("encounterId")
+    if returncode != 0 or not isinstance(encounter_id, str) or not encounter_id.strip():
+        return None, "builder_failed"
+    encounter_path = os.path.join("modules", "encounters", "encounter_%s.json" % encounter_id)
+    try:
+        with open(encounter_path, "r", encoding="utf-8") as encounter_file:
+            saved = json.load(encounter_file)
+    except (OSError, ValueError):
+        return None, "builder_no_encounter"
+    if not isinstance(saved, dict) or saved.get("encounterId") != encounter_id:
+        return None, "builder_no_encounter"
+    return encounter_id, None
+
+
 def process_action(
     action,
     party_tracker_data,
@@ -3019,6 +4681,7 @@ def process_action(
     invocation_claim=None,
     action_context=None,
     level_up_context=None,
+    turn_roster=None,
 ):
     """Process an action based on its type
     
@@ -3034,7 +4697,6 @@ def process_action(
     # Import modules here to avoid circular imports
     from core.managers import location_manager
     from updates.update_world_time import update_world_time
-    from updates.plot_update import update_plot
     from updates.update_character_info import update_character_info
 
     # Helper function to create consistent return values
@@ -3128,7 +4790,26 @@ def process_action(
                         ),
                     },
                 )
-        
+
+        # #263: one automatic save point before the fight begins (never
+        # during combat). Fail-forward: a failed checkpoint never stops it.
+        try:
+            from core.managers.status_manager import status_manager
+            status_manager.update_status("Saving a checkpoint before the fight...", is_processing=True)
+        except Exception:
+            pass
+        try:
+            from updates.save_game_manager import SaveGameManager
+            SaveGameManager().create_combat_checkpoint(
+                (action.get("parameters") or {}).get("encounterSummary", "")
+            )
+        except (LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop):
+            # A player's Load or Exit, or a read-only save stop, ends this
+            # turn before the fight is built (#845, as below for #654).
+            raise
+        except Exception as e:
+            warning(f"Combat checkpoint skipped: {e}", category="save_game")
+
         # Update status to lock input during encounter building
         try:
             from core.managers.status_manager import status_manager
@@ -3136,34 +4817,40 @@ def process_action(
             debug("STATE_CHANGE: Status updated to building encounter", category="combat_processing")
         except Exception as e:
             error(f"FAILURE: Could not update status for encounter building", exception=e, category="combat_processing")
-        
+
+        fight_finished = False
         try:
             print("[DEBUG ACTION_HANDLER] Calling combat_builder.py...")
             debug(f"SUBPROCESS: Sending to combat_builder.py: {json.dumps(action)}", category="combat_processing")
             # Get the path to combat_builder.py relative to the project root
             combat_builder_path = _generator_script_path("combat_builder.py")
             
-            result = subprocess.run(
-                [sys.executable, combat_builder_path],
-                input=json.dumps(action),
-                check=True, capture_output=True, text=True
-            )
+            import shutil
+            import tempfile
+
+            result_dir = tempfile.mkdtemp(prefix="combat_builder_")
+            try:
+                from utils.encoding_utils import utf8_child_env
+                result = subprocess.run(
+                    [sys.executable, combat_builder_path, "--result-file",
+                     os.path.join(result_dir, "result.json")],
+                    input=json.dumps(action),
+                    capture_output=True, encoding="utf-8", errors="replace",
+                    env=utf8_child_env()
+                )
+                encounter_id, build_failure = _built_encounter(
+                    os.path.join(result_dir, "result.json"), result.returncode
+                )
+            finally:
+                shutil.rmtree(result_dir, ignore_errors=True)
             print(f"[DEBUG ACTION_HANDLER] combat_builder.py completed")
             print(f"[DEBUG ACTION_HANDLER] Output: {result.stdout[:200]}...")  # First 200 chars
             debug(f"SUBPROCESS: combat_builder.py output: {result.stdout}", category="combat_processing")
             debug(f"SUBPROCESS: combat_builder.py status: {result.stderr}", category="combat_processing")
-            info("SUCCESS: Combat encounter created successfully", category="combat_processing")
+            info("SUBPROCESS: combat_builder.py exited %d" % result.returncode, category="combat_processing")
 
-            print(f"[DEBUG ACTION_HANDLER] Checking for success in output...")
-            if "Encounter successfully built and saved to" in result.stdout:
-                # Extract encounter ID from the full path
-                # Example: "modules/encounters/encounter_TW03-E2.json" -> "TW03-E2"
-                for line in result.stdout.split('\n'):
-                    if "Encounter successfully built and saved to" in line:
-                        encounter_path = line.split()[-1]
-                        encounter_id = encounter_path.split('encounter_')[-1].replace('.json', '')
-                        print(f"[DEBUG ACTION_HANDLER] SUCCESS! Encounter created with ID: {encounter_id}")
-                        break
+            if encounter_id:
+                print(f"[DEBUG ACTION_HANDLER] SUCCESS! Encounter created with ID: {encounter_id}")
 
                 # The builder persists an inactive typed candidate. Combat
                 # setup writes the complete history marker and conditionally
@@ -3188,17 +4875,24 @@ def process_action(
                     f"STATE_CHANGE: Preparing combat encounter ID: {encounter_id}",
                     category="combat_processing",
                 )
+                # Every enemy gets its engine occupant before the fight: the
+                # declared ID, the present group of its type at the place, or a
+                # new occupant created for a free name (P4-d). Never a stop.
+                from core.nql import occupants as _occupants
+                _occupants.declare_encounter(encounter_id)
 
                 # Reload location data here
                 current_location_id = party_tracker_data["worldConditions"]["currentLocationId"]
                 current_area_id = party_tracker_data["worldConditions"]["currentAreaId"]
                 # Use the reloaded location data for the combat simulation
-                reloaded_location_data = get_location_data(current_location_id, current_area_id)
+                reloaded_location_data = current_location_data(party_tracker_data, consumer="combat start")
 
 
                 if reloaded_location_data is None:
                     print(f"ERROR: Failed to load location data for {current_location_id}")
-                    return # Or handle error appropriately
+                    return _combat_start_failed(
+                        "location_unreadable", conversation_history, invocation_claim
+                    )
 
                 print(f"[DEBUG ACTION_HANDLER] About to call run_combat_simulation with encounter: {encounter_id}")
                 print("[DEBUG ACTION_HANDLER] This should start INTERACTIVE turn-based combat...")
@@ -3211,12 +4905,28 @@ def process_action(
                 except Exception as e:
                     error(f"FAILURE: Could not update status for combat start", exception=e, category="combat_processing")
                 
-                dialogue_summary, updated_player_info = run_combat_simulation(
-                    encounter_id,
-                    party_tracker_data,
-                    reloaded_location_data,
-                    invocation_claim=invocation_claim,
-                )
+                try:
+                    combat_result = run_combat_simulation(
+                        encounter_id,
+                        party_tracker_data,
+                        reloaded_location_data,
+                        invocation_claim=invocation_claim,
+                    )
+                except LiveProviderCompletedError as refused:
+                    # #1087: a refused combat call ends this window. Nothing
+                    # was cleared: the fight stays active and resumes at the
+                    # next start or Load. The one selector says why.
+                    error(
+                        "FAILURE: A combat provider call was refused; the fight is kept",
+                        exception=refused,
+                        category="combat_processing",
+                    )
+                    refusal = classify_provider_error(refused)
+                    return create_return(status="error", response_data={
+                        "provider_refusal": refusal["category"],
+                        "provider_refusal_provider": refusal["provider"],
+                        "provider_refusal_moment": "combat",
+                    })
 
                 authoritative_party = safe_json_load("party_tracker.json")
                 active_after_combat = (
@@ -3265,7 +4975,21 @@ def process_action(
                             ),
                         },
                     )
-                
+
+                # A quit at a combat prompt returns None and a stopped fight
+                # (None, None); neither is a finished fight (#444).
+                if not (
+                    isinstance(combat_result, tuple)
+                    and len(combat_result) == 2
+                    and isinstance(combat_result[0], str)
+                    and combat_result[0]
+                ):
+                    return _combat_start_failed(
+                        "combat_not_started", conversation_history, invocation_claim
+                    )
+                dialogue_summary, updated_player_info = combat_result
+                fight_finished = True
+
                 print(f"[DEBUG ACTION_HANDLER] Combat simulation returned. Type of result: {type(dialogue_summary)}")
                 print(f"[DEBUG ACTION_HANDLER] Dialogue summary preview: {str(dialogue_summary)[:200]}...")
 
@@ -3283,93 +5007,112 @@ def process_action(
                 else:
                     print("WARNING: Combat simulation did not return valid player info. Player file not updated.")
 
-                # Copy combat summary to main conversation history
-                print("[DEBUG ACTION_HANDLER] Loading combat conversation history...")
-                combat_history = safe_json_load("modules/conversation_history/combat_conversation_history.json")
-                print(f"[DEBUG ACTION_HANDLER] Combat history has {len(combat_history) if combat_history else 0} entries")
-                
-                combat_summary = next((entry for entry in reversed(combat_history) if entry["role"] == "assistant" and "Combat Summary:" in entry["content"]), None)
+                # Copy combat summary to main conversation history. The fight's
+                # exit wrote exactly this line and returned its summary, so the
+                # record never comes from an earlier fight (#444).
+                print("[DEBUG ACTION_HANDLER] Appending this fight's combat summary to conversation history")
+                # Add clear historical marker to prevent Combat Commitment Point confusion
+                from core.managers.combat_manager import (
+                    combat_record_exit_kind, combat_record_joined_against_party,
+                    combat_record_xp_receipt,
+                    render_combat_record_marker,
+                )
+                modified_combat_summary = {
+                    "role": "user",
+                    "content": render_combat_record_marker(
+                        "Combat Summary: " + dialogue_summary,
+                        combat_record_exit_kind(encounter_id),
+                        combat_record_xp_receipt(encounter_id),
+                        combat_record_joined_against_party(encounter_id),
+                    )
+                }
+                conversation_history.append(modified_combat_summary)
+                # Import save_conversation_history from main
+                if __name__ != "__main__":
 
-                if combat_summary:
-                    print("[DEBUG ACTION_HANDLER] Found combat summary, appending to conversation history")
-                    # Add clear historical marker to prevent Combat Commitment Point confusion
-                    modified_combat_summary = {
-                        "role": "user",
-                        "content": "[COMBAT CONCLUDED - HISTORICAL RECORD]\n" + combat_summary["content"] + "\n[END OF COMBAT RECORD - Please continue the narrative after this combat]\n\nIMPORTANT: This historical record describes character changes already applied by the combat system, including HP, spell slots, effects, XP, treasure, currency, items, and other rewards. Do not re-emit updateCharacterInfo actions for those changes."
-                    }
-                    conversation_history.append(modified_combat_summary)
-                    # Import save_conversation_history from main
-                    if __name__ != "__main__":
+                    sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-                        sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-                    from main import save_conversation_history
-                    save_conversation_history(conversation_history)
-                    print("[DEBUG ACTION_HANDLER] Returning with status='needs_post_combat_narration' - main loop will get follow-up from AI")
-                    print("[DEBUG ACTION_HANDLER] ========== CREATE ENCOUNTER END ==========\n")
-                    # SIGNAL-BASED ARCHITECTURE: This return value is crucial for maintaining chronological history.
-                    # When combat ends, we've already added the [COMBAT CONCLUDED...] summary to conversation_history.
-                    # This signal tells main.py to:
-                    # 1. NOT append the original createEncounter message (preventing duplication)
-                    # 2. Request a new AI response for natural post-combat narration
-                    # This ensures players get seamless transitions like Kira's dialogue after combat.
-                    return {"status": "needs_post_combat_narration"}
-                else:
-                    print("ERROR: Combat summary not found in combat conversation history")
-                    print("[DEBUG ACTION_HANDLER] ========== CREATE ENCOUNTER END WITH ERROR ==========\n")
-                    # Reset status on error
-                    try:
-                        from core.managers.status_manager import status_ready
-                        status_ready()
-                    except Exception:
-                        pass
+                from main import save_conversation_history
+                save_conversation_history(conversation_history)
+                # The engine's location record: each enemy's typed end in
+                # the fight resolves its occupant (P4-c). Never stops play.
+                from core.nql import occupants as _occupants
+                _occupants.resolve_combat(encounter_id)
+                print("[DEBUG ACTION_HANDLER] Returning with status='needs_post_combat_narration' - main loop will get follow-up from AI")
+                print("[DEBUG ACTION_HANDLER] ========== CREATE ENCOUNTER END ==========\n")
+                # SIGNAL-BASED ARCHITECTURE: This return value is crucial for maintaining chronological history.
+                # When combat ends, we've already added the [COMBAT CONCLUDED...] summary to conversation_history.
+                # This signal tells main.py to:
+                # 1. NOT append the original createEncounter message (preventing duplication)
+                # 2. Request a new AI response for natural post-combat narration
+                # This ensures players get seamless transitions like Kira's dialogue after combat.
+                return {"status": "needs_post_combat_narration"}
             else:
                 print(f"[DEBUG ACTION_HANDLER] FAILED! Encounter was not created successfully")
                 print(f"[DEBUG ACTION_HANDLER] Full stdout: {result.stdout}")
                 print(f"[DEBUG ACTION_HANDLER] Full stderr: {result.stderr}")
                 print("[DEBUG ACTION_HANDLER] ========== CREATE ENCOUNTER END WITH FAILURE ==========\n")
-                # Reset status on failure
-                try:
-                    from core.managers.status_manager import status_ready
-                    status_ready()
-                except Exception:
-                    pass
+                return _combat_start_failed(
+                    build_failure, conversation_history, invocation_claim
+                )
 
-        except (LiveProviderSuperseded, InvocationSupersededError):
+        except (LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop):
+            # A read-only save stop inside the combat ends the session now,
+            # not after the rest of this turn (issue #654).
             raise
         except subprocess.CalledProcessError as e:
             print(f"Error occurred while running combat_builder.py: {e}")
             print("Error output:", e.stderr)
             print("Standard output:", e.stdout)
-            # Reset status on exception
-            try:
-                from core.managers.status_manager import status_ready
-                status_ready()
-            except Exception:
-                pass
+            return _combat_start_failed(
+                "builder_failed", conversation_history, invocation_claim
+            )
         except Exception as e:
             print(f"Unexpected error occurred: {e}")
             import traceback
             traceback.print_exc()
-            # Reset status on exception
-            try:
-                from core.managers.status_manager import status_ready
-                status_ready()
-            except Exception:
-                pass
+            # This try also wraps the fight itself. After a finished fight the
+            # turn ends with the one failure line; before that, the tracker
+            # decides whether a fight is still active (#444).
+            if fight_finished:
+                return create_return(status="error", needs_update=False)
+            return _combat_start_failed(
+                "combat_not_started", conversation_history, invocation_claim
+            )
 
     elif action_type == ACTION_UPDATE_TIME:
         status_advancing_time()
         time_estimate_str = str(parameters["timeEstimate"])
-        update_world_time(time_estimate_str)
+        # D4: the engine's document holds the clock; the tracker follows it.
+        # The turn's id makes a retried turn historical, not a second wait.
+        from core.nql import game_clock
+
+        if not game_clock.advance_minutes(
+            time_estimate_str,
+            _engine_request_id(invocation_claim, action_context, "time"),
+        ):
+            update_world_time(time_estimate_str)
 
     elif action_type == ACTION_UPDATE_PLOT:
+        # QS: the quest record is the engine's. One typed action, one engine
+        # request; a refusal goes back to the DM as a Quest Error correction
+        # and later actions of this response do not run. module_plot.json is
+        # authored content and is never written here.
         status_updating_plot()
-        plot_point_id = parameters["plotPointId"]
-        new_status = parameters["newStatus"]
-        plot_impact = parameters.get("plotImpact", "")
-        plot_filename = "module_plot.json"  # Now using unified plot file
-        updated_plot = update_plot(plot_point_id, new_status, plot_impact, plot_filename)
+        from utils import quest_record as _quest_record
+
+        _module = str(party_tracker_data.get("module") or "").replace(" ", "_")
+        _outcome = _quest_record.apply_update(
+            parameters,
+            _engine_request_id(invocation_claim, action_context, "updatePlot"),
+            _module,
+        )
+        if _outcome.get("outcome") == "applied":
+            _quest_record.journal_after_change(_module)
+        if _outcome.get("correction"):
+            conversation_history.append({"role": "user", "content": _outcome["correction"]})
+            needs_conversation_history_update = True
+            return create_return(status="needs_response", needs_update=True)
 
     elif action_type == ACTION_EXIT_GAME:
         # Don't add return message here - it will be added when the player actually returns
@@ -3529,54 +5272,73 @@ def process_action(
         # IDs and could turn an authorized local move into a false module
         # transition. Real module changes use updatePartyTracker and its
         # existing publication transaction instead.
-        pending_archive = None
-        campaign_manager = None
-
         transition_checkpoint = None
-        if pending_archive is None:
-            from core.managers.campaign_manager import (
-                _party_module_transition_lock,
+        from core.managers.campaign_manager import (
+            _party_module_transition_lock,
+        )
+
+        with _party_module_transition_lock():
+            existing_checkpoint = safe_json_load(
+                PENDING_LOCATION_TRANSITION_FILE
             )
-
-            with _party_module_transition_lock():
-                existing_checkpoint = safe_json_load(
-                    PENDING_LOCATION_TRANSITION_FILE
+            if isinstance(existing_checkpoint, dict):
+                return create_return(
+                    status="error",
+                    needs_update=False,
+                    response_data={
+                        "error_message": (
+                            "A prior location transition is awaiting recovery"
+                        ),
+                        "retryable": True,
+                        "error_code": "transition_plan_stale",
+                    },
                 )
-                if isinstance(existing_checkpoint, dict):
-                    return create_return(
-                        status="error",
-                        needs_update=False,
-                        response_data={
-                            "error_message": (
-                                "A prior location transition is awaiting recovery"
-                            ),
-                            "retryable": True,
-                            "error_code": "transition_plan_stale",
-                        },
-                    )
-                transition_checkpoint = _new_current_transition_checkpoint(
-                    module_name=approved_transition_plan.module_name,
-                    origin_area_id=current_area_id,
-                    origin_location_id=current_location_id,
-                    origin_location_name=current_location_name,
-                    destination_location_id=new_location_name_or_id,
-                    destination_location_name=destination_node.get(
-                        "location_name", new_location_name_or_id
-                    ),
-                    destination_area_id=destination_node.get("area_id", ""),
-                    destination_area_name=destination_node.get("area_name", ""),
-                    conversation_history=conversation_history,
-                    deferred_actions=transition_deferred_actions,
-                    origin_party_tracker=authoritative_party,
-                )
-                transition_id = transition_checkpoint["operation_id"]
-                _write_location_transition_checkpoint(transition_checkpoint)
+            transition_checkpoint = _new_current_transition_checkpoint(
+                module_name=approved_transition_plan.module_name,
+                origin_area_id=current_area_id,
+                origin_location_id=current_location_id,
+                origin_location_name=current_location_name,
+                destination_location_id=new_location_name_or_id,
+                destination_location_name=destination_node.get(
+                    "location_name", new_location_name_or_id
+                ),
+                destination_area_id=destination_node.get("area_id", ""),
+                destination_area_name=destination_node.get("area_name", ""),
+                conversation_history=conversation_history,
+                deferred_actions=transition_deferred_actions,
+                origin_party_tracker=authoritative_party,
+                path=(
+                    ()
+                    if approved_transition_plan.authority == "engine"
+                    else approved_transition_plan.path
+                ),
+                authority=approved_transition_plan.authority,
+                travel_minutes=getattr(approved_transition_plan, "travel_minutes", None),
+            )
+            transition_id = transition_checkpoint["operation_id"]
+            _write_location_transition_checkpoint(transition_checkpoint)
 
-            # Required semantic sibling proposals are frozen before movement,
-            # outside the party/module mutation lock. A provider wait can
-            # therefore neither hold the transition fence nor strand a
-            # partially applied player turn.
+        # Required semantic sibling proposals are frozen before movement,
+        # outside the party/module mutation lock. A provider wait can
+        # therefore neither hold the transition fence nor strand a
+        # partially applied player turn. A failure here ends this turn
+        # cleanly (#855): nothing has moved, so the move's own checkpoint is
+        # retired and the player gets the curated failure line.
+        try:
             prepare_current_transition_actions(transition_id)
+        except (LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop):
+            raise
+        except Exception as prepare_error:
+            error(
+                "FAILURE: travel prepare failed",
+                exception=prepare_error,
+                category="location_transitions",
+            )
+            _retire_unmoved_transition_checkpoint(transition_id)
+            return create_return(
+                status="error",
+                response_data=_travel_prepare_failure(prepare_error),
+            )
         
         # Use enhanced location manager with auto-generated area connectivity ID
         def run_location_transition():
@@ -3592,150 +5354,109 @@ def process_action(
                     "topology_identity": verified_transition_context.get("topology_identity"),
                     **destination_node,
                 },
-                defer_post_commit=True,
             )
 
-        if pending_archive is not None:
-            try:
-                transition_prompt, _transitioned_party = (
-                    campaign_manager.publish_location_module_transition(
-                        pending_archive["from_module"],
-                        pending_archive["to_module"],
-                        conversation_history,
-                        pending_archive["completion_id"],
-                        run_location_transition,
+        from core.managers.campaign_manager import (
+            _party_module_transition_lock,
+        )
+
+        while True:
+            with _party_module_transition_lock():
+                try:
+                    locked_party = safe_json_load("party_tracker.json")
+                    locked_valid, locked_error, _locked_context = (
+                        verify_approved_transition_plan(
+                            approved_transition_plan,
+                            party_tracker_data=locked_party,
+                            destination_location_id=new_location_name_or_id,
+                            location_graph=None,
+                            return_context=True,
+                        )
                     )
+                except OSError as exc:
+                    if not is_transient_filesystem_error(exc):
+                        raise
+                else:
+                    if not locked_valid:
+                        pending = load_current_transition_checkpoint(transition_id)
+                        if pending is not None and pending.get("phase") == "planned":
+                            _remove_location_transition_checkpoint()
+                        return create_return(
+                            status="error",
+                            needs_update=False,
+                            response_data={
+                                "error_message": locked_error,
+                                "retryable": True,
+                                "error_code": "transition_plan_stale",
+                            },
+                        )
+                    # Never retry movement here: only the pre-commit reads
+                    # above may wait and reacquire this lock.
+                    transition_result = run_location_transition()
+                    break
+            _interruptible_wait(
+                0.25, transition_scope, "Checking the travel map..."
+            )
+        transition_context = (
+            transition_result if isinstance(transition_result, dict) else None
+        )
+        # handle_location_transition returns its context dict only when the
+        # party moved (#773).
+        movement_committed = transition_context is not None
+        if movement_committed:
+            with _party_module_transition_lock():
+                current_checkpoint = load_current_transition_checkpoint(
+                    transition_id
                 )
-            except Exception as e:
-                error(
-                    "FAILURE: Could not publish cross-module location transition",
-                    exception=e,
-                    category="module_management",
-                )
-                publication_state = _completion_publication_state(
-                    campaign_manager,
-                    pending_archive,
-                )
+                if current_checkpoint is None:
+                    raise RuntimeError(
+                        "current transition checkpoint disappeared before movement receipt"
+                    )
+                current_checkpoint["phase"] = "movement_committed"
+                _write_location_transition_checkpoint(current_checkpoint)
+            # C10a: the engine's party walks the committed path (the
+            # resume walks it again, answered from the record).
+            from core.nql import travel
+            travel.realign(current_checkpoint)
+            commit_current_transition_arrival(transition_id)
+
+            reconciliation_status = resolve_current_transition_reconciliation(
+                transition_id, transition_context
+            )
+            if reconciliation_status == "blocked_conflict":
                 return create_return(
                     status="error",
                     needs_update=False,
                     response_data={
-                        "error_message": str(e),
-                        "pending_archive": pending_archive,
-                        "completion_publication_state": publication_state,
-                        "transition_recovery_required": (
-                            publication_state != "absent"
+                        "error_message": (
+                            "The origin location changed while its committed "
+                            "departure was being reconciled. Recovery is "
+                            "required before another turn."
                         ),
+                        "retryable": False,
+                        "error_code": "transition_recovery_conflict",
                     },
                 )
-        else:
-            from core.managers.campaign_manager import (
-                _party_module_transition_lock,
+            departure_summary = resolve_current_transition_departure(
+                transition_id, transition_context
             )
+            transition_context["departure_summary"] = departure_summary
 
-            while True:
-                with _party_module_transition_lock():
-                    try:
-                        locked_party = safe_json_load("party_tracker.json")
-                        locked_valid, locked_error, _locked_context = (
-                            verify_approved_transition_plan(
-                                approved_transition_plan,
-                                party_tracker_data=locked_party,
-                                destination_location_id=new_location_name_or_id,
-                                location_graph=None,
-                                return_context=True,
-                            )
-                        )
-                    except OSError as exc:
-                        if not is_transient_filesystem_error(exc):
-                            raise
-                    else:
-                        if not locked_valid:
-                            pending = load_current_transition_checkpoint(transition_id)
-                            if pending is not None and pending.get("phase") == "planned":
-                                _remove_location_transition_checkpoint()
-                            return create_return(
-                                status="error",
-                                needs_update=False,
-                                response_data={
-                                    "error_message": locked_error,
-                                    "retryable": True,
-                                    "error_code": "transition_plan_stale",
-                                },
-                            )
-                        # Never retry movement here: only the pre-commit reads
-                        # above may wait and reacquire this lock.
-                        transition_result = run_location_transition()
-                        break
-                _interruptible_wait(
-                    0.25, transition_scope, "Checking the travel map..."
-                )
-            transition_context = (
-                transition_result if isinstance(transition_result, dict) else None
-            )
-            transition_prompt = (
-                transition_context.get("transition_prompt")
-                if transition_context is not None
-                else transition_result
-            )
-            if transition_prompt and transition_checkpoint is not None:
-                with _party_module_transition_lock():
-                    current_checkpoint = load_current_transition_checkpoint(
-                        transition_id
-                    )
-                    if current_checkpoint is None:
-                        raise RuntimeError(
-                            "current transition checkpoint disappeared before movement receipt"
-                        )
-                    current_checkpoint["phase"] = "movement_committed"
-                    _write_location_transition_checkpoint(current_checkpoint)
-
-            if transition_prompt and transition_context is not None:
-                reconciliation_status = resolve_current_transition_reconciliation(
-                    transition_id, transition_context
-                )
-                if reconciliation_status == "blocked_conflict":
-                    return create_return(
-                        status="error",
-                        needs_update=False,
-                        response_data={
-                            "error_message": (
-                                "The origin location changed while its committed "
-                                "departure was being reconciled. Recovery is "
-                                "required before another turn."
-                            ),
-                            "retryable": False,
-                            "error_code": "transition_recovery_conflict",
-                        },
-                    )
-                departure_summary = resolve_current_transition_departure(
-                    transition_id, transition_context
-                )
-                transition_context["departure_summary"] = departure_summary
-
-        if transition_prompt:
             info("SUCCESS: Location movement and departure state committed", category="location_transitions")
             response_data = {
-                "transition_prompt": transition_prompt,
                 "departure_summary": transition_context.get("departure_summary"),
             }
-            if transition_checkpoint is not None:
-                response_data["location_transition_id"] = transition_checkpoint[
-                    "operation_id"
-                ]
+            response_data["location_transition_id"] = transition_checkpoint[
+                "operation_id"
+            ]
             return create_return(needs_update=True, response_data=response_data)
-             # After transition, the current_location_data in the main loop might be stale.
-            # We need to ensure the AI response processing uses the *new* location data.
-            # This might require process_ai_response to reload location data or for main_game_loop to handle it.
-            # For now, let's assume the main loop will reload it before the next AI call.
         else:
-            if transition_checkpoint is not None:
-                authoritative_after = safe_json_load("party_tracker.json") or {}
-                after_location = authoritative_after.get(
-                    "worldConditions", {}
-                ).get("currentLocationId")
-                if str(after_location or "") == str(current_location_id):
-                    _remove_location_transition_checkpoint()
+            authoritative_after = safe_json_load("party_tracker.json") or {}
+            after_location = authoritative_after.get(
+                "worldConditions", {}
+            ).get("currentLocationId")
+            if str(after_location or "") == str(current_location_id):
+                _remove_location_transition_checkpoint()
             print("ERROR: Failed to handle location transition")
             # Create error message for the AI DM
             error_message = f"""SYSTEM ERROR: Location Transition Failed
@@ -3766,7 +5487,7 @@ Please use a valid location that exists in the current area ({current_area_id}) 
 
         try:
             # Import the session manager
-            from core.managers.level_up_manager import LevelUpSession
+            from core.managers.level_up_session import LevelUpSession
             
             # Find character file to get current level
             from updates.update_character_info import normalize_character_name
@@ -3822,14 +5543,13 @@ Please use a valid location that exists in the current area ({current_area_id}) 
         if not character_name:
             # Try npcName first (for NPC updates)
             character_name = parameters.get("npcName")
-            if not character_name:
-                # Fall back to player name from party tracker
-                character_name = next((member.lower() for member in party_tracker_data["partyMembers"]), None)
+            # Never a default character: an update that names none changes nothing (#914)
         
         if character_name:
             debug(f"STATE_CHANGE: Updating character info for {character_name}", category="character_updates")
             try:
                 from core.managers.effects_runtime import update_character_with_effects
+                from updates.update_character_info import EngineRefusedChange
 
                 debug(f"STATE_CHANGE: Calling effects-aware character update for {character_name}", category="character_updates")
                 success = update_character_with_effects(
@@ -3837,6 +5557,8 @@ Please use a valid location that exists in the current area ({current_area_id}) 
                     changes,
                     party_tracker_data,
                     action_context=action_context,
+                    affects=parameters.get("affects"),
+                    casting_resource=parameters.get("castingResource"),
                 )
                 debug(f"STATE_CHANGE: effects-aware character update returned {success}", category="character_updates")
                 if success:
@@ -3851,16 +5573,33 @@ Please use a valid location that exists in the current area ({current_area_id}) 
                             "error_message": "Character update failed safely; no partial effect was applied."
                         },
                     )
+            except EngineRefusedChange as refusal:
+                # The rules engine refused the change (coins, hit points, spell
+                # slots or feature uses). Nothing was written; the model hears
+                # why and answers again, and later actions from this response
+                # do not run.
+                print(f"ERROR: Engine refused character update for {character_name}: {refusal.reason}")
+                conversation_history.append({"role": "user", "content": (
+                    f"Rules Error: {refusal.reason}. Nothing changed on {character_name}'s sheet. Later actions from "
+                    "this response have not executed. Do not repeat earlier completed actions; propose a change the "
+                    "sheet can cover (a payment, a spell slot or a feature use that is still available) or narrate "
+                    "why it cannot happen.")})
+                needs_conversation_history_update = True
+                return create_return(status="needs_response", needs_update=True)
             except Exception as e:
                 error(f"FAILURE: Exception in character update", exception=e, category="character_updates")
                 # Use print with separate arguments to avoid format string interpretation
                 print("ERROR: Failed to update character info:", str(e))
-                return create_return(
-                    status="error",
-                    response_data={
-                        "error_message": "Character effect classification or update failed safely."
-                    },
-                )
+                response_data = {
+                    "error_message": "Character effect classification or update failed safely."
+                }
+                if isinstance(e, LiveProviderCompletedError):
+                    # A provider refusal (#240): record its class so the one
+                    # failure-message selector can tell the player why (#432).
+                    refusal = classify_provider_error(e)
+                    response_data["provider_refusal"] = refusal["category"]
+                    response_data["provider_refusal_provider"] = refusal["provider"]
+                return create_return(status="error", response_data=response_data)
             finally:
                 # Always reset status after character update completes
                 try:
@@ -3870,13 +5609,49 @@ Please use a valid location that exists in the current area ({current_area_id}) 
                 except Exception:
                     pass
         else:
-            print("ERROR: No character name provided and no player found in party tracker.")
+            print("ERROR: updateCharacterInfo names no character; nothing was changed (#914).")
             # Reset status even if no character was found
             try:
                 from core.managers.status_manager import status_ready
                 status_ready()
             except Exception:
                 pass
+
+    elif action_type == ACTION_ROLL_CHECK:
+        # C2a: the DM names the check; the engine scores it. The player's own
+        # dice come from the roll prompt before the next DM turn; companions
+        # and engine-rolled checks resolve now. Results reach the next DM Note.
+        try:
+            from core.managers.checks_runtime import stage_roll_check
+
+            outcome = stage_roll_check(parameters)
+        except ReadOnlySaveStop:
+            raise
+        except Exception as exc:
+            error("FAILURE: rollCheck failed safely", exception=exc, category="character_updates")
+            return create_return(status="error", response_data={"error_message": "The check could not be staged safely."})
+        if outcome.get("error"):
+            return create_return(status="error", response_data={"error_message": outcome["error"]})
+        return create_return()
+
+    elif action_type == ACTION_AWARD_EXPERIENCE:
+        # X1b: the DM names the amount; the engine adds it to the character's XP and
+        # writes the next-level threshold and any earned level-up back to the sheet.
+        status_updating_character()
+        try:
+            from core.managers.experience_runtime import award_experience
+
+            outcome = award_experience(parameters)
+        except ReadOnlySaveStop:
+            raise
+        except Exception as exc:
+            error("FAILURE: awardExperience failed safely", exception=exc, category="character_updates")
+            return create_return(status="error", response_data={"error_message": "The XP award could not be applied safely."})
+        if outcome.get("error"):
+            # Fail forward: the response goes on; the refusal is in the log and the sheet is unchanged.
+            warning(f"XP: {outcome['error']}", category="character_updates")
+            return create_return()
+        return create_return()
 
     elif action_type == ACTION_REMOVE_EFFECT:
         status_updating_character()
@@ -3923,28 +5698,58 @@ Please use a valid location that exists in the current area ({current_area_id}) 
 
 
     elif action_type == ACTION_UPDATE_PARTY_NPCS:
-        operation = parameters["operation"]
-        npc = parameters["npc"]
-        # Capture the roster before the commit so we can tell whether this action
-        # actually changed state (idempotent duplicate add / no-op remove must not
-        # trigger a lifecycle hook or a conversation-history refresh).
-        _roster_before = [
-            dict(x) for x in party_tracker_data.get("partyNPCs", [])
-        ]
-        update_party_npcs(party_tracker_data, operation, npc)
-        _roster_after = party_tracker_data.get("partyNPCs", [])
-        _state_changed = _roster_after != _roster_before
-        # T105: best-effort NPC-voice lifecycle hook after the roster commit.
-        # Only fires when the roster actually changed (idempotent duplicate add /
-        # no-op remove is a true no-op). Always live and fail-open; it must never break
-        # the committed roster action.
-        if _state_changed:
+        operation = parameters.get("operation")
+        npc = parameters.get("npc") if isinstance(parameters.get("npc"), dict) else {}
+        from updates.update_character_info import name_refusal
+        from utils.status_words import NPC_STATUS_WORDS
+        _refusal = name_refusal(npc.get("name")) if operation == "add" else None
+        if _refusal:
+            # #949: no sheet is built for a name that cannot name a character;
+            # #1119: nor for a name carrying a status word.
+            _name = str(npc.get("name") or "")
+            conversation_history.append({"role": "user", "content": (
+                f"Party Error: updatePartyNPCs add for {_name} did not complete: {_refusal}. Nothing was built "
+                f"and nobody joined. Later actions from this response have not executed. Do not repeat earlier "
+                f"completed actions. Give this companion its proper name: a name with letters that is not a "
+                f"reserved engine name and has no status word ({', '.join(NPC_STATUS_WORDS)}).")})
+            needs_conversation_history_update = True
+            return create_return(status="needs_response", needs_update=True)
+        if turn_roster is None:
+            turn_roster = TurnRoster.get(turn_key(invocation_claim))
+        _request_id = _engine_request_id(invocation_claim, action_context, "party")
+        _party_outcome = update_party_npcs(
+            party_tracker_data,
+            parameters,
+            turn_roster=turn_roster,
+            request_id=_request_id,
+            id_suffix=_party_id_suffix(invocation_claim, action_context),
+        )
+        if _party_outcome is None:
+            # The add's sheet could not be built: nothing joined. The DM is told
+            # so, as for a refused quest or storage step, and later actions of
+            # this response do not run (#534).
+            _name = str(npc.get("name") or "")
+            conversation_history.append({"role": "user", "content": (
+                f"Party Error: updatePartyNPCs add for {_name} did not complete: no character sheet could be "
+                f"built for {_name}. Nothing changed in the party roster; {_name} has not joined. Later actions "
+                f"from this response have not executed. Do not repeat earlier completed actions. Narrate that "
+                f"{_name} is not with the party yet; the player can ask again.")})
+            needs_conversation_history_update = True
+            return create_return(status="needs_response", needs_update=True)
+        if _party_outcome["kind"] == "correction":
+            conversation_history.append({"role": "user", "content": _party_error(operation, _party_outcome["text"])})
+            needs_conversation_history_update = True
+            return create_return(status="needs_response", needs_update=True)
+        # T105: best-effort NPC-voice lifecycle hook after the roster commit,
+        # fired by the outcome's kind: a join or heal is an arrival (a heal
+        # seeds no T107 profile), a leave a departure; a noop fires nothing.
+        # Always live and fail-open; it must never break the committed roster
+        # action.
+        if _party_outcome["kind"] in ("join", "heal", "leave"):
             needs_conversation_history_update = True
             try:
                 lifecycle_context = parameters.get("lifecycleContext")
-                source_turn_id = str(
-                    getattr(invocation_claim, "logical_invocation_id", "") or ""
-                ).strip()
+                source_turn_id = turn_key(invocation_claim)
                 if not source_turn_id:
                     warning(
                         "T105 NPC lifecycle hook skipped after roster commit: "
@@ -3952,31 +5757,14 @@ Please use a valid location that exists in the current area ({current_area_id}) 
                         category="character_updates",
                     )
                 else:
-                    npc_name = str(npc.get("name") or "")
-                    npc_file = ""
-                    try:
-                        _lc_module = party_tracker_data.get("module", "").replace(" ", "_")
-                        _lc_pm = ModulePathManager(_lc_module)
-                        from updates.update_character_info import (
-                            find_character_file_fuzzy,
-                            normalize_character_name,
-                        )
-                        _matched = find_character_file_fuzzy(npc_name)
-                        if _matched:
-                            npc_file = _lc_pm.get_character_path(_matched)
-                        else:
-                            npc_file = _lc_pm.get_character_path(
-                                normalize_character_name(npc_name)
-                            )
-                    except Exception:
-                        npc_file = ""
                     _apply_party_npc_lifecycle(
                         party_tracker_data,
-                        operation,
-                        npc_name,
-                        npc_file,
+                        "remove" if _party_outcome["kind"] == "leave" else "add",
+                        str(_party_outcome.get("display_name") or ""),
+                        str(_party_outcome.get("npc_path") or ""),
                         lifecycle_context,
                         source_turn_id,
+                        seed_profile=_party_outcome["kind"] == "join",
                     )
             except Exception as exc:
                 warning(
@@ -3984,6 +5772,15 @@ Please use a valid location that exists in the current area ({current_area_id}) 
                     % (type(exc).__name__, str(exc)),
                     category="character_updates",
                 )
+        # The companion's occupant follows the roster (P4-e) by the planned
+        # lines, for every outcome. Best effort; never undoes the roster.
+        from core.nql import occupants as _occupants
+
+        _occupants.party_change(
+            _party_outcome["engine_lines"],
+            _request_id,
+            reason=_party_outcome.get("reason"),
+        )
 
     elif action_type == ACTION_UPDATE_ENCOUNTER:
         debug("STATE_CHANGE: Processing updateEncounter action", category="combat_processing")
@@ -4220,6 +6017,7 @@ Please use a valid location that exists in the current area ({current_area_id}) 
                 validate_create_new_module_action,
             )
             from core.generators.module_builder import (
+                ModuleCreationBusyError,
                 ModuleCreationCancelledError,
                 ModuleCreationFailedError,
                 ai_driven_module_creation,
@@ -4232,7 +6030,9 @@ Please use a valid location that exists in the current area ({current_area_id}) 
             # Build + publish are one atomic unit: the module is built in a
             # hidden temp workspace and swapped into modules/ in a single rename,
             # so a failure never leaves a half-built module live (fail-forward).
-            from utils.module_refresh_lock import module_refresh_lock
+            # The build takes module_refresh_lock itself, only to reserve its
+            # name and to publish (issue #708); it is not held here while the
+            # module generates.
 
             with module_build_usage_scope(build_id=build_id) as build_context:
                 build_id = str(build_context.build_id)
@@ -4246,86 +6046,85 @@ Please use a valid location that exists in the current area ({current_area_id}) 
                     )
                     return failure
 
-                with module_refresh_lock() as publication_acquired:
-                    if not publication_acquired:
-                        mark_module_build_outcome("lock_unavailable")
-                        failure = module_failure(
-                            message=(
-                                "Module creation is busy; no game state was "
-                                "changed. Please retry shortly."
-                            )
-                        )
-                        terminal_progress(
-                            "failed", failure["response_data"]["error_message"]
-                        )
-                        return failure
-
-                    # No cross-turn idempotency dedup: a createNewModule may carry
-                    # only a narrative (no module_name), and the allocated final
-                    # name may differ, so nothing can reliably match a retry to a
-                    # prior build. A crash-then-recreate yields a harmless SPARE
-                    # module the player can delete -- fail-forward, never a broken
-                    # or corrupted game. No prior in-flight state ever BLOCKS a
-                    # new build.
-                    stitcher = get_module_stitcher()
-                    try:
-                        # Builds into a hidden temp workspace and atomically swaps
-                        # the module into modules/<name> in one rename, updating
-                        # the advisory registry via the store-free helper. A
-                        # failure here NEVER touches live state -- the build simply
-                        # did not happen and the player keeps playing.
-                        success, module_name = ai_driven_module_creation(
-                            parameters,
-                            progress_callback=module_progress_callback,
-                            policy="game",
-                            prepare_candidate=(
-                                stitcher.build_publication_registry_bytes
-                            ),
-                        )
-                    except ModuleCreationCancelledError:
-                        mark_module_build_outcome("not_generated")
-                        failure = module_failure()
-                        terminal_progress(
-                            "failed", failure["response_data"]["error_message"]
-                        )
-                        return failure
-                    except ModuleCreationFailedError as build_error:
-                        # The build reports its reason instead of returning a bare
-                        # failure (issue #130). Log the detail, but keep the
-                        # player-facing message sanitized: provider output must
-                        # not leak into the DM conversation.
-                        error(
-                            f"Module creation failed: {build_error}",
-                            exception=build_error,
-                            category="module_creation",
-                        )
-                        mark_module_build_outcome("not_generated")
-                        failure = module_failure()
-                        terminal_progress(
-                            "failed", failure["response_data"]["error_message"]
-                        )
-                        return failure
-
-                    if not success or not module_name:
-                        mark_module_build_outcome("not_generated")
-                        failure = module_failure()
-                        terminal_progress(
-                            "failed", failure["response_data"]["error_message"]
-                        )
-                        return failure
-
-                    mark_module_build_outcome("published")
+                # No cross-turn idempotency dedup: a createNewModule may carry
+                # only a narrative (no module_name), and the allocated final
+                # name may differ, so nothing can reliably match a retry to a
+                # prior build. A crash-then-recreate yields a harmless SPARE
+                # module the player can delete -- fail-forward, never a broken
+                # or corrupted game. No prior in-flight state ever BLOCKS a
+                # new build.
+                stitcher = get_module_stitcher()
+                try:
+                    # Builds into a hidden temp workspace and atomically swaps
+                    # the module into modules/<name> in one rename, updating
+                    # the advisory registry via the store-free helper. A
+                    # failure here NEVER touches live state -- the build simply
+                    # did not happen and the player keeps playing.
+                    success, module_name = ai_driven_module_creation(
+                        parameters,
+                        progress_callback=module_progress_callback,
+                        policy="game",
+                        prepare_candidate=(
+                            stitcher.build_publication_registry_bytes
+                        ),
+                    )
+                except ModuleCreationCancelledError:
+                    mark_module_build_outcome("not_generated")
+                    failure = module_failure()
                     terminal_progress(
-                        "published",
-                        f"Module {module_name} was published successfully.",
-                        module_name,
+                        "failed", failure["response_data"]["error_message"]
                     )
-                    info(
-                        f"SUCCESS: Module '{module_name}' created and published",
-                        category="module_management",
+                    return failure
+                except ModuleCreationBusyError:
+                    # Module refresh stayed busy before anything was built.
+                    mark_module_build_outcome("lock_unavailable")
+                    failure = module_failure(
+                        message=(
+                            "Module creation is busy; no game state was "
+                            "changed. Please retry shortly."
+                        )
                     )
-                    needs_conversation_history_update = True
-                    return published_result(module_name)
+                    terminal_progress(
+                        "failed", failure["response_data"]["error_message"]
+                    )
+                    return failure
+                except ModuleCreationFailedError as build_error:
+                    # The build reports its reason instead of returning a bare
+                    # failure (issue #130). Log the detail, but keep the
+                    # player-facing message sanitized: provider output must
+                    # not leak into the DM conversation.
+                    error(
+                        f"Module creation failed: {build_error}",
+                        exception=build_error,
+                        category="module_creation",
+                    )
+                    mark_module_build_outcome("not_generated")
+                    failure = module_failure()
+                    terminal_progress(
+                        "failed", failure["response_data"]["error_message"]
+                    )
+                    return failure
+
+                if not success or not module_name:
+                    mark_module_build_outcome("not_generated")
+                    failure = module_failure()
+                    terminal_progress(
+                        "failed", failure["response_data"]["error_message"]
+                    )
+                    return failure
+
+                mark_module_build_outcome("published")
+                terminal_progress(
+                    "published",
+                    f"Module {module_name} was published successfully.",
+                    module_name,
+                )
+                info(
+                    f"SUCCESS: Module '{module_name}' created and published",
+                    category="module_management",
+                )
+                needs_conversation_history_update = True
+                return published_result(module_name)
         except Exception as module_error:
             error(
                 "FAILURE: Unexpected module creation pipeline error",
@@ -4399,11 +6198,7 @@ Please use a valid location that exists in the current area ({current_area_id}) 
             # Get storage description from parameters
             storage_description = parameters.get("description", "")
             character_name = parameters.get("characterName", "")
-            
-            # Fallback to party member if no character specified
-            if not character_name:
-                character_name = next((member for member in party_tracker_data["partyMembers"]), None)
-                
+            # Never a default character: a request that names none changes nothing (#959)
             if not character_name:
                 print(f"ERROR: No character name provided for storage interaction")
                 conversation_history.append({"role": "user", "content": "Storage Error: No character name provided for storage interaction. This storage step and later actions have not executed. Do not repeat earlier completed actions; use current state."})
@@ -4475,6 +6270,249 @@ Please use a valid location that exists in the current area ({current_area_id}) 
             needs_conversation_history_update = True
             return create_return(status="needs_response", needs_update=True)
 
+    elif action_type == ACTION_TRANSFER_ITEM:
+        # One typed handoff between two party characters. The engine moves the
+        # stock (core/nql/transfer.py) and both sheets are written together or
+        # not at all, replacing the two independent updateCharacterInfo deltas.
+        debug("STATE_CHANGE: Processing transferItem action", category="storage_operations")
+        status_updating_character()
+        try:
+            from core.managers.item_transfer import execute_transfer
+
+            result = execute_transfer(
+                parameters.get("fromCharacter", ""),
+                parameters.get("toCharacter", ""),
+                parameters.get("itemName", ""),
+                parameters.get("quantity", 1),
+                party_tracker_data,
+            )
+            if result.get("success"):
+                info(f"SUCCESS: {result.get('message')}", category="storage_operations")
+                conversation_history.append({"role": "user", "content": f"Transfer: {result.get('message')}"})
+                needs_conversation_history_update = True
+            else:
+                print(f"ERROR: Transfer failed: {result.get('error')}")
+                error_message = (
+                    f"Transfer Error: {result.get('error', 'the handoff was refused')}. Nothing moved; both sheets are "
+                    "unchanged. Later actions from this response have not executed. Do not repeat earlier completed "
+                    "actions; propose the handoff again from the current sheets or narrate why it cannot happen."
+                )
+                conversation_history.append({"role": "user", "content": error_message})
+                needs_conversation_history_update = True
+                return create_return(status="needs_response", needs_update=True)
+        except (LiveProviderSuperseded, InvocationSupersededError):
+            raise
+        except Exception as e:
+            print(f"ERROR: Exception while processing transferItem: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            error_message = "Transfer System Error: An unexpected error occurred while handing the item over. Nothing moved. Later actions from this response have not executed; check current state before proposing further changes. Do not repeat earlier completed actions."
+            conversation_history.append({"role": "user", "content": error_message})
+            needs_conversation_history_update = True
+            return create_return(status="needs_response", needs_update=True)
+
+    elif action_type == ACTION_EXPEND_CHARGES:
+        # One typed charge spend (item charges H1): the engine holds the count
+        # of every charged sheet row, spends exactly or refuses, and the sheet
+        # count is rewritten from its view. A retried turn is answered from
+        # the receipt on the sheet (chargeUses).
+        debug("STATE_CHANGE: Processing expendCharges action", category="storage_operations")
+        status_updating_character()
+        try:
+            from core.managers.item_charges import execute_expend
+
+            result = execute_expend(
+                parameters.get("characterName", ""),
+                parameters.get("itemName", ""),
+                parameters.get("charges", 1),
+                _engine_request_id(invocation_claim, action_context, "expendCharges"),
+                party_tracker_data,
+            )
+            if result.get("success"):
+                info(f"SUCCESS: {result.get('message')}", category="storage_operations")
+                conversation_history.append({"role": "user", "content": f"Charges: {result.get('message')}"})
+                needs_conversation_history_update = True
+            else:
+                print(f"ERROR: Charge spend failed: {result.get('error')}")
+                error_message = (
+                    f"Expend Error: {result.get('error', 'the spend was refused')}. Nothing changed: no charge was "
+                    "spent. Later actions from this response have not executed. Do not repeat earlier completed "
+                    "actions; spend a count the item has, name a charged item the character holds, or narrate why "
+                    "the item cannot be used."
+                )
+                conversation_history.append({"role": "user", "content": error_message})
+                needs_conversation_history_update = True
+                return create_return(status="needs_response", needs_update=True)
+        except (LiveProviderSuperseded, InvocationSupersededError):
+            raise
+        except Exception as e:
+            print(f"ERROR: Exception while processing expendCharges: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            error_message = "Charges System Error: An unexpected error occurred while spending charges. Nothing changed. Later actions from this response have not executed; check current state before proposing further changes. Do not repeat earlier completed actions."
+            conversation_history.append({"role": "user", "content": error_message})
+            needs_conversation_history_update = True
+            return create_return(status="needs_response", needs_update=True)
+
+    elif action_type == ACTION_ACQUIRE_ITEM:
+        # One typed acquisition from the SRD item catalog (SA, #499): the host
+        # prices it and makes change, one engine request pays and creates the
+        # item from its catalog type, and the sheet row comes from the engine's
+        # views. A retried turn is answered from the receipt on the sheet.
+        debug("STATE_CHANGE: Processing acquireItem action", category="storage_operations")
+        status_updating_character()
+        try:
+            from core.managers.item_acquisition import execute_acquisition
+
+            result = execute_acquisition(
+                parameters.get("characterName", ""),
+                parameters.get("itemName", ""),
+                parameters.get("quantity", 1),
+                parameters.get("price"),
+                _engine_request_id(invocation_claim, action_context, "acquireItem"),
+                party_tracker_data,
+                kind=parameters.get("kind"),
+                catalog_id=parameters.get("catalogId"),
+            )
+            if result.get("success"):
+                info(f"SUCCESS: {result.get('message')}", category="storage_operations")
+                conversation_history.append({"role": "user", "content": f"Acquisition: {result.get('message')}"})
+                needs_conversation_history_update = True
+            else:
+                print(f"ERROR: Acquisition failed: {result.get('error')}")
+                if result.get("listing") is not None:
+                    # P3a: a catalogId take is refused with its location's listing.
+                    from core.managers.item_acquisition import dispatch_refusal
+                    error_message = dispatch_refusal(result.get("error", "the acquisition was refused"), result["listing"])
+                else:
+                    error_message = (
+                        f"Acquire Error: {result.get('error', 'the acquisition was refused')}. Nothing changed: no coins "
+                        "moved and no item was added. Later actions from this response have not executed. Do not repeat "
+                        "earlier completed actions; name a catalog item and a whole-lot quantity the character can pay "
+                        "for, or, only when no catalog item can record what the narration showed, narrate briefly why it "
+                        "changed."
+                    )
+                conversation_history.append({"role": "user", "content": error_message})
+                needs_conversation_history_update = True
+                return create_return(status="needs_response", needs_update=True)
+        except (LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop):
+            raise
+        except Exception as e:
+            print(f"ERROR: Exception while processing acquireItem: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            error_message = "Acquisition System Error: An unexpected error occurred while acquiring the item. Nothing changed. Later actions from this response have not executed; check current state before proposing further changes. Do not repeat earlier completed actions."
+            conversation_history.append({"role": "user", "content": error_message})
+            needs_conversation_history_update = True
+            return create_return(status="needs_response", needs_update=True)
+
+    elif action_type in (ACTION_TRANSFER_CURRENCY, ACTION_SPLIT_CURRENCY):
+        # Coins between party characters as one engine transaction across every
+        # sheet involved (core/nql/currency.py); all sheets are written together
+        # or none is.
+        debug(f"STATE_CHANGE: Processing {action_type} action", category="storage_operations")
+        status_updating_character()
+        try:
+            from core.managers.currency_transfer import execute_currency_split, execute_currency_transfer
+
+            if action_type == ACTION_TRANSFER_CURRENCY:
+                amounts = {coin: parameters.get(coin) for coin in ("gold", "silver", "copper")
+                           if parameters.get(coin) not in (None, "", 0)}
+                result = execute_currency_transfer(
+                    parameters.get("fromCharacter", ""), parameters.get("toCharacter", ""), amounts, party_tracker_data,
+                )
+            else:
+                result = execute_currency_split(
+                    parameters.get("fromCharacter", ""), parameters.get("toCharacters"),
+                    parameters.get("giverKeepsShare", True), party_tracker_data,
+                    coins=parameters.get("coins") or None,
+                )
+            if result.get("success"):
+                info(f"SUCCESS: {result.get('message')}", category="storage_operations")
+                conversation_history.append({"role": "user", "content": f"Currency: {result.get('message')}"})
+                needs_conversation_history_update = True
+            else:
+                print(f"ERROR: {action_type} failed: {result.get('error')}")
+                error_message = (
+                    f"Currency Error: {result.get('error', 'the coin transfer was refused')}. No coins moved; every "
+                    "sheet is unchanged. Later actions from this response have not executed. Do not repeat earlier "
+                    "completed actions; propose the transfer again from the current balances or narrate why it cannot happen."
+                )
+                conversation_history.append({"role": "user", "content": error_message})
+                needs_conversation_history_update = True
+                return create_return(status="needs_response", needs_update=True)
+        except (LiveProviderSuperseded, InvocationSupersededError):
+            raise
+        except Exception as e:
+            print(f"ERROR: Exception while processing {action_type}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            error_message = "Currency System Error: An unexpected error occurred while moving coins. No coins moved. Later actions from this response have not executed; check current state before proposing further changes. Do not repeat earlier completed actions."
+            conversation_history.append({"role": "user", "content": error_message})
+            needs_conversation_history_update = True
+            return create_return(status="needs_response", needs_update=True)
+
+    elif action_type == ACTION_REST:
+        # A short or long rest for the whole party: the engine refills every
+        # pool the rest recovers on every sheet in one request
+        # (core/managers/rest_manager.py), then rest-bound effects clear.
+        debug("STATE_CHANGE: Processing rest action", category="character_updates")
+        status_updating_character()
+        try:
+            from core.managers.rest_manager import ask_hit_die_faces, execute_rest, player_hit_dice
+
+            # 7b-host: the player rolls their own hit dice (or presses Enter
+            # and the engine rolls); every other character's are the engine's.
+            faces = None
+            if str(parameters.get("restType") or "").strip().lower() == "short":
+                ask = player_hit_dice(party_tracker_data or {}, parameters.get("hitDice"))
+                if ask:
+                    faces = {ask[0]: ask_hit_die_faces(*ask, read=input)}
+            result = execute_rest(parameters.get("restType"), party_tracker_data, conversation_history,
+                                  hit_dice=parameters.get("hitDice"), faces=faces)
+            if result.get("success"):
+                info(f"SUCCESS: {result.get('message')}", category="character_updates")
+                conversation_history.append({"role": "user", "content": f"Rest: {result.get('message')}"})
+                if result.get("hit_dice_receipts"):
+                    # #840: the engine rolled the hit dice; the player sees the roll.
+                    _show_rest_receipt(" ".join(result["hit_dice_receipts"]))
+                if result.get("effects_note"):
+                    # process_effect_lifecycle returns a complete message
+                    # ({"role": "system", "content": ...}); append it as is.
+                    conversation_history.append(result["effects_note"])
+                needs_conversation_history_update = True
+                if result.get("hit_dice_refused"):
+                    # #1239 (D-1239-2 B, D-1239-4): the rest went ahead without some hit dice (refused
+                    # before rolling as certain to heal nothing, or refused by the engine, D-KWA-7e); the
+                    # DM tells the player now, in its own words.
+                    conversation_history.append({"role": "user", "content": (
+                        "Rest: some hit dice were not spent (the Rest line above says whose and why); the rest "
+                        "itself went ahead and is applied. Later actions from this response have not executed. "
+                        "Tell the player in the story which die is kept and why, without the record's field "
+                        "names. Do not state the rest again and do not move the clock.")})
+                    needs_conversation_history_update = True
+                    return create_return(status="needs_response", needs_update=True)
+            else:
+                print(f"ERROR: rest failed: {result.get('error')}")
+                conversation_history.append({"role": "user", "content": (
+                    f"Rest Error: {result.get('error', 'the rest was refused')}. No sheet changed. Later actions from "
+                    "this response have not executed. Do not repeat earlier completed actions; state the rest again "
+                    "with restType short or long (hitDice only on a short rest), or narrate why the party cannot "
+                    "rest.")})
+                needs_conversation_history_update = True
+                return create_return(status="needs_response", needs_update=True)
+        except (LiveProviderSuperseded, InvocationSupersededError):
+            raise
+        except Exception as e:
+            print(f"ERROR: Exception while processing rest: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            conversation_history.append({"role": "user", "content": (
+                "Rest System Error: An unexpected error occurred while applying the rest. No sheet changed. Later "
+                "actions from this response have not executed; check current state before proposing further changes.")})
+            needs_conversation_history_update = True
+            return create_return(status="needs_response", needs_update=True)
+
     elif action_type == ACTION_UPDATE_PARTY_TRACKER:
         debug("STATE_CHANGE: Processing updatePartyTracker action", category="party_management")
         try:
@@ -4502,16 +6540,22 @@ Please use a valid location that exists in the current area ({current_area_id}) 
             # Check if module is being changed
             new_module = parameters.get("module")
             if new_module and new_module != current_module:
+                # A usable destination requires both real IDs and an exact
+                # module id (#1287). Models may emit the full field shape with
+                # empty strings; treating those keys as "provided" publishes a
+                # module with a blank world projection and strands the player
+                # at "()" in the web UI. Resolved first, so a refusal reads and
+                # builds nothing.
+                parameters.update(
+                    resolve_cross_module_target_projection(new_module, parameters)
+                )
                 print(f"DEBUG: [Module Transition] Module change detected: {current_module} -> {new_module}")
                 print(f"DEBUG: [Party Tracker Before Update] Module: {current_party_data.get('module', 'Unknown')}")
                 info(f"STATE_CHANGE: Module change detected: {current_module} -> {new_module}", category="module_management")
                 
                 # Insert module transition marker immediately when module change is detected
                 transition_text = f"Module transition: {current_module} to {new_module}"
-                transition_message = {
-                    "role": "user",
-                    "content": transition_text
-                }
+                transition_message = hm.marker("user", transition_text, hm.MODULE_TRANSITION)
                 transition_history = list(conversation_history)
                 transition_history.append(transition_message)
                 print(f"DEBUG: [Module Transition] Inserted transition marker: '{transition_text}'")
@@ -4554,14 +6598,6 @@ Please use a valid location that exists in the current area ({current_area_id}) 
                         info(f"SUCCESS: Campaign context prepared for {new_module}", category="module_management")
                     else:
                         warning(f"STATE_CHANGE: No campaign context to inject for {new_module} - context was empty", category="module_management")
-                
-                # A usable destination requires both real IDs. Models may emit
-                # the full field shape with empty strings; treating those keys
-                # as "provided" publishes a module with a blank world
-                # projection and strands the player at "()" in the web UI.
-                parameters.update(
-                    resolve_cross_module_target_projection(new_module, parameters)
-                )
             
             # Update party tracker with all provided parameters
             for key, value in parameters.items():
@@ -4640,31 +6676,55 @@ Please use a valid location that exists in the current area ({current_area_id}) 
                 response_data=response_data,
             )
 
-    elif action_type == ACTION_MOVE_BACKGROUND_NPC:
-        debug("STATE_CHANGE: Processing moveBackgroundNPC action", category="npc_management")
-        try:
-            # Extract parameters
-            npc_name = parameters.get("npcName")
-            context = parameters.get("context", "")
-            current_location = parameters.get("currentLocation")
-            
-            if not npc_name:
-                print(f"ERROR: Missing required parameter 'npcName' for moveBackgroundNPC action")
-                return create_return(status="continue", needs_update=False)
-            
-            # Process the NPC movement
-            success = move_background_npc(npc_name, context, current_location, party_tracker_data)
-            
-            if success:
-                info(f"SUCCESS: Processed movement for NPC: {npc_name}", category="npc_management")
-                needs_conversation_history_update = True
+    elif action_type in (
+        ACTION_RESOLVE_OCCUPANT,
+        ACTION_SET_OCCUPANT_ATTITUDE,
+        ACTION_MOVE_OCCUPANT,
+        ACTION_RETURN_OCCUPANT,
+        ACTION_MOVE_BACKGROUND_NPC,
+    ):
+        # Typed story outcomes on the engine's occupant record (P4-e). The DM
+        # decided what became of the occupant; the engine records it by id.
+        # A refusal goes back to the DM as a correction with the present ids,
+        # the way a refused handoff does; an unavailable engine never stops
+        # the turn. The retired moveBackgroundNPC is forwarded to moveOccupant
+        # when it names an occupant and a destination, else corrected.
+        debug("STATE_CHANGE: Processing %s action" % action_type, category="npc_management")
+        from core.nql import occupants as _occupants
+
+        _module = str(party_tracker_data.get("module") or "")
+        _location_id = str(
+            (party_tracker_data.get("worldConditions") or {}).get("currentLocationId") or ""
+        )
+        _occupant_action = action_type
+        _occupant_parameters = parameters
+        _correction = None
+        if action_type == ACTION_MOVE_BACKGROUND_NPC:
+            _legacy = _occupants.legacy_move(parameters, _module, _location_id)
+            if _legacy.get("forward"):
+                _occupant_action = ACTION_MOVE_OCCUPANT
+                _occupant_parameters = _legacy["forward"]
             else:
-                print(f"ERROR: Failed to process movement for NPC: {npc_name}")
-                
-        except Exception as e:
-            print(f"ERROR: Exception while processing moveBackgroundNPC: {str(e)}")
-            import traceback
-            traceback.print_exc()
+                _correction = _legacy.get("correction")
+        if _occupant_action != ACTION_MOVE_BACKGROUND_NPC and _correction is None:
+            # A companion's person is not moved or returned here: they part
+            # ways through updatePartyNPCs. An unreadable roster refuses nothing.
+            _roster = party_tracker_data.get("partyNPCs")
+            _outcome = _occupants.apply_dm_action(
+                _occupant_action,
+                _occupant_parameters,
+                _engine_request_id(invocation_claim, action_context, _occupant_action),
+                _module,
+                _location_id,
+                companion_ids=frozenset(_roster_ids(_roster)) if isinstance(_roster, list) else frozenset(),
+            )
+            if _outcome.get("ok"):
+                needs_conversation_history_update = True
+            _correction = _outcome.get("correction")
+        if _correction:
+            conversation_history.append({"role": "user", "content": _correction})
+            needs_conversation_history_update = True
+            return create_return(status="needs_response", needs_update=True)
 
     elif action_type == ACTION_SAVE_GAME:
         debug("STATE_CHANGE: Processing save game action", category="save_game")
@@ -4795,242 +6855,6 @@ Please use a valid location that exists in the current area ({current_area_id}) 
     
     return create_return(needs_update=needs_conversation_history_update)
 
-def move_background_npc(npc_name, context, current_location_hint=None, party_tracker_data=None):
-    """
-    AI-driven function to handle NPC movement/status changes with atomic safety
-    
-    Args:
-        npc_name (str): Name of the NPC to move/update
-        context (str): Narrative context explaining what happened to the NPC
-        current_location_hint (str, optional): Hint about current location if not found automatically
-        party_tracker_data (dict, optional): Party tracker data for module context
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    import json
-    import copy
-    import shutil
-    import os
-    import time
-    from datetime import datetime
-    from utils.file_operations import safe_write_json, safe_read_json
-    
-    debug(f"STATE_CHANGE: moveBackgroundNPC called for {npc_name}", category="npc_management")
-    debug(f"AI_CALL: Context: {context}", category="npc_management")
-    
-    if not party_tracker_data:
-        party_tracker_data = safe_read_json("party_tracker.json")
-        if not party_tracker_data:
-            print("ERROR: Could not load party tracker data")
-            return False
-
-    module_name = party_tracker_data.get("module", "").replace(" ", "_")
-    if not module_name:
-        print("ERROR: No current module found in party tracker")
-        return False
-
-    # The complete read -> AI decision -> mutate -> write sequence is one
-    # transaction.  A lock created inside this function cannot protect two
-    # invocations, so share a re-entrant lock by module instead.
-    from contextlib import ExitStack
-    from utils.module_refresh_lock import module_refresh_lock
-
-    with ExitStack() as movement_locks:
-        refresh_acquired = movement_locks.enter_context(module_refresh_lock())
-        if not refresh_acquired:
-            warning(
-                "Background NPC movement deferred while modules are refreshing",
-                category="npc_management",
-            )
-            return False
-        movement_locks.enter_context(_npc_movement_lock(module_name))
-        try:
-            path_manager = ModulePathManager(module_name)
-            
-            # Find the NPC in area files
-            npc_location = find_npc_in_areas(npc_name, path_manager, current_location_hint)
-            if not npc_location:
-                print(f"ERROR: Could not find NPC '{npc_name}' in any location")
-                return False
-                
-            area_file, location_id, npc_data = npc_location
-            debug(f"VALIDATION: Found {npc_name} in {area_file} at location {location_id}", category="npc_management")
-            
-            # Load area data with backup
-            area_data = safe_read_json(area_file)
-            if not area_data:
-                print(f"ERROR: Could not load area data from {area_file}")
-                return False
-                
-            # Create backup
-            backup_path = create_area_backup(area_file)
-            if not backup_path:
-                print("WARNING: Could not create backup, proceeding anyway")
-            
-            # Get party NPCs for validation
-            party_npcs = party_tracker_data.get("partyNPCs", [])
-            
-            # Retry loop with fallback system
-            ai_decision = None
-            max_attempts = 5
-            
-            for attempt in range(1, max_attempts + 1):
-                debug(f"AI_CALL: AI decision attempt {attempt}/{max_attempts}", category="npc_management")
-                
-                # Get AI decision on what to do with the NPC
-                ai_decision = get_ai_npc_movement_decision(
-                    npc_name, context, npc_data, area_data, location_id, module_name, party_npcs, attempt
-                )
-                
-                if ai_decision:
-                    # Validate the AI decision
-                    validation_result = validate_npc_movement_decision(ai_decision, area_data, location_id, party_npcs)
-                    if validation_result["valid"]:
-                        info(f"SUCCESS: AI decision validated on attempt {attempt}", category="npc_management")
-                        break
-                    else:
-                        warning(f"VALIDATION: AI decision failed on attempt {attempt}: {validation_result['reason']}", category="npc_management")
-                        if attempt == max_attempts:
-                            print("ERROR: Max attempts reached, AI could not generate valid decision")
-                            return False
-                        else:
-                            # Add validation feedback to context for retry
-                            context += f"\n\nPREVIOUS ATTEMPT FAILED: {validation_result['reason']}"
-                else:
-                    error(f"FAILURE: AI could not generate decision on attempt {attempt}", category="npc_management")
-                    if attempt == max_attempts:
-                        print("ERROR: Max attempts reached, AI could not determine appropriate action")
-                        return False
-            
-            if not ai_decision:
-                print("ERROR: AI could not determine appropriate action after all attempts")
-                return False
-                
-            info(f"AI_CALL: Final AI decision: {ai_decision.get('action')} - {ai_decision.get('reasoning', 'No reasoning')}", category="npc_management")
-            
-            # Execute the AI decision with surgical updates
-            success = execute_npc_movement_decision(ai_decision, area_data, location_id, npc_name, path_manager)
-            
-            if success:
-                # Save updated area data
-                if safe_write_json(area_file, area_data):
-                    info(f"SUCCESS: Updated area file {area_file}", category="file_operations")
-                    # Clean up old backups
-                    cleanup_old_area_backups(area_file)
-                    return True
-                else:
-                    print(f"ERROR: Failed to save updated area data")
-                    # Restore from backup if save failed
-                    if backup_path and os.path.exists(backup_path):
-                        try:
-                            shutil.copy2(backup_path, area_file)
-                            warning("FILE_OP: Restored area file from backup due to save failure", category="file_operations")
-                        except Exception as e:
-                            print(f"ERROR: Could not restore from backup: {e}")
-                    return False
-            else:
-                print("ERROR: Failed to execute NPC movement decision")
-                return False
-                
-        except Exception as e:
-            print(f"ERROR: Exception in move_background_npc: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-
-def prepare_background_npc_movement(
-    npc_name, context, current_location_hint=None, party_tracker_data=None
-):
-    """Freeze one required T014 decision and its exact area mutation."""
-    from utils.module_refresh_lock import module_refresh_lock
-
-    party = party_tracker_data or safe_json_load("party_tracker.json")
-    module_name = str((party or {}).get("module", "")).replace(" ", "_")
-    if not module_name:
-        raise RuntimeError("No current module for moveBackgroundNPC")
-    path_manager = ModulePathManager(module_name)
-    with module_refresh_lock() as acquired:
-        if not acquired:
-            raise RuntimeError("module refresh is busy")
-        with _npc_movement_lock(module_name):
-            found = find_npc_in_areas(
-                npc_name, path_manager, current_location_hint
-            )
-            if not found:
-                raise ValueError("referenced background NPC does not exist")
-            area_file, location_id, npc_data = found
-            area_before = safe_json_load(area_file)
-    correction = context
-    attempt = 1
-    while True:
-        decision = get_ai_npc_movement_decision(
-            npc_name,
-            correction,
-            npc_data,
-            area_before,
-            location_id,
-            module_name,
-            (party or {}).get("partyNPCs", []),
-            attempt,
-        )
-        validation = validate_npc_movement_decision(
-            decision, area_before, location_id, (party or {}).get("partyNPCs", [])
-        )
-        if validation["valid"]:
-            break
-        correction = "%s\n\nCorrection facts: %s" % (
-            context,
-            validation["reason"],
-        )
-        attempt += 1
-    return {
-        "kind": "moveBackgroundNPC",
-        "module": module_name,
-        "area_path": area_file,
-        "location_id": location_id,
-        "npc_name": npc_name,
-        "proposal": decision,
-        # The semantic decision is frozen before movement. Its exact file
-        # values are materialized only after earlier travel stages finish, so
-        # the departure summary cannot become a false whole-area conflict.
-        "before": None,
-        "after": None,
-    }
-
-
-def materialize_staged_background_npc_movement(receipt):
-    """Freeze T014's exact post-departure area values before its first write."""
-    import copy
-    from utils.module_refresh_lock import module_refresh_lock
-
-    if receipt.get("before") is not None:
-        return receipt
-    with module_refresh_lock() as acquired:
-        if not acquired:
-            raise RuntimeError("module refresh is busy")
-        with _npc_movement_lock(receipt["module"]):
-            current = safe_json_load(receipt["area_path"])
-            if not isinstance(current, dict):
-                raise RuntimeError("background NPC area is unavailable")
-            after = copy.deepcopy(current)
-            path_manager = ModulePathManager(receipt["module"])
-            if not execute_npc_movement_decision(
-                receipt["proposal"],
-                after,
-                receipt["location_id"],
-                receipt["npc_name"],
-                path_manager,
-            ):
-                raise RuntimeError(
-                    "accepted background NPC proposal no longer matches current state"
-                )
-            receipt["before"] = current
-            receipt["after"] = after
-    return receipt
-
-
 def apply_staged_background_npc_movement(receipt):
     """Apply or recognize one frozen T014 area value."""
     from utils.module_refresh_lock import module_refresh_lock
@@ -5047,418 +6871,3 @@ def apply_staged_background_npc_movement(receipt):
             if not safe_write_json(receipt["area_path"], receipt["after"]):
                 raise RuntimeError("background NPC area write failed")
     return "committed"
-
-def find_npc_in_areas(npc_name, path_manager, location_hint=None):
-    """Find an NPC in area files, returning (area_file, location_id, npc_data)"""
-    import glob
-    import os
-    from utils.file_operations import safe_read_json
-    
-    # Get all area files in the module, excluding backup files
-    area_pattern = f"{path_manager.module_dir}/areas/*.json"
-    all_files = glob.glob(area_pattern)
-    
-    # Filter out backup files (_BU.json) and backup copies (.backup_*)
-    area_files = []
-    for file_path in all_files:
-        filename = os.path.basename(file_path)
-        # Skip backup files
-        if filename.endswith('_BU.json') or '.backup_' in filename:
-            debug(f"FILE_OP: Skipping backup file: {filename}", category="file_operations")
-            continue
-        area_files.append(file_path)
-    
-    debug(f"FILE_OP: Searching {len(area_files)} active area files (excluded {len(all_files) - len(area_files)} backup files)", category="file_operations")
-    
-    for area_file in area_files:
-        try:
-            area_data = safe_read_json(area_file)
-            if not area_data:
-                continue
-                
-            # Search through all locations in this area
-            for location in area_data.get("locations", []):
-                location_id = location.get("locationId", "")
-                
-                # If location hint provided, check if this matches
-                if location_hint and location_hint != location_id:
-                    continue
-                    
-                # Search NPCs in this location
-                for npc in location.get("npcs", []):
-                    if npc.get("name", "").lower() == npc_name.lower():
-                        return (area_file, location_id, npc)
-                        
-        except Exception as e:
-            warning(f"FILE_OP: Could not search area file {area_file}: {e}", category="file_operations")
-            continue
-    
-    return None
-
-def get_ai_npc_movement_decision(npc_name, context, npc_data, area_data, location_id, module_name, party_npcs=None, attempt=1):
-    """Use AI to determine what to do with the NPC based on context"""
-    try:
-        # Get available locations for potential moves
-        available_locations = []
-        for location in area_data.get("locations", []):
-            loc_id = location.get("locationId", "")
-            loc_name = location.get("name", "")
-            if loc_id and loc_name and loc_id != location_id:
-                available_locations.append(f"{loc_id} ({loc_name})")
-        
-        # Check if this is a party NPC vs background NPC
-        party_npc_names = [npc.get("name", "").lower() for npc in (party_npcs or [])]
-        is_party_npc = npc_name.lower() in party_npc_names
-        
-        # Load and validate against location schema
-        from jsonschema import validate, ValidationError
-        import json
-        
-        try:
-            with open("schemas/loca_schema.json", "r") as f:
-                location_schema = json.load(f)
-        except Exception as e:
-            warning(f"FILE_OP: Could not load location schema: {e}", category="file_operations")
-            location_schema = None
-        
-        system_prompt = f"""You are an expert 5th edition narrative manager specialized in NPC movement and status changes. Your job is to make intelligent decisions about background NPCs based on narrative context while maintaining strict game world consistency.
-
-CRITICAL DISTINCTIONS:
-- BACKGROUND NPCs: NPCs found in location files who are not traveling with the party
-- PARTY NPCs: NPCs actively traveling with and assisting the party (managed separately)
-- This action is ONLY for BACKGROUND NPCs - NPCs who exist in specific locations
-
-CURRENT NPC CLASSIFICATION:
-- {npc_name} is {'a PARTY NPC (ERROR - use updatePartyNPCs instead)' if is_party_npc else 'a BACKGROUND NPC (correct for this action)'}
-
-AVAILABLE ACTIONS FOR BACKGROUND NPCs:
-1. "remove" - Remove NPC from location entirely
-   - Use for: Captured and taken elsewhere, fled permanently, left the area
-   - Result: NPC disappears from location, may add location description update
-   
-2. "update_status" - Keep NPC in location but change their description  
-   - Use for: Death, injury, status change, but NPC remains in place
-   - Result: NPC description updated, location may be updated too
-   
-3. "move" - Move NPC to different location within same area
-   - Use for: NPC relocated to another nearby location
-   - Result: NPC moves between locations, descriptions updated
-
-SCHEMA VALIDATION REQUIREMENTS:
-All NPC objects must maintain this exact structure:
-{{
-  "name": "string (required)",
-  "description": "string (required)", 
-  "attitude": "string (required)"
-}}
-
-CONTEXT INFORMATION:
-- Module: {module_name}
-- Current Location: {location_id}
-- Available Target Locations: {', '.join(available_locations) if available_locations else 'None (cannot use move action)'}
-- Attempt: {attempt}/5
-
-RESPONSE FORMAT (JSON only):
-{{
-  "action": "remove|update_status|move",
-  "reasoning": "Brief explanation of decision based on narrative context",
-  "newDescription": "Updated NPC description if action is update_status (required field)",
-  "newAttitude": "Updated attitude if action is update_status (required field)", 
-  "newLocation": "Target location ID if action is move (must match available locations exactly)",
-  "locationUpdate": "Addition to location description explaining change (optional)"
-}}
-
-DECISION GUIDELINES WITH EXAMPLES:
-
-CAPTURE SCENARIO:
-Context: "Rusk was captured by the party and taken to Thornwood"
-Decision: "remove" - Rusk is no longer at this location
-Reasoning: "Captured and removed from area by party"
-
-DEATH SCENARIO:  
-Context: "The merchant was killed by bandits"
-Decision: "update_status" - Body remains in location
-New Description: "The merchant's lifeless body lies sprawled among scattered goods..."
-New Attitude: "Dead"
-Location Update: "Signs of violence and blood stain the ground"
-
-RELOCATION SCENARIO:
-Context: "Elen went to report to the watchtower"  
-Decision: "move" - IF watchtower location exists in available locations
-New Location: "WT01" (only if this exact ID exists)
-Reasoning: "Moved to fulfill duty obligations"
-
-INJURY SCENARIO:
-Context: "The guard was wounded but survived the attack"
-Decision: "update_status" - Guard stays but is injured
-New Description: "A wounded guard with bandaged arms, still determined despite recent injuries..."
-New Attitude: "Cautious but resilient"
-
-IMPORTANT VALIDATION RULES:
-- NEVER move party NPCs (they travel with the party automatically)
-- ONLY use exact location IDs from the available locations list
-- ALWAYS provide required fields: newDescription and newAttitude for update_status
-- Keep descriptions realistic and immersive
-- Maintain narrative consistency with established world"""
-
-        user_prompt = f"""Background NPC Movement Decision Request:
-
-NPC Name: {npc_name}
-Current Description: {npc_data.get('description', 'No description available')}
-Current Attitude: {npc_data.get('attitude', 'No attitude specified')}
-Narrative Context: {context}
-Current Location: {location_id}
-
-Based on this narrative context, determine the most appropriate action for this background NPC. Consider the story implications and choose the action that best maintains narrative consistency.
-
-Remember: This is a background NPC management action, not party NPC management."""
-
-        # Select model config per provider
-        from model_config import MODEL_PROVIDER
-        if MODEL_PROVIDER == "openai":
-            npc_config = config.NPC_INFO_GPT54MINI_NONE
-        elif MODEL_PROVIDER == "gemini":
-            # T014 uses its OWN gemini config (NPC_MOVEMENT_T014_*), NOT the shared
-            # NPC_INFO_GEMINI_FLASH_LOW -- that one is shared with T091 whose
-            # output is a JSON ARRAY; attaching this object schema there would corrupt
-            # T091's monster reconciliation.
-            npc_config = config.NPC_MOVEMENT_T014_GEMINI_FLASH_LOW
-        elif MODEL_PROVIDER == "lmstudio":
-            npc_config = config.NPC_INFO_LMSTUDIO
-        else:  # legacy
-            npc_config = config.NPC_INFO_LEGACY
-
-        # T014: fail loud (gemini-only) if response_schema is missing. Without it,
-        # gemini-flash emits narration instead of the action/reasoning decision JSON
-        # and the NPC update is silently dropped.
-        if MODEL_PROVIDER == "gemini" and npc_config.get("response_schema") is None:
-            raise RuntimeError(
-                "T014 NPC movement decision aborted: Gemini response_schema is None. "
-                "Refusing to run -- Gemini would emit narration and silently drop the "
-                "NPC update."
-            )
-
-        response = capture_and_fanout("T014", api_client.create_completion,
-            _request_provider=MODEL_PROVIDER,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            model=npc_config["model"],
-            temperature=0.3,  # MED-9 (#127): lower temp reduces JSON parse failures on NPC movement
-            **{k: v for k, v in npc_config.items() if k != "model"})
-        
-        # Track token usage
-        if USAGE_TRACKING_AVAILABLE:
-            try:
-                track_response(response)
-            except:
-                pass
-        
-        ai_response = response.choices[0].message.content.strip()
-        debug(f"AI_CALL: Movement decision response: {ai_response}", category="ai_operations")
-        
-        # Parse the structured response directly. Gameplay meaning comes from
-        # the typed fields, never a brace-shaped substring found in prose.
-        if ai_response.startswith("```json"):
-            ai_response = ai_response[len("```json") :]
-        if ai_response.endswith("```"):
-            ai_response = ai_response[: -len("```")]
-        return json.loads(ai_response.strip())
-            
-    except Exception as e:
-        error(f"AI_CALL: AI decision failed: {str(e)}", category="ai_operations")
-        return None
-
-def validate_npc_movement_decision(decision, area_data, location_id, party_npcs):
-    """Validate AI decision against schema and game rules"""
-    try:
-        # Check required fields
-        if not isinstance(decision, dict):
-            return {"valid": False, "reason": "Decision must be a JSON object"}
-            
-        action = decision.get("action")
-        if action not in ["remove", "update_status", "move"]:
-            return {"valid": False, "reason": f"Invalid action '{action}'. Must be: remove, update_status, or move"}
-        
-        # Validate action-specific requirements
-        if action == "update_status":
-            if not decision.get("newDescription"):
-                return {"valid": False, "reason": "update_status action requires newDescription field"}
-            if not decision.get("newAttitude"):
-                return {"valid": False, "reason": "update_status action requires newAttitude field"}
-            
-            if not isinstance(decision.get("newDescription"), str):
-                return {"valid": False, "reason": "newDescription must be a string"}
-                
-        elif action == "move":
-            new_location = decision.get("newLocation")
-            if not new_location:
-                return {"valid": False, "reason": "move action requires newLocation field"}
-                
-            # Check if target location exists
-            valid_locations = [loc.get("locationId") for loc in area_data.get("locations", [])]
-            if new_location not in valid_locations:
-                return {"valid": False, "reason": f"Target location '{new_location}' does not exist. Valid locations: {valid_locations}"}
-        
-        location_update = decision.get("locationUpdate")
-        if location_update is not None and not isinstance(location_update, str):
-            return {"valid": False, "reason": "locationUpdate must be a string or null"}
-        
-        # Schema validation - check NPC structure requirements
-        if action == "update_status":
-            # Simulate the NPC object that would be created
-            test_npc = {
-                "name": "test",
-                "description": decision.get("newDescription"),
-                "attitude": decision.get("newAttitude")
-            }
-            
-            # Basic validation
-            for field in ["name", "description", "attitude"]:
-                if not test_npc.get(field):
-                    return {"valid": False, "reason": f"NPC object missing required field: {field}"}
-                if not isinstance(test_npc[field], str):
-                    return {"valid": False, "reason": f"NPC field '{field}' must be a string"}
-        
-        return {"valid": True, "reason": "Decision validated successfully"}
-        
-    except Exception as e:
-        return {"valid": False, "reason": f"Validation error: {str(e)}"}
-
-def execute_npc_movement_decision(decision, area_data, location_id, npc_name, path_manager):
-    """Execute the AI's decision with surgical updates to area data"""
-    try:
-        action = decision.get("action")
-        
-        # Find the location and NPC in area data
-        target_location = None
-        npc_index = None
-        
-        for location in area_data.get("locations", []):
-            if location.get("locationId") == location_id:
-                target_location = location
-                # Find NPC index
-                for i, npc in enumerate(location.get("npcs", [])):
-                    if npc.get("name", "").lower() == npc_name.lower():
-                        npc_index = i
-                        break
-                break
-        
-        if not target_location or npc_index is None:
-            error("VALIDATION: Could not find location or NPC in area data", category="npc_management")
-            return False
-        
-        if action == "remove":
-            # Remove NPC from location
-            target_location["npcs"].pop(npc_index)
-            info(f"STATE_CHANGE: Removed {npc_name} from {location_id}", category="npc_management")
-            
-            # Update location description if provided
-            location_update = decision.get("locationUpdate")
-            if location_update:
-                current_desc = target_location.get("description", "")
-                target_location["description"] = f"{current_desc} {location_update}".strip()
-                
-        elif action == "update_status":
-            # Update NPC description and attitude
-            new_description = decision.get("newDescription")
-            new_attitude = decision.get("newAttitude")
-            
-            if new_description:
-                target_location["npcs"][npc_index]["description"] = new_description
-                info(f"STATE_CHANGE: Updated description for {npc_name}", category="npc_management")
-            
-            if new_attitude:
-                target_location["npcs"][npc_index]["attitude"] = new_attitude
-                info(f"STATE_CHANGE: Updated attitude for {npc_name}", category="npc_management")
-                
-            # Update location description if provided
-            location_update = decision.get("locationUpdate")
-            if location_update:
-                current_desc = target_location.get("description", "")
-                target_location["description"] = f"{current_desc} {location_update}".strip()
-                    
-        elif action == "move":
-            # Move NPC to different location
-            new_location_id = decision.get("newLocation")
-            if not new_location_id:
-                error("VALIDATION: Move action specified but no target location provided", category="npc_management")
-                return False
-                
-            # Find target location
-            target_new_location = None
-            for location in area_data.get("locations", []):
-                if location.get("locationId") == new_location_id:
-                    target_new_location = location
-                    break
-                    
-            if not target_new_location:
-                error(f"VALIDATION: Target location {new_location_id} not found", category="npc_management")
-                return False
-                
-            # Move NPC
-            npc_to_move = target_location["npcs"].pop(npc_index)
-            target_new_location["npcs"].append(npc_to_move)
-            info(f"STATE_CHANGE: Moved {npc_name} from {location_id} to {new_location_id}", category="npc_management")
-            
-            # Update both location descriptions if provided
-            location_update = decision.get("locationUpdate")
-            if location_update:
-                # Update source location
-                current_desc = target_location.get("description", "")
-                target_location["description"] = f"{current_desc} {location_update}".strip()
-        
-        else:
-            error(f"VALIDATION: Unknown action: {action}", category="npc_management")
-            return False
-            
-        return True
-        
-    except Exception as e:
-        error(f"FAILURE: Failed to execute decision: {str(e)}", category="npc_management")
-        return False
-
-def create_area_backup(area_file):
-    """Create timestamped backup of area file"""
-    import shutil
-    import os
-    from datetime import datetime
-    
-    try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"{area_file}.backup_npc_move_{timestamp}"
-        shutil.copy2(area_file, backup_name)
-        debug(f"FILE_OP: Created area backup: {os.path.basename(backup_name)}", category="file_operations")
-        return backup_name
-    except Exception as e:
-        error(f"FILE_OP: Could not create area backup: {e}", category="file_operations")
-        return None
-
-def cleanup_old_area_backups(area_file, max_backups=5):
-    """Clean up old area backup files"""
-    import os
-    
-    try:
-        directory = os.path.dirname(area_file)
-        base_name = os.path.basename(area_file)
-        
-        backup_files = []
-        for file in os.listdir(directory):
-            if file.startswith(f"{base_name}.backup_npc_move_") and file.endswith(".json"):
-                backup_path = os.path.join(directory, file)
-                mtime = os.path.getmtime(backup_path)
-                backup_files.append((mtime, backup_path))
-        
-        # Sort by modification time (newest first) and remove old ones
-        backup_files.sort(reverse=True)
-        if len(backup_files) > max_backups:
-            for _, old_backup in backup_files[max_backups:]:
-                try:
-                    os.remove(old_backup)
-                    debug(f"FILE_OP: Removed old backup: {os.path.basename(old_backup)}", category="file_operations")
-                except Exception as e:
-                    warning(f"FILE_OP: Could not remove old backup: {e}", category="file_operations")
-                    
-    except Exception as e:
-        warning(f"FILE_OP: Backup cleanup failed: {e}", category="file_operations")

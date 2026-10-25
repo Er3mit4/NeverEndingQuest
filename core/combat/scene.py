@@ -12,6 +12,9 @@ CONTRACT_VERSION = "typed-agentic-v1"
 PARTICIPATION_VALUES = {"active", "observer", "hidden", "unaware", "departed"}
 PERSISTENCE_VALUES = {"encounter", "canonical_character", "owner_gated_companion"}
 CONTROLLER_VALUES = {"human", "actor_agent"}
+# #1449: whom a listed NPC fights for in this fight (npc:N keys only). Staying
+# out is participation/initiativeEligible, never a side.
+SIDE_VALUES = {"hostile", "party"}
 CONTROLLER_SCOPE_VALUES = {"encounter", "turn", "temporary", "persistent"}
 OBJECTIVE_STATUS_VALUES = {"active", "satisfied", "failed", "abandoned"}
 
@@ -88,14 +91,14 @@ def reconcile_scene_manifest(parameters, canonical_snapshot):
     for key, source in canonical.items():
         proposal = proposed_by_key[key]
         participation = proposal.get("participation")
-        persistence = proposal.get("persistence")
+        # #1361: the engine sets persistence from the canonical source (built from real files); a
+        # model-supplied value is ignored.
+        persistence = "encounter" if source["sourceKind"] == "monster" else "canonical_character"
         controller = proposal.get("controller")
         if participation not in PARTICIPATION_VALUES:
             raise SceneReconciliationError(f"invalid participation for {key}")
         if type(proposal.get("initiativeEligible")) is not bool:
             raise SceneReconciliationError(f"initiativeEligible must be boolean for {key}")
-        if persistence not in PERSISTENCE_VALUES:
-            raise SceneReconciliationError(f"invalid persistence for {key}")
         if controller not in CONTROLLER_VALUES:
             raise SceneReconciliationError(f"invalid controller for {key}")
         scope = proposal.get("controllerScope", "encounter")
@@ -104,16 +107,32 @@ def reconcile_scene_manifest(parameters, canonical_snapshot):
         expires_at = proposal.get("controllerExpiresAtRevision")
         if expires_at is not None and (type(expires_at) is not int or expires_at < 0):
             raise SceneReconciliationError(f"invalid controller expiry for {key}")
+        surprised = proposal.get("surprised", False)
+        if type(surprised) is not bool:
+            raise SceneReconciliationError(f"surprised must be boolean for {key}")
+        if surprised and source["sourceKind"] != "monster":
+            raise SceneReconciliationError(
+                f"surprised applies only to monster participants, not {key}"
+            )
+        side = proposal.get("side")
+        if side is not None:
+            if not key.startswith("npc:"):
+                raise SceneReconciliationError(f"side applies only to npc participants, not {key}")
+            if side not in SIDE_VALUES:
+                raise SceneReconciliationError(f"invalid side for {key}: side is hostile or party")
 
         combatant_id = source["combatantId"]
-        participants.append(
-            {
-                **source,
-                "participation": participation,
-                "initiativeEligible": proposal["initiativeEligible"],
-                "persistence": persistence,
-            }
-        )
+        participant = {
+            **source,
+            "participation": participation,
+            "initiativeEligible": proposal["initiativeEligible"],
+            "persistence": persistence,
+        }
+        if surprised:
+            participant["surprised"] = True
+        if side is not None:
+            participant["side"] = side
+        participants.append(participant)
         controllers[combatant_id] = {
             "controller": controller,
             "revision": 0,
@@ -233,6 +252,28 @@ def validate_scene_proposal_shape(parameters):
     reconcile_scene_manifest(params, placeholder)
 
 
+def _listed_key_gaps(parameters):
+    """#1377: the scene's npc:N / monster:N keys whose position its own list
+    does not reach, in scene order. A key read as anything but a plain
+    position (npc:x, npc:-1, npc:01) is not a gap; today's sentence answers it.
+    Only the key strings and the list lengths are read."""
+    lengths = {
+        "npc": len(parameters.get("npcs") or []) if isinstance(parameters.get("npcs"), list) else 0,
+        "monster": len(parameters.get("monsters") or []) if isinstance(parameters.get("monsters"), list) else 0,
+    }
+    scene = parameters.get("scene")
+    participants = scene.get("participants") if isinstance(scene, dict) else None
+    gaps = []
+    for item in participants if isinstance(participants, list) else []:
+        key = item.get("participantKey") if isinstance(item, dict) else None
+        kind, _, position = key.partition(":") if isinstance(key, str) else ("", "", "")
+        if kind not in lengths or not (position.isascii() and position.isdigit()) or position != str(int(position)):
+            continue
+        if int(position) >= lengths[kind] and key not in gaps:
+            gaps.append(key)
+    return gaps
+
+
 def validate_typed_encounter_actions(response):
     """Reject incomplete typed encounter actions before any stateful handler runs."""
     payload = _require_object(response, "DM response")
@@ -257,14 +298,26 @@ def validate_typed_encounter_actions(response):
             validate_scene_proposal_shape(parameters)
         except SceneReconciliationError as exc:
             keys = ", ".join(expected_keys)
+            gaps = _listed_key_gaps(parameters)
+            remedy = (
+                " ".join(
+                    f"{key} needs {'an npcs' if key.startswith('npc:') else 'a monsters'} entry, "
+                    f"the {'occupant' if key.startswith('npc:') else 'monster'}'s name, or "
+                    "remove it if they are not here."
+                    for key in gaps
+                )
+                if gaps
+                else f"Use participant keys exactly [{keys}]."
+            )
             raise SceneReconciliationError(
-                f"{exc}. Use participant keys exactly [{keys}]. scene must contain "
+                f"{exc}. {remedy} scene must contain "
                 "participants, relations, objectives, and disclosureGrants arrays. "
                 "Every participant requires participantKey, participation, "
-                "initiativeEligible boolean, persistence, and controller. "
+                "initiativeEligible boolean, and controller. "
+                "A monster participant may add surprised: true (boolean). "
+                "An npc participant may add side: hostile or party (whom it fights for in this fight). "
                 "participation is one of active, observer, hidden, unaware, departed; "
-                "persistence is one of encounter, canonical_character, "
-                "owner_gated_companion; controller is human or actor_agent. "
+                "controller is human or actor_agent; the engine sets persistence. "
                 "Each relation is {subjectKey, objectKey, disposition}. Each objective "
                 "is {ownerKeys array, kind, targetKeys array, status}; status is active, "
                 "satisfied, failed, or abandoned. Each disclosure grant is "

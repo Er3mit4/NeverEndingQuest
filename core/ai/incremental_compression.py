@@ -5,6 +5,7 @@ Filters validation errors and preserves recent valid context.
 """
 
 import json
+from core.ai import history_markers as hm
 import os
 import queue
 import sys
@@ -13,7 +14,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from core.ai import api_client
 from utils.capture.multi_model_capture import capture_and_fanout, register_callsite
-register_callsite("T020", "core/ai/incremental_compression.py", 198)
+register_callsite("T020", "core/ai/incremental_compression.py", 247)
 import shutil
 
 # Add project root to path for standalone execution
@@ -85,10 +86,7 @@ class IncrementalLocationCompressor:
         
     def is_validation_error(self, msg: Dict) -> bool:
         """Check if a message is a validation error."""
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            return "Error Note: Your previous response failed validation" in content
-        return False
+        return hm.is_marker(msg, hm.VALIDATION_ERROR)
     
     def filter_validation_errors(self, messages: List[Dict]) -> List[Dict]:
         """Remove validation error pairs from messages."""
@@ -191,7 +189,7 @@ class IncrementalLocationCompressor:
             content = msg["content"]
             if role == "user":
                 # Skip location transition messages
-                if "Location transition:" in content:
+                if hm.is_marker(msg, hm.LOCATION_TRANSITION):
                     continue
                 context_parts.append(f"Player: {content}")
             elif role == "assistant":
@@ -205,10 +203,8 @@ class IncrementalLocationCompressor:
                         context_parts.append(f"DM: {content}")
                 else:
                     context_parts.append(f"DM: {content}")
-            elif role == "system":
-                # Include important system messages
-                if "arrived at" in content.lower() or "summary" in content.lower():
-                    context_parts.append(f"System: {content}")
+            # System messages are context the game rebuilds every turn, not
+            # events at this location; summaries in history are assistant markers.
         
         if not context_parts:
             warning("No content to compress after filtering")
@@ -271,10 +267,7 @@ Format as a flowing narrative in 2-3 paragraphs. Focus on what happened, not met
                     f"up to this point:\n\n{response}"
                 )
                 
-                return {
-                    "role": "assistant",
-                    "content": summary_content
-                }
+                return hm.marker("assistant", summary_content, hm.ROLLING_SUMMARY)
         except IncrementalCompressionTimeout as exc:
             warning(
                 "Incremental conversation compression timed out; "
@@ -304,9 +297,7 @@ Format as a flowing narrative in 2-3 paragraphs. Focus on what happened, not met
         # Find last location transition
         last_transition_idx = 0
         for i, msg in enumerate(messages):
-            if msg.get("role") == "system" and "arrived at" in msg.get("content", "").lower():
-                last_transition_idx = i
-            elif msg.get("role") == "user" and "Location transition:" in msg.get("content", ""):
+            if hm.is_marker(msg, hm.LOCATION_TRANSITION):
                 last_transition_idx = i
         
         # Get messages since last transition
@@ -400,10 +391,7 @@ Format as a flowing narrative in 2-3 paragraphs. Focus on what happened, not met
         last_transition_idx = 0
         current_location_msg = None
         for i, msg in enumerate(messages):
-            if msg.get("role") == "system" and "arrived at" in msg.get("content", "").lower():
-                last_transition_idx = i
-                current_location_msg = msg
-            elif msg.get("role") == "user" and "Location transition:" in msg.get("content", ""):
+            if hm.is_marker(msg, hm.LOCATION_TRANSITION):
                 last_transition_idx = i
                 current_location_msg = msg
         
@@ -479,9 +467,6 @@ Format as a flowing narrative in 2-3 paragraphs. Focus on what happened, not met
         
         return True
 
-_ROLLING_SUMMARY_MARKER = "[SUMMARY OF EVENTS AT THIS LOCATION]"
-
-
 def _rolling_boundary_turn_id(messages, current_segment):
     """W3 coordinate: roll-<N>.<k>, distinct from close-<N> so a rolling capture and
     the eventual location-close never overwrite each other.
@@ -495,12 +480,11 @@ def _rolling_boundary_turn_id(messages, current_segment):
     """
     n = sum(
         1 for m in messages
-        if isinstance(m, dict) and m.get("role") == "user"
-        and "Location transition:" in (m.get("content") or "")
+        if hm.is_marker(m, hm.LOCATION_TRANSITION)
     )
     k = sum(
         1 for m in current_segment
-        if isinstance(m, dict) and _ROLLING_SUMMARY_MARKER in (m.get("content") or "")
+        if hm.is_marker(m, hm.ROLLING_SUMMARY)
     )
     return "roll-%d.%d" % (n, k)
 

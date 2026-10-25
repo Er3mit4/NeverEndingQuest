@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Mapping, Tuple
 
 import jsonschema
 
+from core.combat.attacks import typed_multiattack_issue
+
 from ..compilers import safe_filename
 from ..contracts import (
     AcceptedAreas,
@@ -30,6 +32,8 @@ from ..validators import require_ascii, semantic_creature_viability_checks
 
 TASK_ID = "T103"
 SCHEMA_NAME = "story_first_module_creature"
+# MS-a: optional stat-block ability fields (schemas/mon_schema.json)
+_OPTIONAL_ABILITY_FIELDS = ("kind", "description", "save", "rider", "recharge")
 _MAX_APPEARANCE_CONTEXT_CHARS = 12_000
 _MAX_CONTEXT_TEXT_CHARS = 800
 _MAX_CONTEXT_LIST_ITEMS = 8
@@ -157,6 +161,11 @@ def _response_contract(production_schema: Mapping[str, Any]) -> Dict[str, Any]:
     contract = strict_internal_contract(mutable_copy(production_schema))
     contract["properties"].pop("skills")
     contract["required"].remove("skills")
+    # Typed Multiattack is optional in the production schema; the strict contract
+    # requires every property, so it is nullable here and a null is dropped again
+    # before production validation (MA-3).
+    sequence = contract["properties"]["multiattackSequence"]
+    contract["properties"]["multiattackSequence"] = {"anyOf": [sequence, {"type": "null"}]}
     contract["properties"]["skillBonuses"] = {
         "type": "array",
         "items": {
@@ -172,6 +181,15 @@ def _response_contract(production_schema: Mapping[str, Any]) -> Dict[str, Any]:
     contract["required"].append("skillBonuses")
     spellcasting = contract["properties"]["spellcasting"]
     contract["properties"]["spellcasting"] = {"anyOf": [spellcasting, {"type": "null"}]}
+    # MS-a: the stat-block ability fields (kind, description, save, rider,
+    # recharge) are optional in the production schema; the strict contract
+    # makes every property required, so each one is nullable here and a null
+    # is dropped again before production validation.
+    for family in ("actions", "specialAbilities"):
+        item_properties = contract["properties"][family]["items"]["properties"]
+        for key in _OPTIONAL_ABILITY_FIELDS:
+            if key in item_properties:
+                item_properties[key] = {"anyOf": [item_properties[key], {"type": "null"}]}
     contract["properties"]["dmGuidance"] = {"type": "string"}
     contract["required"].append("dmGuidance")
     return contract
@@ -212,6 +230,14 @@ def _normalize_for_production(value: Mapping[str, Any]) -> Dict[str, Any]:
     normalized.pop("dmGuidance", None)
     if normalized.get("spellcasting") is None:
         normalized.pop("spellcasting", None)
+    if normalized.get("multiattackSequence") is None:
+        normalized.pop("multiattackSequence", None)
+    for family in ("actions", "specialAbilities"):
+        for entry in normalized.get(family) or []:
+            if isinstance(entry, dict):
+                for key in _OPTIONAL_ABILITY_FIELDS:
+                    if key in entry and entry[key] is None:
+                        del entry[key]
     return normalized
 
 
@@ -259,8 +285,9 @@ def _validate_production_creature(
         for action in actions:
             if not action["damageDice"].strip() or not action["damageType"].strip():
                 raise ValueError(f"hollow {family} entry")
-            if action["name"].strip().casefold() == "multiattack":
-                raise ValueError("frozen schema cannot express Multiattack sequences")
+    multiattack_issue = typed_multiattack_issue(normalized)
+    if multiattack_issue:
+        raise ValueError(multiattack_issue)
     spellcasting = normalized.get("spellcasting")
     if spellcasting:
         spell_lists = spellcasting["spells"].values()
@@ -342,11 +369,15 @@ the frozen skills object uses dynamic keys that provider structured output canno
 return skillBonuses as an array of unique {name, bonus} objects and do not return skills; the
 adapter converts that transport field to the frozen skills object before validation. A new
 creature has equal hitPoints/maxHitPoints, condition Alive, and at least one complete named
-action. It must have speed above zero or explicitly state a positive fly, hover, swim,
-burrow, or climb distance in specialAbilities text.
+action. It must have speed above zero or a positive alternateSpeeds value: alternateSpeeds
+gives its fly, swim, burrow and climb speeds in feet, 0 for each it lacks.
 Actions and specialAbilities can represent only complete attack-shaped mechanics; emit a
-complete executable entry or omit it. Never emit hollow prose or Multiattack. The frozen
-legendaryActions shape has no executable mechanics, so return an empty array. Set
+complete executable entry or omit it. Never emit hollow prose. For a Multiattack, add one
+action named "Multiattack" (attackBonus 0, damageDice "0d0", damageBonus 0, damageType "none",
+a description of the attacks) and set multiattackSequence to the swings one Attack action
+makes, in order: one {name, count} per component attack, each name one of its own complete
+attack entries; combat plays exactly that list. Otherwise set multiattackSequence to null.
+The frozen legendaryActions shape has no executable mechanics, so return an empty array. Set
 spellcasting to null for a non-spellcaster; otherwise supply at least one named spell. Put
 story flavor that cannot be represented mechanically into dmGuidance as a concise DM note;
 never discard it or present an unsupported mechanic as executable. Use ASCII and return only
@@ -381,7 +412,9 @@ JSON."""
             semantic_gate=gate,
             gateway=gateway,
             correction_guidance=(
-                "Return legendaryActions as an empty array and never emit Multiattack. "
+                "Return legendaryActions as an empty array. A Multiattack action needs "
+                "multiattackSequence naming the creature's own attack entries; "
+                "otherwise set multiattackSequence to null. "
                 "Express only complete supported actions; preserve unrepresentable story "
                 "flavor as non-mechanical dmGuidance."
             ),

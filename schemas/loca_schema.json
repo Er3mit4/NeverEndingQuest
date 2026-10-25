@@ -80,6 +80,19 @@
             "items": { "type": "string" },
             "description": "A list of potential items that can be found in this location."
           },
+          "lootItems": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "itemKey": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+                "quantity": { "type": "integer", "minimum": 1 }
+              },
+              "required": ["itemKey", "quantity"],
+              "additionalProperties": false
+            },
+            "description": "Typed loot that can be taken here: items of this module's module_items.json, by itemKey. Found under the same conditions as the lootTable or dcChecks entry that names it."
+          },
           "dangerLevel": { 
             "type": "string",
             "enum": ["Low", "Medium", "High", "Very High"],
@@ -133,7 +146,7 @@
             "items": {
               "type": "string",
               "description": "A string representing a DC check in the format: 'SkillName DC XX: Description of the check.'",
-              "pattern": "^(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma|Acrobatics|Animal Handling|Arcana|Athletics|Deception|History|Insight|Intimidation|Investigation|Medicine|Nature|Perception|Performance|Persuasion|Religion|Sleight of Hand|Stealth|Survival) DC [0-9]+: .+$"
+              "pattern": "^((Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)( \\((Acrobatics|Animal Handling|Arcana|Athletics|Deception|History|Insight|Intimidation|Investigation|Medicine|Nature|Perception|Performance|Persuasion|Religion|Sleight of Hand|Stealth|Survival)\\))?|Acrobatics|Animal Handling|Arcana|Athletics|Deception|History|Insight|Intimidation|Investigation|Medicine|Nature|Perception|Performance|Persuasion|Religion|Sleight of Hand|Stealth|Survival) DC [0-9]+: .+$"
             },
             "examples": [
               "Perception DC 15: Notice signs of recent activity in the room.",

@@ -24,10 +24,6 @@ from core.npc.voice_contracts import (
     ThoughtContractError,
     validate_packet,
 )
-from core.npc.voice_selection import (
-    rank_ooc_candidates,
-    resolve_ooc_mention,
-)
 from core.npc.voice_service import NpcVoiceBatch, NpcVoiceService
 
 
@@ -128,7 +124,7 @@ class CombatVoiceHandle:
 class PreparedOocVoiceHandle:
     """Request-local T112 -> T105 advisory chain with exact turn authority."""
 
-    def __init__(self, packets, service, parent_scope, raw_input, relationship_store):
+    def __init__(self, packets, service, parent_scope, raw_input, relationship_store, recall=True):
         self.batch_id = packets[0]["beat"]["id"] if packets else ""
         self._lock = threading.RLock()
         self._sealed = False
@@ -140,7 +136,7 @@ class PreparedOocVoiceHandle:
         self._parent_scope = parent_scope
         self._relationship_store = relationship_store
         self._packets = tuple(copy.deepcopy(packet) for packet in packets)
-        recall_input = self._recall_candidates(self._packets)
+        recall_input = self._recall_candidates(self._packets) if recall else None
         if recall_input is None:
             self._voice_handle = service.dispatch_batch(
                 self._packets,
@@ -218,10 +214,15 @@ class PreparedOocVoiceHandle:
         self, raw_input, packets, episodes_by_npc, current_location_id, scope
     ):
         try:
-            from core.npc.episode_recall import parse_anchors, select_episodes, _tokens
+            from core.npc.episode_recall import select_recalled_episodes
 
-            anchors = parse_anchors(raw_input, advisory_scope=scope)
-            if anchors is None:
+            selected = select_recalled_episodes(
+                raw_input,
+                episodes_by_npc,
+                current_location_id,
+                advisory_scope=scope,
+            )
+            if selected is None:
                 if scope.is_superseded():
                     self.recall_disposition = "stale_rejected"
                     self._service.telemetry.record_disposition(
@@ -241,22 +242,6 @@ class PreparedOocVoiceHandle:
                             completion_required=True,
                         )
                 return
-            selected = {}
-            for npc_id, episodes in episodes_by_npc.items():
-                ignore = set()
-                for episode in episodes:
-                    for fact in episode.get("salientFacts", []) or []:
-                        subject = fact.get("subject") if isinstance(fact, Mapping) else None
-                        if isinstance(subject, Mapping) and subject.get("id") == npc_id:
-                            ignore |= _tokens(subject.get("label"))
-                scored = select_episodes(
-                    anchors,
-                    episodes,
-                    current_location_id=current_location_id,
-                    ignore_terms=ignore,
-                )
-                if scored:
-                    selected[npc_id] = [row["episode"] for row in scored[:2]]
             enriched = []
             for packet in packets:
                 value = copy.deepcopy(packet)
@@ -431,26 +416,12 @@ def _batch_id(conversation_prefix: Iterable[Any], raw_input: str) -> str:
     return head + raw_input
 
 
-def _raw_player_text(content: Any) -> str:
-    if not isinstance(content, str):
-        return ""
-    if not content.startswith("Dungeon Master Note:"):
-        return content.strip()
-    marker = " Player: "
-    if marker not in content:
-        return ""
-    value = content.rsplit(marker, 1)[1]
-    cutoffs = [
-        index
-        for index in (
-            value.find("\n[Inventory Context:"),
-            value.find("\n[SRD CONTEXT"),
-        )
-        if index >= 0
-    ]
-    if cutoffs:
-        value = value[: min(cutoffs)]
-    return value.strip()
+def _raw_player_text(message: Any) -> str:
+    """The player's own words on a history message (#449): the typed field,
+    or an old turn's envelope; "" for an engine note, a marker or a summary."""
+    from core.ai import history_markers
+
+    return history_markers.player_input(message) or ""
 
 
 def _source_turn_witnessed(user_content: Any, npc_name: str) -> bool:
@@ -459,13 +430,15 @@ def _source_turn_witnessed(user_content: Any, npc_name: str) -> bool:
         "Dungeon Master Note:"
     ):
         return True
+    # The engine's fields come before the player's words; only they are read.
+    head = user_content.split(" Player: ", 1)[0]
     marker = "Party NPCs: "
     end_marker = " Party stats:"
-    start = user_content.find(marker)
-    end = user_content.find(end_marker, start + len(marker))
+    start = head.find(marker)
+    end = head.find(end_marker, start + len(marker))
     if start < 0 or end < 0:
         return True
-    roster_text = user_content[start + len(marker) : end]
+    roster_text = head[start + len(marker) : end]
     return "%s (" % npc_name in roster_text
 
 
@@ -494,8 +467,8 @@ def _accepted_evidence_summary(
             if not isinstance(user, dict) or user.get("role") != "user":
                 continue
             user_content = user.get("content")
-            player_text = _raw_player_text(user_content)
-            if not player_text or player_text.startswith("Error Note:"):
+            player_text = _raw_player_text(user)
+            if not player_text:
                 continue
             summary = "Player: %s Result: %s" % (player_text, narration)
             return (
@@ -518,8 +491,8 @@ def _recent_scene_window(
         role = message.get("role")
         content = message.get("content")
         if role == "user":
-            text = _raw_player_text(content)
-            if text and not text.startswith("Error Note:"):
+            text = _raw_player_text(dict(message))
+            if text:
                 rows.append({"speaker": player_name, "kind": "player", "text": text})
         elif role == "assistant" and isinstance(content, str):
             try:
@@ -634,7 +607,15 @@ def _enrich_ooc_packets(
 def _accepted_legacy_combat_evidence_summary(
     conversation_prefix: Iterable[Any],
 ) -> str:
-    """Return the latest accepted legacy T045 pair, never the current turn."""
+    """Return the latest accepted legacy T045 pair, never the current turn.
+
+    A turn message names what it is by its game fields: an automatic
+    initiative window is a COMBAT_CONTINUATION marker, a player's turn
+    carries the player's words. A turn saved before those fields existed
+    is read from its turn message as it always was.
+    """
+    from core.ai import history_markers
+
     messages = list(conversation_prefix)
     player_marker = "--- PLAYER ACTION ---"
     required_marker = "--- REQUIRED RESPONSE ---"
@@ -660,6 +641,13 @@ def _accepted_legacy_combat_evidence_summary(
             content = user.get("content")
             if not isinstance(content, str):
                 break
+            if history_markers.is_marker(dict(user), history_markers.COMBAT_CONTINUATION):
+                break
+            if history_markers.PLAYER_INPUT_FIELD in user:
+                player_text = history_markers.player_input(dict(user))
+                if not player_text:
+                    break
+                return "Player: %s Result: %s" % (player_text, narration)
             if player_marker not in content or required_marker not in content:
                 break
             player_text = content.split(player_marker, 1)[1]
@@ -694,17 +682,14 @@ def _packet_recent_events(records: Iterable[Mapping[str, Any]]) -> list[Dict[str
     return result
 
 
+_UNAVAILABLE_STATUSES = frozenset({"dead", "defeated", "unconscious"})
+
+
 def _is_eligible_sheet(sheet: Mapping[str, Any]) -> bool:
-    unavailable = " ".join(
-        (
-            _string(sheet.get("status")),
-            _string(sheet.get("condition")),
-        )
-    ).casefold()
-    return not any(
-        marker in unavailable
-        for marker in ("dead", "defeated", "unconscious")
-    )
+    """A companion speaks unless its typed status or condition says it cannot."""
+    status = _string(sheet.get("status")).casefold()
+    condition = _string(sheet.get("condition")).casefold()
+    return status not in _UNAVAILABLE_STATUSES and condition != "unconscious"
 
 
 def _sidecar_identity_inactive(
@@ -764,15 +749,25 @@ def _utilities(sheet: Mapping[str, Any]) -> list[str]:
 def _items(sheet: Mapping[str, Any]) -> list[str]:
     result = []
     equipment = sheet.get("equipment")
-    if not isinstance(equipment, list):
-        return result
-    for item in equipment:
-        if isinstance(item, dict):
-            name = _string(item.get("item_name") or item.get("name"))
-        else:
-            name = _string(item)
-        if name:
-            result.append(name)
+    if isinstance(equipment, list):
+        for item in equipment:
+            if isinstance(item, dict):
+                name = _string(item.get("item_name") or item.get("name"))
+            else:
+                name = _string(item)
+            if name:
+                result.append(name)
+    # #359: the typed ammunition stock follows the equipment names, one
+    # "<name> x<quantity>" entry per row, so the voice knows its arrow count.
+    ammunition = sheet.get("ammunition")
+    if isinstance(ammunition, list):
+        for row in ammunition:
+            if not isinstance(row, dict):
+                continue
+            name = _string(row.get("name"))
+            quantity = row.get("quantity")
+            if name and type(quantity) is int:
+                result.append("%s x%d" % (name, quantity))
     return result
 
 
@@ -948,7 +943,6 @@ def build_ooc_packet_for_turn(
     roster = party_tracker_data.get("partyNPCs", [])
     if not isinstance(roster, list):
         roster = []
-    _mentioned_npc, ambiguous_mention = resolve_ooc_mention(roster, raw_input)
     store = relationship_store or RelationshipStore()
     selected = None
     selected_sheet = None
@@ -956,7 +950,7 @@ def build_ooc_packet_for_turn(
     candidate_order = (
         [dict(_selected_candidate)]
         if isinstance(_selected_candidate, Mapping)
-        else rank_ooc_candidates(roster, raw_input)
+        else [dict(npc) for npc in roster if isinstance(npc, dict)]
     )
     for candidate in candidate_order:
         name = _string(candidate.get("name"))
@@ -1024,23 +1018,15 @@ def build_ooc_packet_for_turn(
     )
     scene_id = "%s|%s" % (module, location_id)
     stored_working = store.get_working(npc_id, scene_id=scene_id)
-    accepted_summary, accepted_witnessed, accepted_player_text = (
+    # Every companion receives the accepted player/DM pair; its own T105
+    # classification returns a typed affinity event, or null when the beat
+    # does not concern it. Code never picks the companion from the player's
+    # words (#855, D-KW-7).
+    accepted_summary, accepted_witnessed, _ = (
         _accepted_evidence_summary(conversation_prefix, npc_name)
     )
-    _accepted_mention, accepted_mention_ambiguous = resolve_ooc_mention(
-        roster, accepted_player_text
-    )
     beat_evidence = None
-    accepted_matches_selected = (
-        _accepted_mention is None
-        or _string(_accepted_mention.get("name")) == _string(selected.get("name"))
-    )
-    if (
-        accepted_summary
-        and not ambiguous_mention
-        and not accepted_mention_ambiguous
-        and accepted_matches_selected
-    ):
+    if accepted_summary:
         beat_evidence = {
             "actorId": player_id,
             "actor": player_name,
@@ -1077,6 +1063,15 @@ def build_ooc_packet_for_turn(
     social_context = location_description or (
         "%s is present with the party at %s." % (npc_name, location_name)
     )
+    from core.npc.actor_facts import actor_sheet_facts
+
+    social_context += "\nOwner-labelled current sheet facts (unknown is not permission to invent):\n"
+    social_context += actor_sheet_facts(npc_name, selected_sheet)
+    try:
+        player_sheet = json_loader(player_path)
+    except (OSError, ValueError, TypeError):
+        player_sheet = None
+    social_context += "\n" + actor_sheet_facts(player_name, player_sheet)
     packet = compose_out_of_combat_packet(
         beat={
             "id": _batch_id(conversation_prefix, raw_input),
@@ -1138,7 +1133,7 @@ def build_ooc_packets_for_turn(
     relationship_store: Optional[RelationshipStore] = None,
     packet_invalid_handler: Optional[Callable[[str, str], None]] = None,
 ) -> tuple[Dict[str, Any], ...]:
-    """Compose and deterministically rank every eligible OOC packet."""
+    """Compose every eligible OOC packet, in roster order."""
     player_name = _canonical_player_display_name(
         player_name,
         path_manager=path_manager,
@@ -1186,9 +1181,8 @@ def build_ooc_packets_for_turn(
                 "npcId": npc_id,
             }
         )
-    ranked = rank_ooc_candidates(ranked_inputs, raw_input)
     selected_packets = tuple(
-        packets_by_id[candidate["npcId"]] for candidate in ranked
+        packets_by_id[candidate["npcId"]] for candidate in ranked_inputs
     )
     return _enrich_ooc_packets(
         selected_packets,
@@ -1384,9 +1378,12 @@ def build_combat_packets_for_window(
             + [profile["bonds"], profile["ideals"], role]
         ))
         goals = [value for value in goals if value]
+        from core.npc.actor_facts import actor_sheet_facts
+
         allies = [
-            "%s: %s" % (
+            actor_sheet_facts(
                 _string(other.get("name")),
+                context_sheets.get(_string(other.get("name"))),
                 _string(other.get("status") or "alive"),
             )
             for other in creatures
@@ -1645,8 +1642,12 @@ def run_ooc_voice_stage(
     path_manager: Any,
     service: Optional[NpcVoiceService] = None,
     relationship_store: Optional[RelationshipStore] = None,
+    recall: bool = True,
 ) -> NpcVoiceBatch:
-    """Run one Phase 3 T105 batch and contain every failure."""
+    """Run one Phase 3 T105 batch and contain every failure. ``recall`` False
+    (a turn whose line is the engine's) runs no T112 episode recall."""
+    if not party_tracker_data.get("partyNPCs"):
+        return NpcVoiceBatch(batch_id="", results=())
     try:
         voice_service = service or _default_service()
 
@@ -1668,6 +1669,8 @@ def run_ooc_voice_stage(
             relationship_store=relationship_store,
             packet_invalid_handler=record_packet_invalid,
         )
+        if not packets:
+            return NpcVoiceBatch(batch_id="", results=())
         from utils.capture.live_provider_call import get_live_turn_scope
 
         handle = PreparedOocVoiceHandle(
@@ -1676,6 +1679,7 @@ def run_ooc_voice_stage(
             get_live_turn_scope(),
             raw_input,
             relationship_store or RelationshipStore(),
+            recall=recall,
         )
         return handle
     except Exception as exc:
@@ -1830,6 +1834,7 @@ def inject_voice_context(messages: list, batch):
     rows = [_voice_row(result) for result in batch.results]
     block = (
         "Private NPC intentions for the Dungeon Master only. Each entry is advisory characterization for this immediate beat, keyed to one companion: 'say' is a possible line in that companion's voice, 'do' is the action or behavior they are inclined to take, 'want' is the desire guiding the beat, and 'thought' is private interior context. This advice comes from a limited-context NPC micro-call. You have the fuller story, conversation history, and mechanical state: take the advice as input, but override or change it whenever needed to remain consistent with the actual story. You remain the sole player-facing Dungeon Master. Weave scene-compatible say, do, and want into your own first-hand narration; even companion dialogue appears inside that narration, never as a separate model-to-player channel. Render thought only through observable demeanor, hesitation, focus, choice, or subtext. Never quote or label thought, never expose the private block, and never turn private knowledge into a world fact. Rephrase everything naturally rather than pasting it. Authoritative scene facts, player agency, mechanics, and committed actions still control; reconcile or omit advice that cannot legally fit. Use only entries supplied for this exact beat; code excludes stale or superseded work. Missing or null fields contribute nothing. The micro-call sees little context and can misread who the player's words were for: an entry that hands the player something the player just offered to a companion, or congratulates the player for a companion's moment, has misread the beat; drop that line and voice the companion's reaction yourself.\n"
+        "Give each reaction a specific voice and observable behavior grounded in this beat and the recent exchange. Do not reset a repeated interaction to the same warning or gesture. Preserve agency, temperament and boundaries; do not force warmth or rejection. Before speaking an NPC's tactical recommendation, check its recipient's own gear and abilities, not the speaker's. Unknown equipment is not possessed equipment. Promised aid is not applied healing: resolve a real available recovery action with the required state changes, or explain the missing resource and a concrete feasible next step. Out of combat, an ally may tend a party member at 0 HP up to 1 HP with no check; in combat, Medicine alone does not wake them.\n"
         + json.dumps(rows, ensure_ascii=True, separators=(",", ":"))
     )
     copied = [dict(message) for message in messages]

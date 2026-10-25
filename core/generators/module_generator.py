@@ -68,10 +68,12 @@ import json
 # generation while maintaining consistency and quality standards.
 # ============================================================================
 
+import copy
 import os
 import re
 import glob
 import random
+from core.generators.location_prefixes import PREFIX_COUNT, location_prefix
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -82,6 +84,7 @@ from utils.module_path_manager import ModulePathManager
 from utils.file_operations import safe_write_json as save_json_safely
 from utils.enhanced_logger import debug, info, warning, error
 from utils.capture.multi_model_capture import capture_and_fanout, register_callsite
+from utils.status_words import status_word_refusal
 register_callsite("T031", "core/generators/module_generator.py", 585)
 
 
@@ -92,15 +95,49 @@ LOCATION_PREFIX_MAP = {
     # Special areas can have specific prefixes
 }
 
-def get_location_prefix(area_index: int) -> str:
-    """Get the appropriate prefix for location IDs based on area index"""
-    # Use letters A-Z for first 26 areas, then AA-AZ, BA-BZ, etc.
-    if area_index < 26:
-        return chr(65 + area_index)  # A-Z
-    else:
-        first_letter = chr(65 + (area_index // 26) - 1)
-        second_letter = chr(65 + (area_index % 26))
-        return first_letter + second_letter
+def registered_location_prefixes() -> set:
+    """Location ID prefixes already used by the modules in the world registry"""
+    from utils.encoding_utils import safe_json_load
+
+    used_prefixes = set()
+    world_registry_path = "modules/world_registry.json"
+
+    if os.path.exists(world_registry_path):
+        registry = safe_json_load(world_registry_path)
+        if registry:
+            # Check all areas in all modules for used location prefixes
+            for area_id, area_info in registry.get('areas', {}).items():
+                module_name = area_info.get('module')
+                if module_name:
+                    # Load the actual area file to get location IDs
+                    area_path = f"modules/{module_name}/areas/{area_id}.json"
+                    if os.path.exists(area_path):
+                        area_data = safe_json_load(area_path)
+                        if area_data and 'locations' in area_data:
+                            for loc in area_data['locations']:
+                                loc_id = loc.get('locationId', '')
+                                if loc_id:
+                                    # Extract prefix (letters before numbers)
+                                    match = re.match(r'^([A-Z]+)\d+', loc_id)
+                                    if match:
+                                        used_prefixes.add(match.group(1))
+    return used_prefixes
+
+
+def get_location_prefix(area_index: int, used_prefixes=frozenset(), module_name: str = "", log=None) -> str:
+    """Get the prefix for location IDs: the area index's prefix, or the next one not in used_prefixes.
+
+    The one allocator (#646): A-Z, AA-ZZ, then AAA-ZZZ (core/generators/location_prefixes).
+    When every prefix is in use it raises ValueError; there is no random fallback,
+    which could repeat a prefix and gave IDs the location schema rejects.
+    """
+    for candidate_index in range(area_index, PREFIX_COUNT):
+        prefix = location_prefix(candidate_index)
+        if prefix not in used_prefixes:
+            if log:
+                log(f"Assigned unique location prefix '{prefix}' for area {area_index}")
+            return prefix
+    raise ValueError(f"every location prefix from index {area_index} is in use ({module_name or 'module'})")
 
 
 def _strip_response_fence(content: str) -> str:
@@ -129,7 +166,14 @@ def _parse_generated_field_value(
         if content.startswith('"'):
             value = json.loads(content)
         else:
-            value = content
+            try:
+                decoded = json.loads(content)
+            except json.JSONDecodeError:
+                decoded = content
+            # JSON null is the typed absent value: the schema refuses it below
+            # and the retry asks again (keyword program GEN-12). Any other
+            # unquoted reply is the string as written.
+            value = None if decoded is None else content
     else:
         try:
             value = json.loads(content)
@@ -147,13 +191,43 @@ def _parse_generated_field_value(
 
     if isinstance(value, str):
         value = value.strip()
-        if not value or value.casefold() in {"null", "none", "n/a"}:
+        if not value:
             raise ValueError(f"{field_path} must be a useful non-empty string")
     elif isinstance(value, dict) and not value:
         raise ValueError(f"{field_path} must be a useful non-empty object")
     elif isinstance(value, list) and not value and field_path != "moduleConflicts":
         raise ValueError(f"{field_path} must be a useful non-empty array")
+    if field_path in _GENERATION_NAME_FIELDS:
+        # D-KW-3: a NAME field never carries a status word; the retry asks again.
+        refusal = status_word_refusal(value)
+        if refusal:
+            raise ValueError(f"{field_path}: {refusal}")
     return value
+
+# Region fields a NEW module must carry (keyword program GEN-3/4). The schema
+# lists them as optional so module data written before them stays valid;
+# generation requires them here, and generate_field's retry heals a reply that
+# leaves one out. The model authors them; code never guesses them from names.
+_GENERATION_REQUIRED_FIELDS = {
+    "worldMap": ("areaType", "climate", "terrain"),
+}
+
+# Fields that are a character's NAME (keyword program GEN-6). The builder places
+# the antagonist as an NPC under this exact name; the free-text antagonist
+# field stays the description.
+_GENERATION_NAME_FIELDS = frozenset({"mainPlot.antagonistName"})
+
+
+def _generation_field_schema(field_path: str, schema_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one T031 field schema with the generation-only required fields."""
+    required = _GENERATION_REQUIRED_FIELDS.get(field_path)
+    if not required:
+        return schema_info
+    schema = copy.deepcopy(schema_info)
+    items = schema["items"]
+    present = list(items.get("required", []))
+    items["required"] = present + [name for name in required if name not in present]
+    return schema
 
 @dataclass
 class ModulePromptGuide:
@@ -209,7 +283,7 @@ class ModulePromptGuide:
     """
     
     
-    mainObjective: str = """
+    mainPlot_mainObjective: str = """
     The ultimate goal of the module in one sentence.
     Should be:
     - Clear and specific
@@ -220,7 +294,7 @@ class ModulePromptGuide:
     Format: Verb + specific goal
     """
     
-    antagonist: str = """
+    mainPlot_antagonist: str = """
     The main villain or opposing force.
     Format: Name + title/organization
     
@@ -231,8 +305,20 @@ class ModulePromptGuide:
     
     Should tie directly to the main objective
     """
+
+    mainPlot_antagonistName: str = """
+    The proper name of the villain named in mainPlot.antagonist, alone, exactly
+    as the character would be listed as an NPC: no title clause, organization or
+    description.
+
+    Examples:
+    - "Rurik Emberstone"
+    - "The Whispering Shadow"
+
+    A state such as wounded or corrupted belongs in a description, never in a name.
+    """
     
-    plotStages: str = """
+    mainPlot_plotStages: str = """
     3-7 major module stages/acts.
     Each needs:
     - stageName: Clear identifier ("Act 1: The Awakening")
@@ -290,6 +376,9 @@ class ModulePromptGuide:
     - mapId: Unique identifier based on region initials (e.g., "BH001" for Blackwood Hollow)
     - dangerLevel: "low", "medium", "high", "extreme"
     - recommendedLevel: Character level range (e.g., 1-3)
+    - areaType: "dungeon", "town", "wilderness" or "mixed" - the kind of place the region is
+    - climate: the region's climate in a few words, matching the region
+    - terrain: the region's ground and landscape in a few words, matching the region
     - levels: Sub-areas within the region
     
     Sub-area format:
@@ -648,6 +737,7 @@ Use only standard ASCII characters -- no smart quotes, no em-dashes, no Unicode 
             "moduleConflicts",
             "mainPlot.mainObjective",
             "mainPlot.antagonist",
+            "mainPlot.antagonistName",
             "mainPlot.plotStages",
             "factions",
             "worldMap",
@@ -664,7 +754,9 @@ Use only standard ASCII characters -- no smart quotes, no em-dashes, no Unicode 
                 continue
             
             # Get schema info for this field
-            schema_info = self.get_field_schema(field_path)
+            schema_info = _generation_field_schema(
+                field_path, self.get_field_schema(field_path)
+            )
             
             # Progress feedback
             print(f"MODULE_GENERATION_PROGRESS: Generating field {idx}/{total_fields}: {field_path}")
@@ -809,7 +901,7 @@ Use only standard ASCII characters -- no smart quotes, no em-dashes, no Unicode 
         for index, region in enumerate(world_map):
             area_id = region.get("mapId")
             area_name = region.get("regionName")
-            area_type = self._determine_area_type(region.get("regionDescription", ""))
+            area_type = region["areaType"]
             danger_level = region.get("dangerLevel", "medium")
             recommended_level = region.get("recommendedLevel", 1)
             
@@ -826,7 +918,9 @@ Use only standard ASCII characters -- no smart quotes, no em-dashes, no Unicode 
                 complexity="moderate",
                 danger_level=danger_level,
                 recommended_level=recommended_level,
-                num_locations=random.randint(5, 7)  # Explicitly set to 5-7 locations
+                num_locations=random.randint(5, 7),  # Explicitly set to 5-7 locations
+                climate=region["climate"],
+                terrain=region["terrain"],
             )
             
             # Generate area data (issue #128: generate_area requires the location
@@ -891,19 +985,6 @@ Use only standard ASCII characters -- no smart quotes, no em-dashes, no Unicode 
         
         # Return list of generated areas
         return generated_areas
-    
-    def _determine_area_type(self, description: str) -> str:
-        """Determine area type from description text"""
-        description = description.lower()
-        
-        if any(word in description for word in ["dungeon", "cave", "crypt", "tomb", "underground"]):
-            return "dungeon"
-        elif any(word in description for word in ["forest", "mountain", "swamp", "wilderness", "natural"]):
-            return "wilderness"
-        elif any(word in description for word in ["town", "city", "village", "settlement", "urban"]):
-            return "town"
-        else:
-            return "mixed"
     
     def update_area_with_prefix(self, area_data: Dict[str, Any], prefix: str) -> Dict[str, Any]:
         """Update all location IDs in area data to use the specified prefix"""

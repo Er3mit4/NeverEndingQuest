@@ -1,5 +1,18 @@
 # Provider Routing
 
+## Play-turn cost delta (2026-10-20; D-COST-1 and D-COST-4, #193)
+
+T082 (action prediction) no longer runs on a play turn. ENABLE_INTELLIGENT_ROUTING
+defaults to False (model_config.py), and main.py calls predict_actions_required only
+when that legacy flag is set. T067's model is its registry binding either way, so the
+prediction changed no request (#1313). T065 review attempts are capped: provider errors
+and unparseable verdicts count, and after _T065_ATTEMPT_LIMIT = 3 the review returns
+t065_exhausted (#1315). The OpenAI request carries the strict t065_verdict json_schema
+response_format, and Gemini the converted response_schema. On exhaustion the player gets
+one in-character line from the authored list data/dm_fail_forward_lines.json, never an
+error (#1317). This narrows item 18's "keep reissuing until useful output" for T065
+only; other required live tasks are unchanged.
+
 ## Issue 400 compression delta (2026-09-14; live evidence in the PR)
 
 T084 now asks the model for `{"text": "..."}` only: a numbered list of the
@@ -116,6 +129,8 @@ provider router, persisted approval or background comparison is introduced.
 | Successful response | Normalized content, usage, provider, T-ID, reported model, and response ID | Pre-call model constant |
 | Evidence | API/capture/usage logs | Gameplay or persisted-state authority |
 | Membership permission | T114 boolean/reason over actual input, accepted history and canonical party | Candidate narration and previous rejection feedback |
+| Roll answer (#1118) | T126 typed kind (`let_game_roll`, `faces`, `decline`, `other`) over the open roll, the ask shown and the player's whole line; required in a live turn; OpenAI luna/none, T112's Gemini, Legacy and LM Studio profiles; strict JSON schema with no bounds | The player's words as parsed by code; the site checks faces against the dice |
+| Startup menu answer (#1260) | T127 typed option number or clarifying question over the menu's numbered options as printed and the player's whole line; only after code finds no in-range number, whole listed name or "new"; one bounded attempt outside the live turn path, any failure falls back to the menu's own line; OpenAI luna/none, T093's MINI_UTIL Gemini, Legacy and LM Studio profiles; strict JSON schema | The player's words as parsed by code; code checks the number is one of the listed options |
 
 ## Flow
 
@@ -138,7 +153,7 @@ provider router, persisted approval or background comparison is introduced.
 17. Local/Custom may replace only the LM Studio model from persisted settings and omits unsupported `json_object` while preserving explicit JSON schema.
 18. Required live tasks structurally reissue after a fully reaped unavailable generation and keep reissuing transient transport/HTTP failures with capped jittered backoff until useful output or supersession (Load/Reset). The owner-approved integration policy below retains empty-response reissue; structured deterministic errors hand off to existing caller policy. Changing progress and provider-specific error cards remain transport-owned. Advisory tasks retain their own completion policy; capture does not own that distinction.
 19. Startup supplies a private reactive message-repair callback when a provider rejects request ordering. The live transport invokes it only after the correlated failed child is reaped, then freezes the repaired messages for the next generation. It does not fabricate a response or change provider selection.
-20. Capture removes that callback before serialization/API dispatch and records the actual repaired message sequence. Independent startup review uses the existing T092 binding; no parallel startup router or model-specific gameplay branch is introduced.
+20. Capture removes that callback before serialization/API dispatch and records the actual repaired message sequence. Independent startup review uses its own T124 binding (split from T092 by #682); the default `engine` review mode (D-CREATE-COST-5) uses T128 instead, one review of the typed intent and narration against the creation scope with its own binding; T124 stays the review of the `whole` rollback mode, over the engine-built sheet. No parallel startup router or model-specific gameplay branch is introduced.
 21. Canonically normalized membership proposals trigger T114 before provisional
     travel preflight and T065. A malformed verdict
     repeats the same guardian stage; semantic rejection returns to the shared T067
@@ -164,27 +179,27 @@ provider router, persisted approval or background comparison is introduced.
 - Scope supersession reaps a child and raises before generation logging; absence of a
   completed T114 capture cannot prove whether an interrupted guardian started. The
   guardian-load acceptance observation does not certify task-specific cancellation.
-- Guardian seams: `core/npc/party_guardian.py:95`, `main.py:9245`,
-  `model_registry.py:647`, `utils/capture/live_provider_call.py:52`.
+- Guardian seams: `core/npc/party_guardian.py:94`, `main.py::_review_dm_candidate` at `guardian_result = review_party_membership(`,
+  `model_registry.py:688`, `utils/capture/live_provider_call.py:52`.
 
 ## Load-bearing seams
 
-1. `model_registry.py:14-39` - supported providers and eligible model catalog.
-2. `model_registry.py:75-113` and `model_registry.py:573-594` - binding schema and immutable inventory.
-3. `model_registry.py:268-310` and `model_registry.py:413-429` - representative validator and main-DM bindings.
-4. `model_registry.py:495-520` - T096/T097 profiles and attempt ladders.
-5. `model_config.py:1018-1124` - capture defaults, provider defaults, and switching.
-6. `model_config.py:1147-1388` - persisted settings and credentials.
-7. `model_config.py:1391-1521` - registry validation, resolution, and derived variants.
-8. `utils/capture/multi_model_capture.py:323-376` - profile replacement and empty-only retry.
-9. `utils/capture/multi_model_capture.py:379-498` - provider snapshot and primary execution.
-10. `utils/capture/multi_model_capture.py:500-620` - failure-isolated capture and variants.
-11. `core/ai/api_client.py:181-263` - response rejection and actual model/ID normalization.
-12. `core/ai/api_client.py:280-367` - provider-neutral router and error normalization.
-13. `core/ai/api_client.py:370-552` - provider constraints and Gemini translation.
-14. `utils/capture/live_provider_call.py:735` and `utils/capture/multi_model_capture.py:380` - live children, correlation, required reissue, and capture bookkeeping.
+1. `model_registry.py:14-72` - supported providers and eligible model catalog.
+2. `model_registry.py:75-112` and `model_registry.py:734-743` - binding schema and immutable inventory.
+3. `model_registry.py:299-316` and `model_registry.py:441-466` - representative validator and main-DM bindings.
+4. `model_registry.py:522-548` - T096/T097 profiles and attempt ladders.
+5. `model_config.py:1069-1175` - capture defaults, provider defaults, and switching.
+6. `model_config.py:1198-1439` - persisted settings and credentials.
+7. `model_config.py:1442-1572` - registry validation, resolution, and derived variants.
+8. `utils/capture/multi_model_capture.py:325-387` - profile replacement and empty-only retry.
+9. `utils/capture/multi_model_capture.py:390-525` - provider snapshot and primary execution.
+10. `utils/capture/multi_model_capture.py:527-647` - failure-isolated capture and variants.
+11. `core/ai/api_client.py:217-302` - response rejection and actual model/ID normalization.
+12. `core/ai/api_client.py:319-442` - provider-neutral router and error normalization.
+13. `core/ai/api_client.py:532-1020` - provider constraints and Gemini translation.
+14. `utils/capture/live_provider_call.py:1310` and `utils/capture/multi_model_capture.py:390` - live children, correlation, required reissue, and capture bookkeeping.
 15. `core/ai/api_client.py` `normalize_local_template_messages` / `_local_template_repair` - Local/Custom strict-template shape repair (#179, #389). Lives in the adapter so every caller, the live child included, gets it: on a COMPLETED Local/Custom rejection (any HTTP status; provider prose is never parsed) the request is reissued once with one leading system block, later system messages converted to user turns in place, and a trailing user turn; an array the reshape leaves unchanged re-raises as before, so lenient models are never reshaped and nothing can loop. Capture rows keep the caller's assembled request; replay through the adapter applies the same repair.
-16. `utils/capture/file_writer.py:36-181` and `utils/api_logger.py:42-123` - capture and API evidence stores.
+16. `utils/capture/file_writer.py:36-182` and `utils/api_logger.py:42-197` - capture and API evidence stores.
 
 ## Invariants
 

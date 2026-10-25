@@ -8,6 +8,12 @@ The encounter file is the transaction journal.  A turn claim is persisted
 before model work, resolved events are persisted before mechanical writes,
 and every character/resource/effect write is absolute and replay-safe.  The
 encounter receipt and cursor are committed last.
+
+A player's answer to a DM roll request is an exchange of
+``pendingTurn.playerExchanges``; when the game rolls it (#877, #1118) its
+writers type ``rolledBy`` and ``rolledFaces`` beside the player's own words:
+``mark_pending_game_roll`` for a DM-asked roll, ``write_weapon_attack`` for a
+code-issued roll phase.
 """
 
 from contextlib import contextmanager
@@ -18,12 +24,14 @@ import re
 import uuid
 
 from core.combat import (
+    PersistedPrerollSource,
     apply_resolution,
     check_invariants,
     ensure_agentic_roll_reserve,
+    recharge_at_turn_start,
     resolution_from_event,
 )
-from core.effects.lifecycle import enter_combat_effect, exit_combat_effect
+from core.effects.lifecycle import apply_effect_ops, enter_combat_effect, exit_combat_effect
 from core.effects.effective import effective_sheet
 from core.managers.combat_state import (
     CombatStateConflict,
@@ -36,6 +44,7 @@ from core.managers.combat_state import (
     valid_pending_delivery,
     combat_provenance,
     combatant_by_id,
+    join_as_hostile,
     resolve_creature_controller,
 )
 from utils.encoding_utils import safe_json_load
@@ -369,6 +378,9 @@ def _return_stale_turn_to_intent(encounter, characters):
     pending["stage"] = "intent_pending"
     pending["events"] = []
     pending["retryReason"] = "character_state_changed"
+    # Item 3: a returned turn goes back to the model's path; the typed faces
+    # already given stay in playerExchanges.
+    pending.pop("weaponAttack", None)
     pending.pop("characterPreconditions", None)
     state["phase"] = "resolving_turn"
     state.pop("pauseReason", None)
@@ -681,6 +693,46 @@ def store_agentic_preroll_cache(
         return deepcopy(encounter)
 
 
+def take_opening_action(encounter_path, timeout_seconds=5.0):
+    """#882: the player's declared first action, once.
+
+    It is marked offered on the encounter before it is returned, so a resume
+    never offers it again. None when there is none, it was offered, the
+    encounter predates the field, a DM request is waiting for the player, or
+    the encounter is busy (a later window offers it then).
+    """
+    with path_transaction_lock(
+        encounter_path,
+        suffix=".combat.lock",
+        timeout_seconds=timeout_seconds,
+    ) as acquired:
+        if acquired is None:
+            return None
+        encounter = safe_json_load(encounter_path)
+        if not isinstance(encounter, dict):
+            return None
+        text = encounter.get("openingAction")
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or encounter.get("openingActionOffered") is not False
+        ):
+            return None
+        pending = (encounter.get("combatState") or {}).get("pendingTurn")
+        exchanges = live_exchanges(pending)
+        if exchanges and exchanges[-1].get("dmRequest"):
+            return None
+        encounter["openingActionOffered"] = True
+        try:
+            _write_object(encounter_path, encounter, "opening action offer")
+        except CombatTransactionError as exc:
+            # Optional: a failed mark never ends the turn; the player is asked
+            # for their action as before, and a later window may offer it.
+            _LOGGER.warning("opening action not offered: %s", exc)
+            return None
+        return text.strip()
+
+
 def claim_turn(
     encounter_path,
     actor_ids,
@@ -738,6 +790,19 @@ def claim_turn(
         state.pop("pauseReason", None)
         if state.get("pipelineMode") == "agentic":
             ensure_agentic_roll_reserve(encounter, actor_ids)
+            if "rechargeRolls" not in pending:
+                # MS-b: recharge d6 per spent ability at the start of the
+                # actor's turn, drawn from the persisted reserve and journaled
+                # on the claim; the cursor advances so resolution never
+                # reuses the face. A recovered claim keeps its draws.
+                rolls = PersistedPrerollSource(
+                    (encounter.get("preroll_cache") or {}).get("rolls", ""), encounter
+                )
+                pending["rechargeRolls"] = recharge_at_turn_start(encounter, actor_ids, rolls)
+                if pending["rechargeRolls"]:
+                    encounter.setdefault("preroll_cache", {})["consumed"] = deepcopy(
+                        rolls.consumption()
+                    )
         _write_object(encounter_path, encounter, "turn claim")
         return deepcopy(encounter), deepcopy(pending)
 
@@ -770,10 +835,60 @@ def append_pending_player_input(
         if not isinstance(exchanges, list):
             exchanges = []
         exchanges = [item for item in exchanges if isinstance(item, dict)]
-        if not exchanges or exchanges[-1].get("playerInput") != rendered:
+        # A retried line is not appended twice; an answer to a new DM
+        # request is always its own exchange, even when its text repeats (#1118).
+        if (not exchanges or exchanges[-1].get("dmRequest") or exchanges[-1].get("withdrawn") is True
+                or exchanges[-1].get("playerInput") != rendered):
             exchanges.append({"playerInput": rendered})
         pending["playerExchanges"] = exchanges
         _write_object(encounter_path, encounter, "pending player clarification")
+
+
+def mark_pending_game_roll(
+    encounter_path,
+    turn_id,
+    player_input,
+    faces,
+    timeout_seconds=None,
+):
+    """#1118: the writer of the game's roll for an open typed roll
+    request: ``rolledBy`` "game" and the faces per die term, beside the
+    player's own line (never a sentence written for them). Under one hold of
+    the combat lock it does exactly one thing and returns which:
+    "appended" when the last exchange is the DM's request (the line answers
+    it), "marked" when the last exchange is this line with no roll yet (the
+    line was appended by append_pending_player_input), or None (a resumed
+    turn re-reading its own line: nothing is written)."""
+    rendered = _player_text(player_input)
+    with path_transaction_lock(
+        encounter_path,
+        suffix=".combat.lock",
+        timeout_seconds=timeout_seconds,
+    ) as acquired:
+        if acquired is None:
+            raise CombatLeaseBusy("Combat state is busy; retry the preserved action")
+        encounter = _load_object(encounter_path, "encounter")
+        state = ensure_combat_state(encounter)
+        pending = state.get("pendingTurn")
+        if not isinstance(pending, dict) or pending.get("turnId") != turn_id:
+            raise CombatTransactionError("The pending player turn changed")
+        if pending.get("stage") != "intent_pending":
+            raise CombatTransactionError("The pending player turn is already staged")
+        exchanges = pending.get("playerExchanges")
+        exchanges = [item for item in exchanges if isinstance(item, dict)] if isinstance(exchanges, list) else []
+        last = exchanges[-1] if exchanges and exchanges[-1].get("withdrawn") is not True else None
+        if last is not None and last.get("dmRequest"):
+            exchanges.append({"playerInput": rendered, "rolledBy": "game", "rolledFaces": deepcopy(faces)})
+            branch = "appended"
+        elif last is not None and _player_text(last.get("playerInput")) == rendered and "rolledBy" not in last:
+            last["rolledBy"] = "game"
+            last["rolledFaces"] = deepcopy(faces)
+            branch = "marked"
+        else:
+            return None
+        pending["playerExchanges"] = exchanges
+        _write_object(encounter_path, encounter, "pending game roll")
+        return branch
 
 
 def record_pending_player_request(
@@ -783,8 +898,15 @@ def record_pending_player_request(
     requested_die=None,
     timeout_seconds=5.0,
     npc_voice_intents=None,
+    requested_phase=None,
+    requested_roll=None,
+    requested_slot_level=None,
+    requested_dc=None,
 ):
-    """Persist the DM's complete question beside the action it clarifies."""
+    """Persist the DM's complete question beside the action it clarifies,
+    with the typed die and (#853) the typed phase of a roll request,
+    (#877) its full typed dice, (#942) the slot level its dice are
+    asked at, and (r2 item 10) the DC a save is asked at."""
     rendered = _player_text(player_message)
     with path_transaction_lock(
         encounter_path,
@@ -801,10 +923,22 @@ def record_pending_player_request(
         exchanges = pending.get("playerExchanges")
         if not isinstance(exchanges, list) or not exchanges:
             exchanges = [{"playerInput": ""}]
+        if not isinstance(exchanges[-1], dict) or exchanges[-1].get("withdrawn") is True:
+            # A new ask never lands on a withdrawn exchange (#1118 r4).
+            exchanges.append({"playerInput": ""})
         exchanges[-1]["dmRequest"] = rendered
         die = str(requested_die or "").strip().lower()
         if re.fullmatch(r"(?:\d+)?d(?:4|6|8|10|12|20|100)", die):
             exchanges[-1]["requestedDie"] = die
+        if isinstance(requested_phase, str) and requested_phase.strip():
+            exchanges[-1]["requestedPhase"] = requested_phase.strip()
+        roll = str(requested_roll or "").strip().lower()
+        if re.fullmatch(r"\d*d(?:4|6|8|10|12|20|100)(?:\+\d*d(?:4|6|8|10|12|20|100))*", roll):
+            exchanges[-1]["requestedRoll"] = roll
+        if type(requested_slot_level) is int and 1 <= requested_slot_level <= 9:
+            exchanges[-1]["requestedSlotLevel"] = requested_slot_level
+        if type(requested_dc) is int and requested_dc > 0:
+            exchanges[-1]["requestedDc"] = requested_dc
         pending["playerExchanges"] = exchanges
         existing_voice_envelope = normalize_npc_voice_intents(
             pending.get("npcVoiceIntents")
@@ -818,6 +952,142 @@ def record_pending_player_request(
             if supplied_voice_envelope is not None:
                 pending["npcVoiceIntents"] = supplied_voice_envelope
         _write_object(encounter_path, encounter, "pending player request")
+
+
+def live_exchanges(pending):
+    """The pending turn's exchanges that still count (#1118 r4): an exchange
+    the player withdrew (typed ``withdrawn``) is kept for T096's record but
+    is never a live ask, answer or roll to any typed reader."""
+    exchanges = pending.get("playerExchanges") if isinstance(pending, dict) else None
+    return [item for item in exchanges or [] if isinstance(item, dict) and item.get("withdrawn") is not True]
+
+
+def write_pending_stats(
+    encounter_path,
+    turn_id,
+    combatant_id,
+    stats=None,
+    sheet_ref=None,
+    timeout_seconds=5.0,
+    invocation_claim=None,
+):
+    """#1447: settle one ``statsPending`` observer while its turn is still
+    being chosen. With ``stats`` (currentHitPoints, maxHitPoints, armorClass,
+    initiative from the sheet just built) and ``sheet_ref`` (that sheet's
+    path), the creature takes the stats, ``statsPending`` is cleared,
+    ``sheetBuiltAt`` records the round, and its scene row now names the
+    sheet, so later loads find it by sourceRef. Without them the build
+    failed: ``sheetBuildFailedAt`` records the round and the creature stays
+    pending (one build per creature per fight). Returns the written
+    encounter."""
+    with _invocation_commit_authority(invocation_claim), path_transaction_lock(
+        encounter_path,
+        suffix=".combat.lock",
+        timeout_seconds=timeout_seconds,
+    ) as acquired:
+        if acquired is None:
+            raise CombatLeaseBusy("Combat state is busy; retry the preserved action")
+        encounter = _load_object(encounter_path, "encounter")
+        state = ensure_combat_state(encounter)
+        pending = state.get("pendingTurn")
+        if not isinstance(pending, dict) or pending.get("turnId") != turn_id:
+            raise CombatTransactionError("The pending player turn changed")
+        if pending.get("stage") != "intent_pending":
+            raise CombatTransactionError("The pending player turn is already staged")
+        creature = combatant_by_id(encounter, combatant_id)
+        if not isinstance(creature, dict) or creature.get("statsPending") is not True:
+            raise CombatTransactionError("The creature has no pending stats")
+        if stats is None:
+            creature["sheetBuildFailedAt"] = state.get("round")
+        else:
+            for key in ("currentHitPoints", "maxHitPoints", "armorClass", "initiative"):
+                creature[key] = stats[key]
+            creature.pop("statsPending", None)
+            creature.pop("sheetBuildFailedAt", None)
+            creature["sheetBuiltAt"] = state.get("round")
+            for row in (encounter.get("sceneFacts") or {}).get("participants") or []:
+                if isinstance(row, dict) and row.get("combatantId") == combatant_id:
+                    row["sourceKind"] = "character"
+                    row["sourceRef"] = str(sheet_ref)
+        _write_object(encounter_path, encounter, "combat pending stats")
+        return encounter
+
+
+def write_weapon_attack(
+    encounter_path,
+    turn_id,
+    record,
+    player_message=None,
+    requested_die=None,
+    answer=None,
+    timeout_seconds=5.0,
+    npc_voice_intents=None,
+    requested_phase=None,
+    rolled_faces=None,
+    withdraw=False,
+):
+    """Item 3: persist the code-issued roll phase, pendingTurn.weaponAttack.
+
+    One optional key, absent when no code-issued roll is open: ``record``
+    None removes it (the player's words go back to the model). ``answer`` is
+    the player's typed reply, added to the exchange chain first, and
+    ``player_message`` the next roll ask beside it, so history reads as
+    a DM request does today. ``rolled_faces`` (#1118) marks the answer as the
+    game's roll, typed beside the player's own words (``rolledBy`` "game" and
+    the faces per term); the answer text may then be empty. ``withdraw``
+    (with ``record`` None, #1118 r4) marks every exchange so far as the
+    player's withdrawn action: the swing did not happen, and T096 rules only
+    the lines after it.
+    """
+    with path_transaction_lock(
+        encounter_path,
+        suffix=".combat.lock",
+        timeout_seconds=timeout_seconds,
+    ) as acquired:
+        if acquired is None:
+            raise CombatLeaseBusy("Combat state is busy; retry the preserved action")
+        encounter = _load_object(encounter_path, "encounter")
+        state = ensure_combat_state(encounter)
+        pending = state.get("pendingTurn")
+        if not isinstance(pending, dict) or pending.get("turnId") != turn_id:
+            raise CombatTransactionError("The pending player turn changed")
+        if pending.get("stage") != "intent_pending":
+            raise CombatTransactionError("The pending player turn is already staged")
+        exchanges = pending.get("playerExchanges")
+        if not isinstance(exchanges, list) or not exchanges:
+            exchanges = [{"playerInput": ""}]
+        exchanges = [item for item in exchanges if isinstance(item, dict)]
+        if answer is not None and rolled_faces is not None:
+            exchanges.append({"playerInput": _player_text(answer), "rolledBy": "game",
+                              "rolledFaces": deepcopy(rolled_faces)})
+        elif answer is not None:
+            exchanges.append({"playerInput": _player_text(answer) or "(the game rolled)"})
+        if player_message is not None and exchanges[-1].get("withdrawn") is True:
+            # A new ask never lands on a withdrawn exchange (#1118 r4).
+            exchanges.append({"playerInput": ""})
+        if player_message is not None:
+            exchanges[-1]["dmRequest"] = _player_text(player_message)
+            die = str(requested_die or "").strip().lower()
+            if re.fullmatch(r"(?:\d+)?d(?:4|6|8|10|12|20|100)", die):
+                exchanges[-1]["requestedDie"] = die
+            # #1008: the typed phase beside the die, as #853 stores it for a
+            # model request, so the die check never reads this wording.
+            if isinstance(requested_phase, str) and requested_phase.strip():
+                exchanges[-1]["requestedPhase"] = requested_phase.strip()
+        pending["playerExchanges"] = exchanges
+        if record is None:
+            pending.pop("weaponAttack", None)
+            if withdraw:
+                for exchange in exchanges:
+                    exchange["withdrawn"] = True
+        else:
+            pending["weaponAttack"] = deepcopy(record)
+        if normalize_npc_voice_intents(pending.get("npcVoiceIntents")) is None:
+            supplied_voice_envelope = normalize_npc_voice_intents(npc_voice_intents)
+            if supplied_voice_envelope is not None:
+                pending["npcVoiceIntents"] = supplied_voice_envelope
+        _write_object(encounter_path, encounter, "weapon attack roll phase")
+        return deepcopy(pending)
 
 
 def stage_events(
@@ -1167,6 +1437,16 @@ def exit_effect_clock(
             return
         for name, path in (character_paths or {}).items():
             character = _load_object(path, "character %s" % name)
+            # An effect that ended in combat (no rounds left, or an encounter
+            # effect) leaves through the lifecycle operation so its onRemove
+            # change applies and the engine takes its numbers off the sheet.
+            ended = [
+                {"op": "remove", "effectId": effect.get("effectId"), "name": effect.get("name")}
+                for effect in character.get("temporaryEffects", []) or []
+                if isinstance(effect, dict) and exit_combat_effect(effect, now_scalar) is None
+            ]
+            if ended:
+                character = apply_effect_ops(character, ended)
             surviving = []
             for effect in character.get("temporaryEffects", []) or []:
                 converted = (
@@ -1271,6 +1551,13 @@ def apply_staged_turn(
                 "Restore the missing character data or a known-good save."
             ) from exc
 
+        # #1415: a bystander the player attacked joins as a hostile (the
+        # record the resolver wrote on the event; idempotent on a replay).
+        for event in pending.get("events", []):
+            for record in event.get("normalizations") or []:
+                if isinstance(record, dict) and record.get("kind") == "bystanderJoinedHostile":
+                    join_as_hostile(next_encounter, record.get("combatantId"), by=record.get("by"))
+
         violations = check_invariants(next_encounter, next_characters)
         if violations:
             raise CombatTransactionError(
@@ -1288,6 +1575,106 @@ def apply_staged_turn(
         commit_turn(next_encounter, turn_id, event_ids)
         _write_object(encounter_path, next_encounter, "combat turn commit")
         return deepcopy(next_encounter), deepcopy(next_characters)
+
+
+def _award_journaled_xp(character, name, after):
+    """Bring one sheet to its journaled post-combat XP through the engine award (X1b).
+
+    The engine adds the difference and writes the next threshold and
+    levelUpsPending in the same call, so the level-up flag is right the turn
+    the fight ends. A sheet already at ``after`` (a replay after a crash) is
+    left alone by value comparison. Fail forward: without the engine the total
+    is written directly, as before, and the engine refreshes the derived
+    numbers at its next touch of the sheet.
+    """
+    current = int(character.get("experience_points", 0) or 0)
+    if current == after:
+        return character
+    from core.nql import experience
+
+    outcome = experience.award(character, after - current, location="combat")
+    if outcome.ok and isinstance(outcome.sheet, dict):
+        _LOGGER.info(
+            "XP: %s: %+d XP -> %s/%s%s [combat]",
+            name, after - current, outcome.sheet.get("experience_points"),
+            outcome.sheet.get("exp_required_for_next_level"),
+            ", level-up earned (%s)" % outcome.sheet.get("levelUpsPending")
+            if outcome.sheet.get("levelUpsPending") else "",
+        )
+        return outcome.sheet
+    _LOGGER.warning(
+        "XP: %s: combat reward written without the engine (%s)", name, outcome.reason
+    )
+    character["experience_points"] = after
+    return character
+
+
+def recover_ammunition(
+    encounter_path,
+    character_paths,
+    forfeit,
+    timeout_seconds=5.0,
+):
+    """AM: once per encounter, the engine returns the recoverable share of each stock.
+
+    SRD: a minute's search after the fight recovers half the ammunition spent
+    (rounded down); a party that fled or yielded has no minute (``forfeit``,
+    engine ``recover ... by 0``). Idempotent through the completion receipt;
+    a crash between a sheet write and the receipt leaves that stock's count
+    at zero, which the engine refuses on the second pass and is then treated
+    as already recovered. Returns the receipt {name: [{name, spent, before,
+    after, recovered}]}, ``spent`` being the shots fired since the last
+    recovery (the engine's pending count).
+    """
+    with _combat_leases(
+        encounter_path,
+        character_paths,
+        timeout_seconds,
+    ):
+        encounter = _load_object(encounter_path, "encounter")
+        state = ensure_combat_state(encounter)
+        completion = state["completion"]
+        if completion.get("ammunitionRecovered"):
+            return deepcopy(completion.get("ammunitionRecovery") or {})
+        from core.nql import ammunition as nql_ammunition
+
+        receipt = {}
+        for name, path in (character_paths or {}).items():
+            character = _load_object(path, "character %s" % name)
+            rows = [
+                row for row in character.get("ammunition") or []
+                if isinstance(row, dict) and type(row.get("recoverable")) is int and row["recoverable"] > 0
+            ]
+            if not rows:
+                continue
+            lines = []
+            for row in rows:
+                before = int(row.get("quantity", 0) or 0)
+                spent = int(row.get("recoverable", 0) or 0)
+                try:
+                    outcome = nql_ammunition.recover(character, row["name"], forfeit=forfeit)
+                except Exception as exc:
+                    outcome = nql_ammunition.AmmunitionOutcome(False, reason=str(exc))
+                if outcome.ok:
+                    nql_ammunition.write_back(row, outcome)
+                    lines.append({"name": row["name"], "spent": spent, "before": before,
+                                  "after": row["quantity"], "recovered": row["quantity"] - before})
+                elif (outcome.fault or {}).get("code") == "E_QUANTITY":
+                    # The count was already closed (a crash after the sheet write).
+                    row.pop("recoverable", None)
+                else:
+                    # Fail forward: the count stays on the row for the next fight's
+                    # recovery; the fight still closes.
+                    _LOGGER.warning(
+                        "AM: %s: %s not recovered (%s)", name, row["name"], outcome.reason
+                    )
+            if lines:
+                receipt[name] = lines
+            _write_object(path, character, "ammunition recovery for %s" % name)
+        completion["ammunitionRecovered"] = True
+        completion["ammunitionRecovery"] = receipt
+        _write_object(encounter_path, encounter, "ammunition recovery receipt")
+        return deepcopy(receipt)
 
 
 def apply_combat_rewards(
@@ -1327,10 +1714,17 @@ def apply_combat_rewards(
                     "Reward journal does not cover character %s" % name
                 )
             character = _load_object(path, "character %s" % name)
-            character["experience_points"] = int(pending[name]["after"])
+            character = _award_journaled_xp(character, name, int(pending[name]["after"]))
             _write_object(path, character, "combat reward for %s" % name)
 
         completion["rewardsApplied"] = True
+        # The typed receipt of what each member was awarded (#726), kept in the
+        # same write that clears the journal, so the post-combat pass can tell
+        # an exact repeat of this award by data.
+        completion["appliedRewards"] = {
+            name: int(pending[name]["after"]) - int(pending[name]["before"])
+            for name in (character_paths or {})
+        }
         completion["pendingRewards"] = None
         _write_object(encounter_path, encounter, "combat reward receipt")
         return deepcopy(encounter)

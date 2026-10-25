@@ -18,7 +18,7 @@ REQUIRED_EVENT_FIELDS = ("eventId", "actorId", "intent", "outcome", "stateVersio
 # verify application without re-running the resolver.
 REQUIRED_TARGET_FIELDS = ("combatantId", "hpBefore", "hpAfter", "statusAfter")
 
-VALID_RESOURCE_KINDS = frozenset({"ammunition", "spellSlot", "featureUse", "item"})
+VALID_RESOURCE_KINDS = frozenset({"ammunition", "spellSlot", "featureUse", "item", "charges"})
 
 
 def make_event_id(encounter_id, round_number, turn_id, sequence):
@@ -59,7 +59,17 @@ def validate_event(event):
                         "target %s missing %s" % (target.get("combatantId", "?"), field))
     elif "outcome" in event:
         problems.append("outcome must be an object")
-    for resource in event.get("resources", []) or []:
+    bonus = event.get("bonusAction")
+    if bonus is not None:
+        # R2: the actor's typed Bonus Action, resolved before its Action.
+        if not isinstance(bonus, dict) or not (
+                isinstance(bonus.get("featureName"), str) ^ isinstance(bonus.get("item"), dict)):
+            problems.append("bonusAction must have one featureName or typed item")
+            bonus = {}
+        for target in (bonus.get("outcome") or {}).get("targets") or []:
+            if not isinstance(target, dict) or any(field not in target for field in REQUIRED_TARGET_FIELDS):
+                problems.append("bonusAction target missing a required field")
+    for resource in list((bonus or {}).get("resources") or []) + list(event.get("resources", []) or []):
         if not isinstance(resource, dict):
             problems.append("resources entries must be objects")
             continue
@@ -74,14 +84,17 @@ def validate_event(event):
         if effect_op.get("op") not in ("add", "remove"):
             problems.append("effect op must be add or remove")
         if effect_op.get("applyOn", "always") not in (
-            "always", "failedSave", "successfulSave"
+            "always", "failedSave", "successfulSave", "hit"
         ):
             problems.append("effect applyOn is invalid")
         if (
-            effect_op.get("applyOn", "always") != "always"
+            effect_op.get("applyOn", "always") in ("failedSave", "successfulSave")
             and not (effect_op.get("saveTargetId") or effect_op.get("combatantId"))
         ):
             problems.append("save-gated effect requires a saveTargetId")
+        if effect_op.get("applyOn") == "hit" and not effect_op.get("hitTargetId"):
+            # #672: staged only when the code-scored spell attack hit.
+            problems.append("hit-gated effect requires a hitTargetId")
         targets = int(bool(effect_op.get("owner"))) + int(
             bool(effect_op.get("combatantId"))
         )
@@ -96,11 +109,12 @@ def validate_event(event):
         elif effect_op.get("op") == "remove" and not (
             effect_op.get("effectId")
             or effect_op.get("name")
+            or effect_op.get("condition")
             or (isinstance(effect_op.get("effect"), dict)
                 and (effect_op["effect"].get("effectId")
                      or effect_op["effect"].get("name")))
         ):
-            problems.append("effect remove requires a name or effectId")
+            problems.append("effect remove requires a name, effectId or condition")
     for tick in event.get("effectTicks", []) or []:
         if not isinstance(tick, dict):
             problems.append("effectTicks entries must be objects")
@@ -132,7 +146,7 @@ def validate_event(event):
                     )
                     continue
                 if any(
-                    field not in ("hitPoints", "status")
+                    field not in ("hitPoints", "temporaryHitPoints", "status")
                     for field in snapshot
                 ):
                     problems.append(
@@ -144,6 +158,14 @@ def validate_event(event):
                 ):
                     problems.append(
                         "characterStateAfter %s hitPoints must be nonnegative"
+                        % owner
+                    )
+                if "temporaryHitPoints" in snapshot and (
+                    type(snapshot["temporaryHitPoints"]) is not int
+                    or snapshot["temporaryHitPoints"] < 0
+                ):
+                    problems.append(
+                        "characterStateAfter %s temporaryHitPoints must be nonnegative"
                         % owner
                     )
                 if "status" in snapshot and not isinstance(

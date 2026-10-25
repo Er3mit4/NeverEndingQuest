@@ -67,6 +67,7 @@ See LICENSE file for full terms.
 # ============================================================================
 
 import copy
+from core.ai import history_markers as hm
 import hashlib
 import json
 import os
@@ -87,6 +88,7 @@ register_callsite("T039", "core/managers/campaign_manager.py", 3245)
 import config
 from utils.encoding_utils import safe_json_load, safe_json_dump
 from utils.file_operations import safe_write_json
+from utils.transient_filesystem import ReadOnlySaveStop, raise_if_save_stopped
 from utils.module_path_manager import ModulePathManager
 from utils.module_refresh_lock import module_refresh_lock
 from utils.path_transaction_lock import path_transaction_lock
@@ -155,6 +157,50 @@ def _is_valid_campaign_export_data(exported_data: Any) -> bool:
         isinstance(module_name, str) and module_name.strip()
         for module_name in exported_data["unlockedModules"]
     )
+
+
+def _party_member_names(party_tracker_data: Dict[str, Any], module_name: str) -> List[str]:
+    """The party's player characters by tracker id and by sheet name (#625)."""
+    path_manager = ModulePathManager(module_name)
+    names: List[str] = []
+    for member in party_tracker_data.get("partyMembers") or []:
+        if not isinstance(member, str) or not member.strip():
+            continue
+        names.append(member.strip())
+        sheet = safe_json_load(path_manager.get_character_path(member))
+        if isinstance(sheet, dict) and isinstance(sheet.get("name"), str) and sheet["name"].strip():
+            names.append(sheet["name"].strip())
+    return list(dict.fromkeys(names))
+
+
+def _same_character_name(a: str, b: str) -> bool:
+    """Exact name equality, case ignored and "_" read as a space (as #855's matcher)."""
+    def norm(name):
+        return " ".join(str(name).lower().replace("_", " ").split())
+    return norm(a) == norm(b)
+
+
+def _relationships_dealt_with(
+    relationships: Dict[str, Any], party_names: List[str] = ()
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Keep the NPCs T039 marks the party as having dealt with (#625).
+
+    T039 labels each NPC it names with ``contact``: "dealt_with", "seen" or
+    "heard_of". Only a dealt-with NPC is a relationship; the label is the
+    model's own typed output, so no status text is read here. A party
+    member is never a relationship: its key is matched exactly against the
+    party's typed names.
+    """
+    kept: Dict[str, Any] = {}
+    dropped: List[str] = []
+    for name, value in relationships.items():
+        if any(_same_character_name(name, member) for member in party_names):
+            dropped.append(name)
+        elif isinstance(value, dict) and value.get("contact") == "dealt_with":
+            kept[name] = value
+        else:
+            dropped.append(name)
+    return kept, dropped
 
 
 def format_campaign_hubs(hubs: Dict[str, Any]) -> str:
@@ -817,6 +863,7 @@ def _validate_receipt_committed_projection(
 
 def _durable_write_json(path: str, payload: Dict[str, Any]) -> None:
     """Write transaction metadata durably without a stale sentinel lock."""
+    raise_if_save_stopped()
     canonical = os.path.abspath(os.path.normpath(path))
     parent = os.path.dirname(canonical)
     if parent:
@@ -846,6 +893,7 @@ def _durable_write_json(path: str, payload: Dict[str, Any]) -> None:
 
 
 def _durable_remove(path: str) -> None:
+    raise_if_save_stopped()
     try:
         os.remove(path)
     except FileNotFoundError:
@@ -1895,13 +1943,27 @@ class CampaignManager:
         )
         return campaign
     
-    def refresh_modules(self):
-        """Scan and integrate modules explicitly, then sync campaign availability."""
+    def refresh_modules(self, priority_module=None):
+        """Scan and integrate modules explicitly, then sync campaign availability.
+
+        ``priority_module`` (the party's module) is integrated first. The
+        result's ``import_required`` lists modules left unjoined while their
+        ids collide with a registered module: they may have been played, or
+        the import failed or its checks could not be finished
+        (``refused_because``); ``imported`` lists the unplayed ones joined by
+        renumbering; ``not_joined`` lists the installed ones publication
+        refused or could not prove, with the reason and a typed ``cause``
+        (#586, #613, #608), or the waiting ones a scan blocked by
+        INDETERMINATE lifecycle recovery did not check (#638).
+        """
         with module_refresh_lock() as acquired:
             if not acquired:
                 return {
                     "success": False,
                     "newly_integrated": [],
+                    "import_required": [],
+                    "imported": [],
+                    "not_joined": [],
                     "available_modules": self.campaign_data.get("availableModules", []),
                     "error": "module_refresh_lock_timeout",
                 }
@@ -1916,8 +1978,8 @@ class CampaignManager:
 
                 # P2a: lifecycle recovery is advisory here too. Do not abort the
                 # refresh over an INDETERMINATE classification -- inert residue
-                # must not block module integration. (This path is currently
-                # unreachable: refresh_modules_async has no callers.)
+                # must not block module integration. (Startup calls this once,
+                # after reconcile_campaign_state.)
                 lifecycle_recovery = ModuleLifecycleStore("modules").recover()
                 if lifecycle_recovery.status is RecoveryStatus.INDETERMINATE:
                     warning(
@@ -1928,7 +1990,9 @@ class CampaignManager:
                 from core.generators.module_stitcher import get_module_stitcher
 
                 stitcher = get_module_stitcher()
-                newly_integrated = stitcher.scan_and_integrate_new_modules()
+                newly_integrated = stitcher.scan_and_integrate_new_modules(
+                    priority_module=priority_module
+                )
 
                 self.party_tracker_data = safe_json_load("party_tracker.json")
                 if self.party_tracker_data and newly_integrated:
@@ -1940,7 +2004,13 @@ class CampaignManager:
 
                 world_registry = stitcher.world_registry
                 if world_registry and "modules" in world_registry:
-                    world_modules = set(world_registry["modules"].keys())
+                    # Only joined modules are offered (#720); a bare stub
+                    # names a module whose joining was refused or not done.
+                    world_modules = {
+                        name
+                        for name in world_registry["modules"]
+                        if stitcher.is_joined_registry_module(world_registry, name)
+                    }
                     merge_result = {
                         "missing_modules": set(),
                         "lifecycle_changed": False,
@@ -1955,14 +2025,19 @@ class CampaignManager:
                         available = campaign.get("availableModules")
                         if not isinstance(available, list):
                             available = []
-                        current_available = set(available)
-                        missing_modules = world_modules - current_available
+                        # Keep the listed order and append new names sorted,
+                        # so the list does not follow the hash seed (#761).
+                        # An exact repeat is still written once.
+                        current_available = list(dict.fromkeys(available))
+                        missing_modules = world_modules - set(current_available)
                         merge_result["missing_modules"] = missing_modules
                         all_updates = set(newly_integrated) | missing_modules
                         if not all_updates:
                             return False
-                        current_available.update(all_updates)
-                        campaign["availableModules"] = list(current_available)
+                        for name in sorted(all_updates):
+                            if name not in current_available:
+                                current_available.append(name)
+                        campaign["availableModules"] = current_available
                         campaign["lastUpdated"] = datetime.now().isoformat()
                         return True
 
@@ -1998,6 +2073,9 @@ class CampaignManager:
                 return {
                     "success": True,
                     "newly_integrated": list(newly_integrated),
+                    "import_required": list(stitcher.import_required),
+                    "imported": list(stitcher.imported),
+                    "not_joined": list(stitcher.not_joined),
                     "available_modules": self.campaign_data.get("availableModules", []),
                 }
             except Exception as e:
@@ -2010,6 +2088,9 @@ class CampaignManager:
                 return {
                     "success": False,
                     "newly_integrated": [],
+                    "import_required": [],
+                    "imported": [],
+                    "not_joined": [],
                     "available_modules": self.campaign_data.get("availableModules", []),
                     "error": str(e),
                 }
@@ -2025,6 +2106,9 @@ class CampaignManager:
             return {
                 "success": False,
                 "newly_integrated": [],
+                "import_required": [],
+                "imported": [],
+                "not_joined": [],
                 "available_modules": self.campaign_data.get("availableModules", []),
                 "error": "refresh_timeout",
             }
@@ -2114,7 +2198,8 @@ class CampaignManager:
                 debug(f"FILE_OP: No module_plot.json found for {module_name}", category="file_operations")
                 return False
             
-            plot_data = safe_json_load(plot_file)
+            from utils import quest_record
+            plot_data = quest_record.module_plot(module_name) or {}
             plot_points = plot_data.get('plotPoints', [])
             
             if not plot_points:
@@ -2336,6 +2421,10 @@ class CampaignManager:
             )
             try:
                 transition_result = transition_callable()
+            except ReadOnlySaveStop:
+                # Keep the stop's type and write nothing more: the prepared
+                # intent stays for the next start's recovery (issue #654).
+                raise
             except BaseException as transition_exc:
                 current = safe_json_load("party_tracker.json")
                 if current == persisted:
@@ -3532,6 +3621,9 @@ class CampaignManager:
             if not isinstance(updated_campaign.get(field), type(default)):
                 updated_campaign[field] = copy.deepcopy(default)
 
+        # completedModules means visited and summarized: every crossing
+        # completes the module it leaves (#747). Plot progress is tracked
+        # separately.
         if module_name not in updated_campaign["completedModules"]:
             updated_campaign["completedModules"].append(module_name)
         self._handle_module_completion_export(
@@ -3802,6 +3894,7 @@ The chronicle should feel like a tale told by firelight years later—when inhib
 
 **Critical Instruction: Enrich and Extrapolate**
 While you must remain true to the events that occurred, you have the creative freedom—nay, the sacred duty—to flesh out the intimate details that make characters real. If the conversation history doesn't explicitly state someone's nickname, but their personality suggests one, include it. If their actions imply a quirk, phobia, or desire, weave it into the narrative. Did the rogue who always scouts ahead perhaps have a fear of being trapped? Did the cleric who heals everyone hide their own pain behind gentle smiles? Did the tension between two characters suggest an attraction neither would admit?
+This freedom never extends to events: never add a meeting, conversation, fight, reward, discovery or outcome that the conversation or the plot statuses do not record.
 
 Fill in these human details with the same care a novelist would. The conversation history provides the skeleton of events—you must add the flesh, blood, and beating heart. Every hero has quirks, every companion has pet names, every relationship has inside jokes. Find them. Create them. Make them real. 
 
@@ -3858,16 +3951,20 @@ FORMATTING RULES: Use only standard ASCII characters -- no smart quotes, no em-d
         
         conversation_data = f"Complete Conversation History: {json.dumps(filtered_conversation, indent=2)}"
         
-        user_prompt = f"""Please generate a complete narrative summary of this adventure arc using the location summaries and plot file provided below:
+        user_prompt = f"""Please write the chronicle of what the party actually played in this adventure arc, from the conversation and the plot statuses provided below:
 
 STRUCTURED PLOT DATA:
+These plot points are the module's authored plan, not a record of play. A point records something that happened only through a status other than "not started" and its plotImpact; a "not started" point did not happen, and a description tells what the module offers, not what the party did.
 {plot_summary}
 
 PARTY STATUS:
 Party NPCs: {json.dumps(party_npcs, indent=2)}
 
 CONVERSATION CONTEXT:
+This conversation is the only record of play. If it holds little or no play, the chronicle is short and tells only what it holds.
 {conversation_data}
+
+The chronicle tells only what the party did and perceived. Mention plot content only as far as the party perceived it in the conversation (seen, heard or told there), whatever the point's status, and in the conversation's own words: a plot description adds no detail to what the party learned. Never write what did not happen, in any form: no sentence that something was not done, not met, not found, not fought or not learned, and no list of kinds of events that did not occur (such as "no meeting, battle or reward"). Only a request or question the party perceived may be told as still open. If little was played, one sentence that the visit was brief is enough.
 
 Focus on story outcomes, character development, and decisions that will matter in future adventures."""
         
@@ -3915,13 +4012,26 @@ Focus on story outcomes, character development, and decisions that will matter i
                         "Could not durably checkpoint T038 output"
                     ) from checkpoint_exc
             
-            # Have AI also extract exportable data
+            # Have AI also extract exportable data. The player's own words
+            # are the typed record of what the player said and promised
+            # (#449); the summary retells them (#625).
+            player_words = [
+                words for words in (
+                    hm.player_input(message) for message in filtered_conversation
+                ) if words
+            ]
+            party_names = _party_member_names(party_tracker_data, module_name)
             export_prompt = f"""From this module summary, extract key data to export to the campaign:
             
             Summary: {summary_text}
             
+            The player's own words, turn by turn (what the player said and did; the summary retells them):
+            {json.dumps(player_words, indent=2)}
+            
+            The party's player characters (never a relationship): {json.dumps(party_names)}
+            
             Extract:
-            1. Relationships formed (NPCs met, befriended, made enemies)
+            1. Relationships: each NPC the summary or the player's words name, as an object with "contact", "status" and "details". "contact" is "dealt_with" when the party spoke with, fought, traded with or acted on that NPC, "seen" when the party only saw them, and "heard_of" when the party was only told about them or sent to find them. status and details never claim a meeting, conversation or bond the summary does not show. A promise or agreement the player made to an NPC is recorded in that NPC's own status or details as the player's words state it; leaving or not yet acting on a request is not a refusal unless the player's words refuse it
             2. Artifacts or important items acquired
             3. Locations that could become hubs (owned property, bases)
             4. World state changes (political shifts, curses lifted, etc)
@@ -3986,6 +4096,15 @@ Focus on story outcomes, character development, and decisions that will matter i
                 exported_data = json.loads(export_response.choices[0].message.content)
                 if not _is_valid_campaign_export_data(exported_data):
                     raise ValueError("T039 returned invalid campaign export data")
+                exported_data["relationships"], not_dealt_with = (
+                    _relationships_dealt_with(exported_data["relationships"], party_names)
+                )
+                if not_dealt_with:
+                    debug(
+                        "T039 relationships left out (not dealt with): "
+                        + ", ".join(not_dealt_with),
+                        category="campaign_management",
+                    )
             except LiveProviderSuperseded:
                 raise
             except Exception as e:
@@ -4467,15 +4586,44 @@ Focus on story outcomes, character development, and decisions that will matter i
     ):
         """Update available modules based on completion"""
         target = self.campaign_data if campaign_data is None else campaign_data
-        # Remove completed module
-        if completed_module in target['availableModules']:
+        from core.generators.module_stitcher import ModuleStitcher
+
+        try:
+            registry = safe_json_load(
+                os.path.join(os.path.dirname(self.campaign_file), "world_registry.json")
+            )
+        except (OSError, ValueError):
+            registry = None
+
+        # The completed module is often just the one the party left: a
+        # crossing completes it to write the visit summary. A joined module
+        # stays offered so the party can go back (#747); only a module the
+        # registry does not join is removed. An unreadable registry removes
+        # nothing, as in startup reconciliation; the next refresh decides.
+        registry_readable = isinstance(registry, dict) and isinstance(registry.get("modules"), dict)
+        if (
+            registry_readable
+            and completed_module in target['availableModules']
+            and not ModuleStitcher.is_joined_registry_module(registry, completed_module)
+        ):
             target['availableModules'].remove(completed_module)
-        
-        # Add newly unlocked modules
+
+        # Add newly unlocked modules. The names are model-written (T039, or
+        # the party tracker in the local fallback), so only a joined module
+        # is added, by its registry id (#746, the #720 rule). Spaces read as
+        # underscores, as the module snapshot reads them. An unreadable
+        # registry adds nothing; the next refresh lists every joined module.
         unlocked = summary.get('unlockedModules', [])
-        for module in unlocked:
-            if module not in target['availableModules']:
-                target['availableModules'].append(module)
+        for module in unlocked if isinstance(unlocked, list) else []:
+            module_id = module.strip().replace(" ", "_") if isinstance(module, str) else ""
+            if not module_id or not ModuleStitcher.is_joined_registry_module(registry, module_id):
+                debug(
+                    f"STATE_CHANGE: unlocked module {module!r} is not a joined module; not added",
+                    category="module_management",
+                )
+                continue
+            if module_id not in target['availableModules']:
+                target['availableModules'].append(module_id)
     
     def _archive_conversation_history(
         self,
@@ -4532,16 +4680,14 @@ Focus on story outcomes, character development, and decisions that will matter i
                         )
                         continue
 
-                    if (
-                        msg.get("role") == "user"
-                        and "Module transition:" in msg.get("content", "")
-                    ):
+                    if hm.is_marker(msg, *hm.MODULE_KINDS):
                         original_content = msg["content"]
                         msg["content"] = msg["content"].replace(
                             "Module transition:",
                             "[Archived] Module transition:",
                             1,
                         )
+                        msg[hm.MARKER_FIELD] = hm.ARCHIVED_MODULE_TRANSITION
                         print(
                             "DEBUG: [Module Archive] Neutralized transition "
                             f"marker: '{original_content}' -> "
@@ -4600,7 +4746,8 @@ Focus on story outcomes, character development, and decisions that will matter i
             plot_file = os.path.join(path_manager.module_dir, "module_plot.json")
             
             if os.path.exists(plot_file):
-                return safe_json_load(plot_file)
+                from utils import quest_record
+                return quest_record.module_plot(module_name)
             else:
                 debug(f"FILE_OP: No module_plot.json found for {module_name}", category="file_operations")
                 return None

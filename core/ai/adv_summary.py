@@ -14,6 +14,7 @@ See LICENSE file for full terms.
 """
 
 import copy
+from core.ai import history_markers as hm
 import json
 import os
 import sys
@@ -42,9 +43,10 @@ except:
 
 from jsonschema import validate, ValidationError
 from utils.module_path_manager import ModulePathManager
-from utils.encoding_utils import sanitize_text, safe_json_load, safe_json_dump
+from utils.encoding_utils import sanitize_dict, sanitize_text, safe_json_load, safe_json_dump
+from core.managers.current_location import OK, UNREADABLE, read_current_location
 from utils.file_operations import FileLockError, atomic_writer
-from utils.module_refresh_lock import module_refresh_lock
+from utils.transient_filesystem import ReadOnlySaveStop, raise_if_save_stopped
 from core.managers.status_manager import status_generating_summary
 from utils.enhanced_logger import debug, info, warning, error, set_script_name
 
@@ -61,6 +63,18 @@ class DepartureSummaryError(RuntimeError):
     """An optional departure summary could not be staged or committed safely."""
 
 
+class LocationUpdateExhausted(DepartureSummaryError):
+    """T015 used every attempt without a valid location update."""
+
+
+def _is_supersession(exc):
+    """A Load, Reset or Quit took over this call; it is not a T015 failure."""
+    from core.combat.invocation import InvocationSupersededError
+    from utils.capture.live_provider_call import LiveProviderSuperseded
+
+    return isinstance(exc, (LiveProviderSuperseded, InvocationSupersededError))
+
+
 _DEPARTURE_TRANSACTION_LOCKS = {}
 _DEPARTURE_TRANSACTION_LOCKS_GUARD = threading.Lock()
 
@@ -72,6 +86,27 @@ def _departure_transaction_thread_lock(pending_path):
             canonical_path,
             threading.RLock(),
         )
+
+
+@contextmanager
+def _wait_for_module_refresh():
+    """Hold module refresh, waiting while it is busy instead of refusing.
+
+    Busy means wait, never refuse (#193 B2-ii, issue #637). Short attempts
+    with an interruptible beat between them, like the move's own travel-map
+    wait: each beat checks the read-only save stop and the turn's authority,
+    so Load, Reset or Quit still end the wait. The loop itself is shared with
+    the module build's publish step (issue #708).
+    """
+    from utils.module_refresh_lock import wait_for_module_refresh
+
+    with wait_for_module_refresh(
+        lambda seconds: (
+            "Waiting for module work to finish before recording your "
+            "journey (%d seconds)." % seconds
+        )
+    ):
+        yield
 
 
 @contextmanager
@@ -90,8 +125,8 @@ def _departure_transaction_lock(pending_path):
                 if lock_file.tell() == 0:
                     lock_file.write(b"\0")
                     lock_file.flush()
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                from utils.path_transaction_lock import wait_for_windows_lock
+                wait_for_windows_lock(lock_file)  # no ten-try cap (#944)
             else:
                 import fcntl
 
@@ -229,6 +264,23 @@ def compare_and_update(original, updates):
                 changes[key] = value
     return changes
 
+# The module author's standing directions for a place (#835). A departure
+# summary records what happened in adventureSummary and the encounter log;
+# it never rewrites these, so a past status is never served later as an
+# instruction.
+AUTHOR_OWNED_LOCATION_FIELDS = ("locationId", "name", "dmInstructions", "dcChecks", "lootItems")
+
+
+def preserve_author_location_fields(updated_location, location_before):
+    """Restore author-owned fields from the location as it was before T015."""
+    for field in AUTHOR_OWNED_LOCATION_FIELDS:
+        if field in location_before:
+            updated_location[field] = copy.deepcopy(location_before[field])
+        else:
+            updated_location.pop(field, None)
+    return updated_location
+
+
 def update_location_json(adventure_summary, location_info, current_area_id_from_main):
     debug_print(f"Updating location JSON for {location_info['name']} with all changes")
 
@@ -308,6 +360,7 @@ def update_location_json(adventure_summary, location_info, current_area_id_from_
         - Update 'adventureSummary' with a brief summary of what occurred at this location (2-3 sentences).
         - Modify 'description' if the location has changed significantly.
         - Preserve 'npcs' and 'monsters' exactly. Dedicated presence workflows reconcile those fields; this chronicle-derived update does not own creature placement.
+        - Preserve 'dmInstructions' and 'dcChecks' exactly. They are the module author's standing directions; what happened belongs in 'adventureSummary' and the new encounter entry, never in them.
         - Update 'resourcesAvailable', 'plotHooks', and other narrative location fields only when the accepted summary establishes a real change.
         - Create a new 'encounter' entry for this update. The encounterId should be the location's locationId (e.g., 'R01', 'R02') appended with '-E' and then the next sequential number (e.g., if locationId is 'R01' and there are 2 existing encounters, the new encounterId should be 'R01-E3'). Do NOT include the area ID prefix.
         - Adjust 'dangerLevel' if applicable.
@@ -396,7 +449,7 @@ def update_location_json(adventure_summary, location_info, current_area_id_from_
                 location_updater_prompt.append({"role": "user", "content": "The JSON schema you provided is invalid. Please try again and ensure the output is a valid JSON format."})
             else:
                 debug_print("Max retries reached. Unable to generate valid JSON.")
-                raise DepartureSummaryError(
+                raise LocationUpdateExhausted(
                     "T015 exhausted retries after malformed JSON"
                 )
         except ValidationError as e_val: # Renamed to avoid conflict
@@ -406,16 +459,20 @@ def update_location_json(adventure_summary, location_info, current_area_id_from_
                 location_updater_prompt.append({"role": "user", "content": f"The JSON schema you provided does not match the required structure. Error: {e_val}. Please try again."})
             else:
                 debug_print("Max retries reached. Unable to generate valid JSON matching schema.")
-                raise DepartureSummaryError(
+                raise LocationUpdateExhausted(
                     "T015 exhausted retries after schema validation failures"
                 )
+        except ReadOnlySaveStop:
+            raise
         except Exception as e_gen: # Renamed to avoid conflict
+            if _is_supersession(e_gen):
+                raise
             debug_print(f"Unexpected error in update_location_json: {str(e_gen)}")
             if attempt < max_retries - 1:
                 debug_print(f"Retrying... Attempt {attempt + 2}/{max_retries}")
             else:
                 debug_print("Max retries reached. Unable to update location JSON.")
-                raise DepartureSummaryError(
+                raise LocationUpdateExhausted(
                     f"T015 exhausted retries: {e_gen}"
                 ) from e_gen
     return None # Should only be reached if loop finishes without success (e.g. after retries)
@@ -428,7 +485,7 @@ def trim_conversation(summary_dump):
     # Find the last 'Location transition:' message if any
     last_transition_index = -1
     for i, message in enumerate(relevant_messages):
-        if message.get('role') == 'user' and 'Location transition:' in message.get('content', ''):
+        if hm.is_marker(message, hm.LOCATION_TRANSITION):
             last_transition_index = i
     
     # Start summarizing from after the last transition, or from the beginning of relevant messages
@@ -463,10 +520,13 @@ def convert_to_dialogue(trimmed_data):
         if role == 'assistant':
             dialogue += f"Dungeon Master: {content}\n\n"
         elif role == 'user':
-            if 'Location transition:' in content: # This is a system note, not player dialogue for summary
+            if hm.is_marker(message, hm.LOCATION_TRANSITION): # This is a system note, not player dialogue for summary
                 dialogue += f"[{content}]\n\n" # Keep as a note for context if needed by summarizer
-            else: # Actual player input
-                dialogue += f"Player: {content}\n\n"
+            elif hm.player_input(message) is not None:
+                # #449 (D-449-3 A): only the player's own words are the player's.
+                dialogue += f"Player: {hm.player_input(message)}\n\n"
+            else:
+                dialogue += f"[Game note: {content}]\n\n"
     return [
         trimmed_data[0],
         {"role": "user", "content": dialogue.strip()}
@@ -488,7 +548,18 @@ def generate_adventure_summary(
             "actions the accepted turn actually proposed. Its absence is "
             "not permission to turn a player's requested outcome into "
             "history. Reconcile it with the Dungeon Master's resolved "
-            "narration; do not quote or mention this projection."
+            "narration; do not quote or mention this projection. Items "
+            "whose workflow_status is pending are proposals of the turn, not "
+            "results. An updateCharacterInfo whose workflow_status is "
+            "staged_on_arrival is not a proposal: the game engine has already "
+            "staged that change and applies it when the party arrives. It is "
+            "the outcome of something done at this location (for example an "
+            "item a search found and the character took), so record it as "
+            "having happened here. A pending plotImpact is the Dungeon Master's proposed "
+            "story note: it is not evidence that anything in it happened. A "
+            "committed transitionLocation establishes only that the party "
+            "left this location for that destination; what happens on the "
+            "way or after arrival belongs to later entries."
         ),
     }
     messages = [
@@ -515,11 +586,21 @@ Do NOT:
 - Treat a player's request, plan, prediction, or command as an event that
   occurred. The Dungeon Master's resolved response establishes the semantic
   outcome.
+- Record what a final player message asked to do or find when the Dungeon
+  Master has not answered it in this conversation. That message began the
+  departure, so only the departure and where the party set out for are
+  established.
 - Claim a state-changing action occurred unless the resolved Dungeon Master
   response supports it and the corresponding structured action is present in
-  the supplied action projection. A proposed structured action may still be
-  awaiting its code-owned commit, so describe the resolved intent without
-  inventing its mechanical result.
+  the supplied action projection. A pending action, including any plotImpact
+  text, is a proposal and not an outcome: never state its contents as
+  something that happened. Never state the opposite either (for example
+  that a search found nothing or that an item was left behind): leave a
+  pending action's contents out of the summary. The place the party set out
+  for may be named as their destination.
+- Record what the party did not see, learn or establish ("could not
+  determine", "was not established", "remained unknown"). Write only what
+  happened and what was learned.
 - Speculate about the future or characters’ intentions.
 - Use first-person narration or dialogue-heavy exchanges.
 - Use bullet points, headings, or formatting.
@@ -539,14 +620,20 @@ Your writing should feel immersive, literary, and grounded -- like a historical 
         except OSError as e:
             debug_print(f"Error removing {dump_file_path}: {e}")
 
+    # A read-only save stop is an IOError too; it ends the session, so it
+    # passes these diagnostic dumps' catches.
     try:
         safe_json_dump(messages, dump_file_path)
+    except ReadOnlySaveStop:
+        raise
     except IOError as e:
         debug_print(f"Error writing to {dump_file_path}: {e}")
 
     trimmed_data = trim_conversation(messages)
     try:
         safe_json_dump(trimmed_data, 'trimmed_summary_dump.json')
+    except ReadOnlySaveStop:
+        raise
     except IOError as e:
         debug_print(f"Error writing to trimmed_summary_dump.json: {e}")
 
@@ -554,6 +641,8 @@ Your writing should feel immersive, literary, and grounded -- like a historical 
     dialogue_data.insert(1, structured_projection_message)
     try:
         safe_json_dump(dialogue_data, 'dialogue_summary.json')
+    except ReadOnlySaveStop:
+        raise
     except IOError as e:
         debug_print(f"Error writing to dialogue_summary.json: {e}")
 
@@ -588,26 +677,51 @@ Your writing should feel immersive, literary, and grounded -- like a historical 
         # Sanitize AI response to prevent encoding issues
         adventure_summary = sanitize_text(adventure_summary)
         return adventure_summary
+    except ReadOnlySaveStop:
+        raise
     except Exception as e:
+        if _is_supersession(e):
+            raise
         debug_print(f"ERROR: Failed to generate adventure summary. Error: {str(e)}")
         return None
 
-def build_journal_update(adventure_summary, party_tracker_data, location_name):
-    """Stage a validated journal update without writing runtime state."""
+
+def _departure_fact(leaving_location_name, destination_location_name):
+    """The departure as a plain fact from the checkpoint's own names (#699)."""
+    origin = sanitize_text(str(leaving_location_name or "")).strip()
+    destination = sanitize_text(str(destination_location_name or "")).strip()
+    if not origin:
+        return None
+    if destination:
+        return "The party left %s for %s." % (origin, destination)
+    return "The party left %s." % origin
+
+
+def journal_schema_failure(journal_data):
+    """The journal schema's failure message for journal_data, or None.
+
+    The one check both the staged departure update and the chronicle's
+    read use (#633), so the two cannot drift.
+    """
     journal_schema = load_json_file("schemas/journal_schema.json")
     if not isinstance(journal_schema, dict):
         raise DepartureSummaryError("journal schema is unavailable or invalid")
+    try:
+        validate(instance=journal_data, schema=journal_schema)
+    except ValidationError as exc:
+        return exc.message
+    return None
 
+
+def build_journal_update(adventure_summary, party_tracker_data, location_name):
+    """Stage a validated journal update without writing runtime state."""
     try:
         existing_journal = safe_json_load("journal.json")
     except Exception as exc:
         raise DepartureSummaryError(f"could not load journal.json: {exc}") from exc
 
     if existing_journal is None:
-        journal_data = {
-            "module": party_tracker_data.get("module", "Keep_of_Doom"),
-            "entries": [],
-        }
+        journal_data = {"entries": []}
     elif (
         not isinstance(existing_journal, dict)
         or not isinstance(existing_journal.get("entries"), list)
@@ -632,24 +746,11 @@ def build_journal_update(adventure_summary, party_tracker_data, location_name):
         }
     )
 
-    try:
-        validate(instance=journal_data, schema=journal_schema)
-    except ValidationError as exc:
+    failure = journal_schema_failure(journal_data)
+    if failure is not None:
         raise DepartureSummaryError(
-            f"staged journal update failed schema validation: {exc.message}"
-        ) from exc
-    return journal_data
-
-
-def update_journal(adventure_summary, party_tracker_data, location_name):
-    """Compatibility wrapper for callers that only need a journal write."""
-    journal_data = build_journal_update(
-        adventure_summary,
-        party_tracker_data,
-        location_name,
-    )
-    safe_json_dump(journal_data, "journal.json")
-    debug_print("Journal updated successfully")
+            f"staged journal update failed schema validation: {failure}"
+        )
     return journal_data
 
 
@@ -672,6 +773,7 @@ def _fsync_parent_directory(path):
 
 
 def _durable_remove(path):
+    raise_if_save_stopped()
     try:
         os.remove(path)
     except FileNotFoundError:
@@ -768,10 +870,76 @@ def _snapshot_matches(existed, value, expected_existed, expected_value):
     )
 
 
-def _recover_pending_summary_targets(pending, pending_path, area_path, journal_path):
+def _load_journal_under_marker(journal_path):
+    """(existed, value, unreadable) for the journal a marker recovers (#636).
+
+    Unreadable means it does not parse, or parses but fails its schema
+    (D-636-12); with no schema to judge by it reads as before.
+    """
+    if not os.path.exists(journal_path):
+        return False, None, False
+    try:
+        value = safe_json_load(journal_path)
+    except ValueError:
+        return True, None, True
+    except Exception as exc:
+        raise DepartureSummaryError(
+            f"could not read departure transaction state {journal_path}: {exc}"
+        ) from exc
+    try:
+        failure = journal_schema_failure(value)
+    except DepartureSummaryError:
+        failure = None
+    return True, value, failure is not None
+
+
+def _set_lost_journal_aside(
+    pending, pending_path, journal_path, journal_existed, set_journal_aside
+):
+    """Record a lost journal in the marker, then set it aside (#636).
+
+    The marker holds the whole chronicle, so its own snapshot replaces the
+    journal (D-636-10). The flag is written first: a crash after the rename
+    resumes here with the journal absent.
+    """
+    if pending.get("journal_lost") is not True:
+        pending["journal_lost"] = True
+        try:
+            safe_json_dump(pending, pending_path)
+        except ReadOnlySaveStop:
+            raise
+        except Exception as exc:
+            raise DepartureSummaryError(
+                "could not record the lost journal; marker retained at "
+                f"{pending_path}: {exc}"
+            ) from exc
+    if journal_existed:
+        try:
+            set_journal_aside()
+        except (OSError, ValueError) as exc:
+            raise DepartureSummaryError(
+                "could not set the unreadable journal aside; marker retained "
+                f"at {pending_path}: {exc}"
+            ) from exc
+        if os.path.exists(journal_path):
+            raise DepartureSummaryError(
+                "the unreadable journal was not set aside; marker retained at "
+                f"{pending_path}"
+            )
+
+
+def _recover_pending_summary_targets(
+    pending, pending_path, area_path, journal_path, set_journal_aside=None
+):
     """Classify and repair target state while both target locks are held."""
     area_existed, current_area = _load_json_snapshot(area_path)
-    journal_existed, current_journal = _load_json_snapshot(journal_path)
+    if set_journal_aside is None:
+        journal_existed, current_journal = _load_json_snapshot(journal_path)
+        journal_unreadable = False
+    else:
+        journal_existed, current_journal, journal_unreadable = (
+            _load_journal_under_marker(journal_path)
+        )
 
     area_matches_before = _snapshot_matches(
         area_existed,
@@ -797,18 +965,30 @@ def _recover_pending_summary_targets(pending, pending_path, area_path, journal_p
         True,
         pending["journal_after"],
     )
+    journal_lost = (
+        journal_unreadable
+        and not (journal_matches_before or journal_matches_after)
+    ) or (
+        set_journal_aside is not None
+        and pending.get("journal_lost") is True
+        and not journal_existed
+    )
 
-    if (
+    if journal_lost and (area_matches_before or area_matches_after):
+        _set_lost_journal_aside(
+            pending, pending_path, journal_path, journal_existed, set_journal_aside
+        )
+    elif (
         pending["status"] == "staged"
         and area_matches_after
         and journal_matches_after
     ):
         _durable_remove(pending_path)
         return {"status": "already_committed"}
-    if area_matches_before and journal_matches_before:
+    elif area_matches_before and journal_matches_before:
         _durable_remove(pending_path)
         return {"status": "already_rolled_back"}
-    if not (
+    elif journal_lost or not (
         (area_matches_before or area_matches_after)
         and (journal_matches_before or journal_matches_after)
     ):
@@ -852,6 +1032,8 @@ def _recover_pending_summary_targets(pending, pending_path, area_path, journal_p
                 raise DepartureSummaryError(
                     f"recovery verification failed for {path}"
                 )
+    except ReadOnlySaveStop:
+        raise
     except Exception as exc:
         if isinstance(exc, DepartureSummaryError):
             detail = str(exc)
@@ -866,7 +1048,7 @@ def _recover_pending_summary_targets(pending, pending_path, area_path, journal_p
     return {"status": recovered_status}
 
 
-def _resolve_prior_pending_summary_unlocked(pending_path):
+def _resolve_prior_pending_summary_unlocked(pending_path, set_journal_aside=None):
     if not os.path.exists(pending_path):
         return {"status": "none"}
     try:
@@ -879,26 +1061,33 @@ def _resolve_prior_pending_summary_unlocked(pending_path):
 
     area_path = pending["area_path"]
     journal_path = pending.get("journal_path", "journal.json")
+    if os.path.abspath(journal_path) != os.path.abspath("journal.json"):
+        set_journal_aside = None  # the set-aside renames journal.json only
     with _departure_target_locks(area_path, journal_path, pending_path):
         return _recover_pending_summary_targets(
             pending,
             pending_path,
             area_path,
             journal_path,
+            set_journal_aside,
         )
 
 
-def _resolve_prior_pending_summary(pending_path=PENDING_DEPARTURE_SUMMARY_FILE):
-    """Resolve a prior transaction under the same lock used by commits."""
-    # Recovery may replace an area document, so module refresh must remain the
-    # outermost module-tree fence. The marker/target locks are lower-ranked.
-    with module_refresh_lock() as refresh_acquired:
-        if not refresh_acquired:
-            raise DepartureSummaryError(
-                "module refresh is busy; departure recovery made no changes"
-            )
+def resolve_prior_departure_summary(
+    set_journal_aside, pending_path=PENDING_DEPARTURE_SUMMARY_FILE
+):
+    """Resolve an interrupted commit's marker before its targets are read.
+
+    The drain calls this first (#636, D-636-11): a staged marker is finished
+    forward and a rollback_required one rolled back, from the marker's own
+    snapshots. `set_journal_aside` sets an unreadable journal aside, so the
+    marker's snapshot can replace it (D-636-10).
+    """
+    with _wait_for_module_refresh():
         with _departure_transaction_lock(pending_path):
-            return _resolve_prior_pending_summary_unlocked(pending_path)
+            return _resolve_prior_pending_summary_unlocked(
+                pending_path, set_journal_aside
+            )
 
 
 def _journal_before_from_appended_update(journal_after):
@@ -959,6 +1148,8 @@ def _commit_departure_summary_targets_locked(
     }
     try:
         safe_json_dump(pending_record, pending_path)
+    except ReadOnlySaveStop:
+        raise
     except Exception as exc:
         raise DepartureSummaryError(
             f"could not create departure summary recovery marker: {exc}"
@@ -983,6 +1174,10 @@ def _commit_departure_summary_targets_locked(
             raise DepartureSummaryError(
                 "departure summary commit verification failed"
             )
+    except ReadOnlySaveStop:
+        # No rollback or marker write under a read-only save stop: the staged
+        # marker stays, and the next departure's recovery finishes it.
+        raise
     except Exception as commit_exc:
         pending_record["status"] = "rollback_required"
         pending_record["commit_error"] = str(commit_exc)
@@ -1051,11 +1246,7 @@ def commit_departure_summary(
     # Lock order is module refresh, marker, then canonical targets. Ordinary
     # AtomicFileWriter callers acquire only target locks, so they cannot form
     # a target -> marker cycle with this transaction.
-    with module_refresh_lock() as refresh_acquired:
-        if not refresh_acquired:
-            raise DepartureSummaryError(
-                "module refresh is busy; departure summary made no changes"
-            )
+    with _wait_for_module_refresh():
         with _departure_transaction_lock(pending_path):
             _resolve_prior_pending_summary_unlocked(pending_path)
             with _departure_target_locks(area_path, journal_path, pending_path):
@@ -1070,6 +1261,76 @@ def commit_departure_summary(
                 )
 
 
+def commit_departure_journal(journal_after, pending_path=PENDING_DEPARTURE_SUMMARY_FILE):
+    """Commit a departure's journal entry alone, its area left as it is (#1072).
+
+    One file, replaced atomically, so no recovery marker: a retry finds the
+    entry at its staged index. The locks are the pair commit's, in its order.
+    """
+    journal_path = os.path.abspath(os.path.normpath("journal.json"))
+    expected_journal_before = _journal_before_from_appended_update(journal_after)
+
+    with _wait_for_module_refresh():
+        with _departure_transaction_lock(pending_path):
+            _resolve_prior_pending_summary_unlocked(pending_path)
+            try:
+                atomic_writer.acquire_lock(journal_path)
+            except Exception as exc:
+                raise DepartureSummaryError(
+                    "could not acquire departure transaction target lock for "
+                    f"{journal_path}: {exc}"
+                ) from exc
+            try:
+                journal_existed, journal_before = _load_json_snapshot(journal_path)
+                if journal_existed:
+                    journal_matches_base = journal_before == expected_journal_before
+                else:
+                    journal_matches_base = not expected_journal_before.get("entries")
+                if not journal_matches_base:
+                    raise DepartureSummaryError(
+                        "departure journal changed concurrently; staged summary "
+                        "was not committed"
+                    )
+                safe_json_dump(journal_after, journal_path)
+                if not _snapshot_matches(
+                    *_load_json_snapshot(journal_path), True, journal_after
+                ):
+                    raise DepartureSummaryError(
+                        "departure journal commit verification failed"
+                    )
+            finally:
+                atomic_writer.release_lock(journal_path)
+    return {"success": True, "status": "committed", "area_path": None}
+
+
+def read_departure_area(party_tracker, area_path, area_id, location_id):
+    """(status, area, detail) for the area a departure leaves, read through
+    #448's one reader (#1072).
+
+    The reader keys on a tracker's current ids, and a resumed journey's tracker
+    is already at the destination, so it reads one projected to the departure's
+    own area and location. OK gives the area sanitized as safe_json_load reads
+    a healthy file; UNREADABLE gives no area and the reader's detail. Any other
+    answer, or a reader file other than ``area_path``, gives (status, None, detail)
+    and the caller reads as before.
+    """
+    projected = {
+        "module": (party_tracker or {}).get("module", ""),
+        "worldConditions": {
+            "currentAreaId": area_id,
+            "currentLocationId": location_id,
+        },
+    }
+    read = read_current_location(projected)
+    if not read.area_file or os.path.abspath(read.area_file) != os.path.abspath(
+        area_path
+    ):
+        return None, None, "the reader names another area file"
+    if read.status == OK:
+        return OK, sanitize_dict(read.area), ""
+    return read.status, None, read.detail
+
+
 def prepare_departure_summary(
     conversation_history,
     party_tracker,
@@ -1077,6 +1338,7 @@ def prepare_departure_summary(
     current_area_id,
     leaving_location_id,
     structured_actions=None,
+    destination_location_name=None,
 ):
     """Run T016/T015 and return exact commit material without writing targets."""
     if not isinstance(conversation_history, list):
@@ -1090,12 +1352,53 @@ def prepare_departure_summary(
         leaving_location_name,
         structured_actions=structured_actions,
     )
-    if not isinstance(adventure_summary, str) or not adventure_summary.strip():
-        raise DepartureSummaryError("T016 did not produce an adventure summary")
+    summary_fallback = (
+        not isinstance(adventure_summary, str) or not adventure_summary.strip()
+    )
+    if summary_fallback:
+        # Fail forward (#699): the party has moved. The chronicle records the
+        # departure itself, and T015 has nothing to rewrite the location from.
+        adventure_summary = _departure_fact(
+            leaving_location_name, destination_location_name
+        )
+        if adventure_summary is None:
+            raise DepartureSummaryError("T016 did not produce an adventure summary")
+        warning(
+            "FALLBACK: departure summary unavailable for %s; the journal "
+            "records the departure only" % leaving_location_id,
+            category="location_transitions",
+        )
 
     current_module = party_tracker.get("module", "").replace(" ", "_")
     area_path = ModulePathManager(current_module or None).get_area_path(current_area_id)
-    area_before = load_json_file(area_path)
+    area_status, area_before, area_detail = read_departure_area(
+        party_tracker, area_path, current_area_id, leaving_location_id
+    )
+    if area_status == UNREADABLE:
+        # Fail forward (#1072, D-1072-1): the party has moved. The damaged area
+        # is left as it is, T015 is not called, the journal records the departure.
+        warning(
+            "FALLBACK: departure area left as it is for %s: %s; the journal "
+            "records the departure" % (leaving_location_id, area_detail),
+            category="location_transitions",
+        )
+        journal_after = build_journal_update(
+            adventure_summary,
+            party_tracker,
+            leaving_location_name,
+        )
+        return {
+            "summary": adventure_summary,
+            "area_path": area_path,
+            "area_before": None,
+            "area_after": None,
+            "area_unreadable": area_detail,
+            "journal_after": journal_after,
+            "journal_entry_index": len(journal_after.get("entries", [])) - 1,
+            "journal_entry_after": copy.deepcopy(journal_after["entries"][-1]),
+        }
+    if area_status != OK:
+        area_before = load_json_file(area_path)
     if not isinstance(area_before, dict) or not isinstance(
         area_before.get("locations"), list
     ):
@@ -1112,14 +1415,30 @@ def prepare_departure_summary(
     if leaving_index is None:
         raise DepartureSummaryError("canonical departure location is absent")
     location_before = copy.deepcopy(area_before["locations"][leaving_index])
-    updated_location = update_location_json(
-        adventure_summary,
-        copy.deepcopy(location_before),
-        current_area_id,
-    )
+    if summary_fallback:
+        # T015 is not called: keep the location as it was, marked visited.
+        updated_location = copy.deepcopy(location_before)
+        updated_location["explorationState"] = {"status": "visited"}
+    else:
+        try:
+            updated_location = update_location_json(
+                adventure_summary,
+                copy.deepcopy(location_before),
+                current_area_id,
+            )
+        except LocationUpdateExhausted as exc:
+            # Fail forward (#653): the party has moved and T016 produced the
+            # chronicle. Keep the location as it was, marked visited.
+            warning(
+                "FALLBACK: location update skipped for %s: %s"
+                % (leaving_location_id, exc),
+                category="location_transitions",
+            )
+            updated_location = copy.deepcopy(location_before)
+            updated_location["explorationState"] = {"status": "visited"}
     if not isinstance(updated_location, dict):
         raise DepartureSummaryError("T015 did not produce a location update")
-    # T091 and T014 are the dedicated presence authorities. T015 owns the
+    # The engine's occupant record is the presence authority. T015 owns the
     # chronicle-derived location description, not creature placement. Preserve
     # the accepted lists so a summary proposal cannot silently add, remove, or
     # relocate an entity outside its responsible workflow lane.
@@ -1127,6 +1446,7 @@ def prepare_departure_summary(
         updated_location[presence_field] = copy.deepcopy(
             location_before.get(presence_field, [])
         )
+    preserve_author_location_fields(updated_location, location_before)
     area_after = copy.deepcopy(area_before)
     area_after["locations"][leaving_index] = updated_location
     journal_after = build_journal_update(
@@ -1143,96 +1463,3 @@ def prepare_departure_summary(
         "journal_entry_index": len(journal_after.get("entries", [])) - 1,
         "journal_entry_after": copy.deepcopy(journal_after["entries"][-1]),
     }
-
-
-def run_departure_summary(
-    conversation_history_file,
-    current_location_file,
-    leaving_location_name,
-    current_area_id,
-    party_tracker_file="party_tracker.json",
-):
-    """Run T016 then T015 and commit their derived state as one transaction."""
-    del current_location_file  # Kept in the CLI contract for caller compatibility.
-    # Repair any prior interrupted commit before reading state or invoking a
-    # provider for the next departure.
-    _resolve_prior_pending_summary()
-    conversation_history = load_json_file(conversation_history_file)
-    party_tracker = load_json_file(party_tracker_file)
-    if not isinstance(conversation_history, list):
-        raise DepartureSummaryError("conversation history is unavailable or invalid")
-    if not isinstance(party_tracker, dict):
-        raise DepartureSummaryError("party tracker is unavailable or invalid")
-
-    adventure_summary = generate_adventure_summary(
-        conversation_history,
-        party_tracker,
-        leaving_location_name,
-    )
-    if not isinstance(adventure_summary, str) or not adventure_summary.strip():
-        raise DepartureSummaryError("T016 did not produce an adventure summary")
-    debug_print("Adventure Summary generated")
-
-    current_module = party_tracker.get("module", "").replace(" ", "_")
-    path_manager = ModulePathManager(current_module or None)
-    area_path = path_manager.get_area_path(current_area_id)
-    area_before = load_json_file(area_path)
-    if not isinstance(area_before, dict) or not isinstance(
-        area_before.get("locations"), list
-    ):
-        raise DepartureSummaryError(f"area data is unavailable or invalid: {area_path}")
-
-    leaving_index = next(
-        (
-            index
-            for index, location in enumerate(area_before["locations"])
-            if isinstance(location, dict)
-            and location.get("name") == leaving_location_name
-        ),
-        None,
-    )
-    if leaving_index is None:
-        raise DepartureSummaryError(
-            f"could not find leaving location '{leaving_location_name}' in {area_path}"
-        )
-
-    updated_location = update_location_json(
-        adventure_summary,
-        copy.deepcopy(area_before["locations"][leaving_index]),
-        current_area_id,
-    )
-    if not isinstance(updated_location, dict):
-        raise DepartureSummaryError("T015 did not produce a location update")
-
-    area_after = copy.deepcopy(area_before)
-    area_after["locations"][leaving_index] = updated_location
-    journal_after = build_journal_update(
-        adventure_summary,
-        party_tracker,
-        leaving_location_name,
-    )
-    return commit_departure_summary(
-        area_path,
-        area_before,
-        area_after,
-        journal_after,
-    )
-
-
-if __name__ == "__main__":
-    if len(sys.argv) not in {5, 6}:
-        debug_print("Usage: python adv_summary.py <conversation_history_file> <current_location_file> <leaving_location_name> <current_area_id> [party_tracker_snapshot_file]")
-        sys.exit(1)
-
-    try:
-        result = run_departure_summary(*sys.argv[1:6])
-        debug_print(
-            "Departure summary transaction committed: "
-            + json.dumps(result, sort_keys=True)
-        )
-    except DepartureSummaryError as exc:
-        debug_print(f"DEPARTURE SUMMARY UNAVAILABLE: {exc}")
-        sys.exit(2)
-    except Exception as exc:
-        debug_print(f"DEPARTURE SUMMARY FAILED UNEXPECTEDLY: {exc}")
-        sys.exit(2)

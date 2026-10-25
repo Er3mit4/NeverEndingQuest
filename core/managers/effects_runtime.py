@@ -11,10 +11,12 @@ application, removal, notification delivery, and crash-safe replay.
 from copy import deepcopy
 import os
 
-from core.ai.effects_agent import classify_effect
+from core.ai.effects_agent import (EffectsAgentContractError, classification_from_object,
+                                    classify_effect)
 from core.effects.clock import scalar_from_calendar
 from core.effects.effective import effective_sheet
 from core.effects.lifecycle import apply_effect_ops, plan_expirations, plan_rest_clears
+from core.effects.model import effect_identity
 from core.effects.outbox import build_message, delivered_ids, notification_id
 from core.managers.effects_state import (
     campaign_effects_migrated,
@@ -31,12 +33,21 @@ from updates.update_character_info import (
     update_character_info,
 )
 from utils.encoding_utils import safe_json_load
+from utils.enhanced_logger import info, warning
 from utils.file_operations import safe_write_json
 from utils.path_transaction_lock import path_transaction_lock
 
 
 class EffectsRuntimeError(RuntimeError):
     """A declarative effect operation could not be completed safely."""
+
+
+class CharacterProposalDropped(EffectsRuntimeError):
+    """T079 gave no usable required proposal within its bounded tries (#855)."""
+
+    def __init__(self, owner):
+        super().__init__("required character proposal was not prepared")
+        self.owner = owner
 
 
 def _resolve_character(character_name):
@@ -75,14 +86,14 @@ def _remove_operation(result, sheet):
             or (not requested_id and requested_name and effect.get("name") == requested_name)
         )
     ]
-    if len(matches) != 1:
-        raise EffectsRuntimeError("effect removal did not identify exactly one active effect")
-    effect = matches[0]
-    return {
-        "op": "remove",
-        "effectId": effect.get("effectId"),
-        "name": effect.get("name"),
-    }
+    if not matches:
+        raise EffectsRuntimeError("effect removal did not identify an active effect")
+    # Several records of one name are the same effect (an earlier double
+    # classification); ending it ends them all.
+    return [
+        {"op": "remove", "effectId": effect.get("effectId"), "name": effect.get("name")}
+        for effect in matches
+    ]
 
 
 def update_character_with_effects(
@@ -90,13 +101,17 @@ def update_character_with_effects(
     changes,
     party_tracker_data=None,
     action_context=None,
+    affects=None,
+    casting_resource=None,
 ):
     """Classifier-first T078 -> T079 character update for a migrated campaign."""
     if not campaign_effects_migrated():
         # Explicit recovery fallback for campaigns whose automatic conversion
         # was blocked.  Normal converted campaigns never execute this path.
         success = update_character_info(
-            character_name, changes, action_context=action_context
+            character_name, changes, action_context=action_context,
+            affects=affects,
+            casting_resource=casting_resource,
         )
         if success:
             from updates.update_character_effects import update_character_effects
@@ -116,36 +131,94 @@ def update_character_with_effects(
             sheet = safe_json_load(path)
             if not isinstance(sheet, dict):
                 raise EffectsRuntimeError("character sheet became unavailable")
-            result = classify_effect(
-                resolved,
-                changes,
-                effective_sheet(sheet),
-                _world_scalar(party_tracker_data),
-            )
-            operation = None
-            if result["operation"] == "add":
-                operation = {"op": "add", "effect": result["effect"]}
-            elif result["operation"] == "remove":
-                operation = _remove_operation(result, sheet)
+            classifier = _lazy_classifier(resolved, changes, sheet, _world_scalar(party_tracker_data))
             success = _update_character_info_unlocked(
                 resolved,
                 changes,
                 character_role=role,
-                managed_effect_operation=operation,
+                managed_effect_operation=classifier,
                 action_context=action_context,
+                affects=affects,
+                casting_resource=casting_resource,
             )
-    if success:
-        text = str(changes).lower()
-        rest_kind = (
-            "long_rest"
-            if "long rest" in text
-            else "short_rest"
-            if "short rest" in text
-            else None
-        )
-        if rest_kind:
-            process_effect_lifecycle(rest_kind=rest_kind)
+    if success and classifier.cast:
+        from core.managers.concentration_runtime import record_cast
+
+        record_cast(*classifier.cast)
+    # Rest-bound effects end only through the typed rest action, which runs
+    # the effect lifecycle with its own kind; this update's wording never
+    # decides that a rest happened (#855).
     return success
+
+
+def _classifier_mode():
+    """D-COST-8 (#193): "merged" (T079's effectChange is the classification) or "separate" (T078)."""
+    import model_config
+    mode = model_config.EFFECTS_CLASSIFIER_MODE
+    return mode if mode in ("merged", "separate") else "merged"
+
+
+class _lazy_classifier:
+    """T078 on demand: the T079 loop calls this with each parsed delta.
+
+    The classifier runs only when the update model flagged an effect change
+    ("effectChange": true, alone for an effect-only change). A plain {} is
+    "no change" and is not classified (D-COST-6). One T078 result is kept
+    across T079 reissues. A pure number change never pays for the classifier.
+    """
+
+    def __init__(self, character_name, changes, sheet, now_scalar):
+        self._name = character_name
+        self._changes = changes
+        self._sheet = sheet
+        self._now = now_scalar
+        self.result = None
+        self.operation = None
+        self.skipped = False
+        self.cast = None  # CN: (caster, spell, group, target, expiration) when the effect is a concentration
+
+    def __call__(self, updates, effect_flag):
+        # D-COST-6 (#193): only a T079 answer that flags an effect change is classified; a {} answer
+        # ("no change") no longer costs a T078 call.
+        merged = _classifier_mode() == "merged"
+        fresh = False
+        if self.result is None and merged and effect_flag is not None:
+            # D-COST-8 (#193): T079's effectChange is the classification itself, checked against T078's
+            # contract and finalized the same way; no T078 call. A contract error raises for T079's loop.
+            if not isinstance(effect_flag, dict):
+                raise EffectsAgentContractError(
+                    "effectChange must be the effect object {operation, effect, remove}, not %r"
+                    % (effect_flag,))
+            self.result = classification_from_object(effect_flag, self._name, self._changes, self._now)
+            fresh = True
+        elif self.result is None and not merged and effect_flag:
+            self.result = classify_effect(
+                self._name, self._changes, effective_sheet(self._sheet), self._now
+            )
+            fresh = True
+        if fresh:
+            if self.result["operation"] == "add":
+                effect = self.result["effect"]
+                # CN: the classifier states the caster; the record joins the caster's
+                # group for this spell (another target of one cast) or starts one.
+                caster = str(effect.pop("caster", "") or "").strip() or self._name
+                if effect.get("concentration") is True:
+                    from core.managers.concentration_runtime import group_for
+
+                    group = group_for(caster, effect.get("name"))
+                    effect["concentrationId"] = group
+                    self.cast = (caster, effect.get("name"), group, self._name, effect.get("expiration"))
+                self.operation = [{"op": "add", "effect": effect}]
+            elif self.result["operation"] == "remove":
+                self.operation = _remove_operation(self.result, self._sheet)
+            self.skipped = False
+        elif self.result is None:
+            self.skipped = True
+            info(
+                f"T078 skipped for {self._name}: the update model reported no effect change",
+                category="effects_tracking",
+            )
+        return self.operation
 
 
 def _resolve_effect_reference(effects, *, effect_id=None, name=None):
@@ -166,6 +239,45 @@ def _resolve_effect_reference(effects, *, effect_id=None, name=None):
     return []
 
 
+def _condition_reference(sheet, *, effect_id=None, name=None):
+    """The stated condition a removeEffect reference names, or None (typed values compared, no prose).
+
+    A DM may end a grapple or a poisoning with removeEffect although a
+    condition is a sheet fact, not a temporary effect; the structured intent
+    is honoured by ending the condition the sheet actually states.
+    """
+    from core.nql import stats as nql_stats
+
+    listed = [c for c in sheet.get("condition_affected") or [] if isinstance(c, str)]
+    single = sheet.get("condition") if isinstance(sheet.get("condition"), str) else None
+    stated = {c.casefold() for c in listed} | ({single.casefold()} if single and single != "none" else set())
+    for reference in (effect_id, name):
+        if isinstance(reference, str) and reference.strip().casefold() in stated:
+            return reference.strip().casefold()
+    return None
+
+
+def _end_condition(sheet, condition):
+    """The sheet with one stated condition ended; the engine's view (status, speed) refreshed."""
+    from core.nql import stats as nql_stats
+
+    updated = deepcopy(sheet)
+    updated["condition_affected"] = [c for c in updated.get("condition_affected") or []
+                                     if not (isinstance(c, str) and c.casefold() == condition)]
+    if isinstance(updated.get("condition"), str) and updated["condition"].casefold() == condition:
+        updated["condition"] = updated["condition_affected"][0] if updated["condition_affected"] else "none"
+    if condition == "exhaustion":
+        updated[nql_stats.EXHAUSTION_FIELD] = 0  # ending exhaustion clears every level
+    problem = nql_stats.refresh(updated)
+    if problem:
+        warning(f"STATES: {sheet.get('name', '?')}: condition {condition!r} ended on the sheet; engine view not refreshed ({problem})",
+                category="character_updates")
+    else:
+        info(f"STATES: {sheet.get('name', '?')}: removeEffect named the condition {condition!r}; ended on the sheet",
+             category="character_updates")
+    return updated
+
+
 def remove_effect(character_name, *, effect_id=None, name=None, reason="removed"):
     """Deterministically remove one uniquely identified active effect."""
     if not campaign_effects_migrated():
@@ -176,14 +288,13 @@ def remove_effect(character_name, *, effect_id=None, name=None, reason="removed"
     matches = _resolve_effect_reference(
         sheet.get("temporaryEffects", []) or [], effect_id=effect_id, name=name
     )
-    if len(matches) != 1:
-        raise EffectsRuntimeError("removeEffect requires exactly one active match")
-    effect = matches[0]
-    operation = {
-        "op": "remove",
-        "effectId": effect.get("effectId"),
-        "name": effect.get("name"),
-    }
+    condition = None if matches else _condition_reference(sheet, effect_id=effect_id, name=name)
+    if not matches and condition is None:
+        raise EffectsRuntimeError("removeEffect found no active effect to end")
+    operations = [
+        {"op": "remove", "effectId": item.get("effectId"), "name": item.get("name")}
+        for item in matches
+    ]
     with _get_character_update_lock(resolved):
         with path_transaction_lock(path, suffix=".effects.lock", timeout_seconds=5.0) as locked:
             if locked is None:
@@ -191,9 +302,13 @@ def remove_effect(character_name, *, effect_id=None, name=None, reason="removed"
             current = safe_json_load(path)
             if not isinstance(current, dict):
                 raise EffectsRuntimeError("character sheet became unavailable")
-            updated = apply_effect_ops(current, [operation])
+            updated = _end_condition(current, condition) if condition else apply_effect_ops(current, operations)
             if not safe_write_json(path, updated):
                 raise EffectsRuntimeError("effect removal could not be persisted")
+    if condition:
+        return {"owner": resolved, "effectId": condition, "name": condition, "reason": reason}
+    effect = matches[0]
+    _end_concentration_group(matches, reason)
     return {
         "owner": resolved,
         "effectId": effect.get("effectId"),
@@ -212,59 +327,61 @@ def prepare_remove_effect(character_name, *, effect_id=None, name=None, reason="
     matches = _resolve_effect_reference(
         sheet.get("temporaryEffects", []) or [], effect_id=effect_id, name=name
     )
-    if len(matches) != 1:
-        raise EffectsRuntimeError("removeEffect requires exactly one active match")
-    effect = matches[0]
-    operation = {
-        "op": "remove",
-        "effectId": effect.get("effectId"),
-        "name": effect.get("name"),
-    }
+    condition = None if matches else _condition_reference(sheet, effect_id=effect_id, name=name)
+    if not matches and condition is None:
+        raise EffectsRuntimeError("removeEffect found no active effect to end")
+    operations = [
+        {"op": "remove", "effectId": item.get("effectId"), "name": item.get("name")}
+        for item in matches
+    ]
+    # The whole sheet is frozen: ending an effect also changes the numbers
+    # the engine holds for it (armor class, maximum and current hit points).
+    after = _end_condition(sheet, condition) if condition else apply_effect_ops(sheet, operations)
+    effect = {"effectId": condition, "name": condition} if condition else matches[0]
     return {
         "kind": "removeEffect",
         "owner": resolved,
         "role": role,
         "path": path,
-        "before": deepcopy(sheet.get("temporaryEffects", []) or []),
-        "after": deepcopy(
-            apply_effect_ops(sheet, [operation]).get("temporaryEffects", []) or []
-        ),
+        "before": deepcopy(sheet),
+        "after": after,
         "effectId": effect.get("effectId"),
         "name": effect.get("name"),
         "reason": reason,
+        "concentration_groups": sorted({m.get("concentrationId") for m in matches if m.get("concentrationId")}),
     }
 
 
-def prepare_character_update(character_name, changes, party_tracker_data=None):
+def _end_concentration_group(matches, reason):
+    """CN: ending one effect of a concentration spell ends the spell everywhere (the caster stopped)."""
+    from core.managers.concentration_runtime import end_group
+
+    for group in sorted({m.get("concentrationId") for m in matches if isinstance(m, dict) and m.get("concentrationId")}):
+        removed = [m.get("effectId") for m in matches if m.get("concentrationId") == group]
+        end_group(group, f"ended by the DM: {reason}", except_effect_id=removed[0] if len(removed) == 1 else None)
+
+
+def prepare_character_update(character_name, changes, party_tracker_data=None, affects=None, casting_resource=None):
     """Freeze required T078/T079 output and advisory sheet corrections."""
     resolved, role, _path, sheet = _resolve_character(character_name)
-    result = classify_effect(
-        resolved,
-        changes,
-        effective_sheet(sheet),
-        _world_scalar(party_tracker_data),
-        structural_reissue=True,
-    )
-    operation = None
-    if result["operation"] == "add":
-        operation = {"op": "add", "effect": result["effect"]}
-    elif result["operation"] == "remove":
-        operation = _remove_operation(result, sheet)
+    classifier = _lazy_classifier(resolved, changes, sheet, _world_scalar(party_tracker_data))
     receipt = _update_character_info_unlocked(
         resolved,
         changes,
         character_role=role,
-        managed_effect_operation=operation,
+        managed_effect_operation=classifier,
         prepare_only=True,
         structural_reissue=True,
+        affects=affects,
+        casting_resource=casting_resource,
     )
     if not isinstance(receipt, dict):
-        raise EffectsRuntimeError("required character proposal was not prepared")
+        raise CharacterProposalDropped(resolved)
     try:
         from core.validation.character_validator import AICharacterValidator
 
         validation = AICharacterValidator().validate_and_correct_character_smart_with_result(
-            deepcopy(receipt["after"]), max_attempts=1
+            deepcopy(receipt["after"]), before=deepcopy(receipt["before"]), max_attempts=1
         )
         receipt["after"] = validation.data
         receipt["advisory_validation"] = {
@@ -276,7 +393,8 @@ def prepare_character_update(character_name, changes, party_tracker_data=None):
             "status": "attempted_unavailable",
             "error": type(exc).__name__,
         }
-    receipt["effect_proposal"] = result
+    receipt["effect_proposal"] = classifier.result or {"operation": "none", "effect": {}, "remove": {}}
+    receipt["concentration_cast"] = list(classifier.cast) if classifier.cast else None
     return receipt
 
 
@@ -295,6 +413,10 @@ def apply_staged_character_update(receipt):
                 return "blocked_conflict"
             if not safe_write_json(receipt["path"], receipt["after"]):
                 raise EffectsRuntimeError("character update could not be persisted")
+    if receipt.get("concentration_cast"):
+        from core.managers.concentration_runtime import record_cast
+
+        record_cast(*receipt["concentration_cast"])
     return "committed"
 
 
@@ -309,15 +431,17 @@ def apply_staged_remove_effect(receipt):
             current = safe_json_load(receipt["path"])
             if not isinstance(current, dict):
                 raise EffectsRuntimeError("character sheet became unavailable")
-            current_effects = current.get("temporaryEffects", []) or []
-            if current_effects == receipt["after"]:
+            if current == receipt["after"]:
                 return "already_committed"
-            if current_effects != receipt["before"]:
+            if current != receipt["before"]:
                 return "blocked_conflict"
-            updated = deepcopy(current)
-            updated["temporaryEffects"] = deepcopy(receipt["after"])
-            if not safe_write_json(receipt["path"], updated):
+            if not safe_write_json(receipt["path"], deepcopy(receipt["after"])):
                 raise EffectsRuntimeError("effect removal could not be persisted")
+    if receipt.get("concentration_groups"):
+        from core.managers.concentration_runtime import end_group
+
+        for group in receipt["concentration_groups"]:
+            end_group(group, f"ended by the DM: {receipt.get('reason')}", except_effect_id=receipt.get("effectId"))
     return "committed"
 
 
@@ -363,8 +487,8 @@ def _queue_expiration_records(plans):
                         "identity": plan.get("identity"),
                         "name": plan.get("name"),
                     },
-                    "text": "%s: %s (%s)"
-                    % (plan.get("owner"), plan.get("name"), plan.get("reason")),
+                    "text": plan.get("text")
+                    or "%s: %s (%s)" % (plan.get("owner"), plan.get("name"), plan.get("reason")),
                 }
             )
             known.add(notice_id)
@@ -402,14 +526,70 @@ def _apply_outbox_records(paths):
                     candidate["status"] = "applied"
 
 
+def _engine_expirations(sheets, now_scalar):
+    """Remove plans for the owned timed effects the engine clock says are due.
+
+    One ``advance time`` request over the party decides what ended (the
+    engine's order and its ended_conditions record with the numbers each
+    effect was giving). The removal itself goes through the outbox like any
+    other expiry, so a crash between the decision and the write replays
+    safely; the note text carries the engine's before/after numbers.
+    """
+    from core.nql import effects as nql_effects
+
+    outcome = nql_effects.advance(sheets, now_scalar)
+    if not outcome.ok:
+        warning(
+            "[Effects Engine] time advance left to the next turn: %s" % outcome.reason,
+            category="effects_tracking",
+        )
+        return []
+    plans = []
+    for item in outcome.ended:
+        effect = item.effect
+        plans.append(
+            {
+                "owner": item.owner,
+                "op": "remove",
+                "effectId": effect.get("effectId"),
+                "identity": effect_identity(effect),
+                "name": effect.get("name"),
+                "reason": "expired",
+                "effect": deepcopy(effect),
+                "text": nql_effects.ended_text(item, outcome.sheets.get(item.owner) or {}),
+            }
+        )
+    return plans
+
+
+def _legacy_rest_clears(rest_kind):
+    """On a campaign whose effects conversion is refused or postponed, the typed
+    rest kind clears the legacy tracker's rest-bound modifiers for the party
+    (#855: never from rest words in update prose)."""
+    from updates.process_effect_expirations import process_rest_effects
+
+    party = safe_json_load("party_tracker.json") or {}
+    names = list(party.get("partyMembers", []) or [])
+    names.extend(
+        npc.get("name") for npc in party.get("partyNPCs", []) or [] if isinstance(npc, dict)
+    )
+    for name in names:
+        if isinstance(name, str) and name:
+            process_rest_effects(name, rest_kind)
+
+
 def process_effect_lifecycle(conversation_history=None, rest_kind=None):
     """Apply due expirations/rest clears and return one exactly-once DM note."""
     if not campaign_effects_migrated():
+        if rest_kind in ("short_rest", "long_rest"):
+            _legacy_rest_clears(rest_kind)
         return None
     history = conversation_history if isinstance(conversation_history, list) else []
     party = safe_json_load("party_tracker.json") or {}
     sheets, paths = _party_sheets(party)
-    plans = plan_expirations(sheets, _world_scalar(party))
+    now_scalar = _world_scalar(party)
+    plans = plan_expirations(sheets, now_scalar)
+    plans.extend(_engine_expirations(sheets, now_scalar))
     if rest_kind in ("short_rest", "long_rest"):
         for owner, sheet in sheets.items():
             plans.extend(plan_rest_clears(owner, sheet, rest_kind))
@@ -418,6 +598,12 @@ def process_effect_lifecycle(conversation_history=None, rest_kind=None):
             plan["path"] = paths.get(plan.get("owner"))
     _queue_expiration_records(plans)
     _apply_outbox_records(paths)
+    # CN: a caster who became incapacitated loses the spell; a record whose
+    # effects all ended (expiry, rest) is cleared. Both queue through the outbox.
+    from core.managers.concentration_runtime import sweep
+
+    if sweep():
+        _apply_outbox_records(paths)
     already_in_history = delivered_ids(history)
     state = load_effects_state()
     pending = [

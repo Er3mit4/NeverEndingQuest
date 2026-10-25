@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ServerEvents } from '../contract/events'
+import type { ServerEvents, WaitRecord } from '../contract/events'
 
 /** UI mode state machine (plan Task 4.5 seeds live here). */
 export type UiMode = 'disconnected' | 'starting' | 'play' | 'combat'
@@ -19,8 +19,13 @@ export interface SessionState {
   startupInputReady: boolean
   /** Status ticker text (status_update.message). */
   statusMessage: string
+  /** #1271: the typed in-flight model call, and performance.now() at receipt. */
+  wait: WaitRecord | null
+  waitReceivedAt: number
   /** #214: background startup-welcome liveness (presentational; never locks input). */
   welcomeMessage: string
+  /** #1422 F4: the welcome is a new game's opening scene (typing waits for it). */
+  welcomeOpeningScene: boolean
   /** Startup lifecycle (startup_status). */
   startupStatus: StartupStatus
   startupPhase: string
@@ -43,7 +48,7 @@ export interface SessionState {
   gameResumed: (isProcessing: boolean) => void
   setStatus: (status: ServerEvents['status_update']) => void
   setRestoreResult: (result: ServerEvents['restore_complete']) => void
-  setWelcome: (message: string) => void
+  setWelcome: (message: string, kind?: ServerEvents['welcome_progress']['kind']) => void
   setStartup: (status: 'in_progress' | 'ready' | 'failed', phase: string, startupAttemptId?: string) => void
   setRecovery: (recovery: ServerEvents['startup_recovery_response']) => void
   setVersion: (version: ServerEvents['version_status']) => void
@@ -57,7 +62,10 @@ export const useSession = create<SessionState>((set) => ({
   inputAuthorized: false,
   startupInputReady: false,
   statusMessage: '',
+  wait: null,
+  waitReceivedAt: 0,
   welcomeMessage: '',
+  welcomeOpeningScene: false,
   startupStatus: 'idle',
   startupPhase: '',
   startupAttemptId: '',
@@ -80,11 +88,13 @@ export const useSession = create<SessionState>((set) => ({
     inputAuthorized: s.startupStatus === 'ready' || s.startupStatus === 'in_progress',
     startupInputReady: s.startupStatus === 'in_progress' && !isProcessing,
   })),
-  setWelcome: (message) => set({ welcomeMessage: message }),
+  setWelcome: (message, kind) => set({ welcomeMessage: message, welcomeOpeningScene: Boolean(message) && kind === 'opening_scene' }),
   setStatus: (status) =>
     set((s) => ({
       statusMessage: status.message,
       isProcessing: status.is_processing,
+      wait: status.is_processing ? status.wait ?? null : null,
+      waitReceivedAt: performance.now(),
       restoreRecoveryRequired: status.recovery_required ?? s.restoreRecoveryRequired,
       startupInputReady: s.mode === 'starting' && s.startupStatus === 'in_progress' && !status.is_processing
         ? true
@@ -119,6 +129,8 @@ export const useSession = create<SessionState>((set) => ({
         startupInputReady: snapshot.game_running && startupStatus === 'in_progress' && !snapshot.is_processing,
         isProcessing: snapshot.is_processing,
         statusMessage: snapshot.status_message,
+        wait: snapshot.is_processing ? snapshot.wait ?? null : null,
+        waitReceivedAt: performance.now(),
         restorePending: snapshot.operations?.restore?.pending === true,
         restoreRecoveryRequired: snapshot.operations?.restore?.can_resume === false
           || snapshot.operations?.restore?.restore_outcome === 'recovery_required',

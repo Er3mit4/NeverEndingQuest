@@ -9,13 +9,18 @@ identity and owns every duration calculation and mutation.
 """
 
 from copy import deepcopy
-import hashlib
 import json
+import uuid
 
 from core.ai import api_client
 from core.effects.clock import display_iso_from_scalar
 from core.effects.model import normalize_effect, validate_effect
+from utils.capture.live_provider_call import (
+    LiveProviderCompletedError,
+    LiveProviderSuperseded,
+)
 from utils.capture.multi_model_capture import capture_and_fanout, register_callsite
+from utils.transient_filesystem import ReadOnlySaveStop
 from utils.character_sheet_contract import extract_json_object
 
 
@@ -43,12 +48,9 @@ def _provider_config():
     return provider, dict(getattr(config, names[provider]))
 
 
-def _system_prompt():
-    return """You classify temporary effects for a deterministic 5th-edition fantasy RPG engine.
-Return JSON only. The engine owns arithmetic, clocks, persistence, expiry, and removal.
-
-Return exactly:
-{
+# The effect contract and its rules: T078's prompt and, word for word, T079's declarative effect rule
+# (D-COST-8, #193). One source, so the two never drift.
+EFFECT_CONTRACT_RULES = """{
   "operation": "none|add|remove",
   "effect": {
     "name": "effect or spell name",
@@ -61,6 +63,7 @@ Return exactly:
     "durationValue": 10,
     "restKind": "short_rest|long_rest|none",
     "concentration": false,
+    "caster": "the character who concentrates on this effect (the target's own name for a self-cast); empty when concentration is false",
     "onApply": [{"stat":"hitPoints", "delta":5}],
     "onRemove": []
   },
@@ -69,15 +72,40 @@ Return exactly:
 
 Use operation=none with effect={} and remove={} for instant damage/healing,
 permanent changes, inventory/currency/resource changes, and ordinary narration.
-Use operation=remove when the change explicitly ends, dispels, replaces, or
-breaks concentration on an existing temporary effect. Copy its exact effectId
-and name from currentEffectiveSheet. Do not guess a removal target.
+A change that only spends a spell slot or a resource to cast something is
+none; the effect itself arrives as its own change. If currentEffectiveSheet
+already lists an active effect of the same name: a change that casts it again
+on the same target (a recast or a renewal) is operation=add with the complete
+new effect, which replaces the active one and starts its duration over (the
+same spell does not stack); a change that only mentions it, or only spends the
+slot for an effect that arrives as its own change, is none.
+Use operation=remove when the change explicitly ends, dispels, or breaks
+concentration on an existing temporary effect and adds nothing. Copy its exact
+effectId and name from currentEffectiveSheet. Do not guess a removal target.
+A change that casts a NEW concentration spell (even when it says the old
+concentration ended or was replaced) is operation=add for the NEW spell with
+an empty remove: the engine ends the previous concentration and its effects
+by itself the moment the new one begins. Never answer remove for the old spell
+in that case, and never fill effect on a remove.
 
 Allowed modifier stats: armorClass, speed, maxHitPoints, abilities.strength,
 abilities.dexterity, abilities.constitution, abilities.intelligence,
 abilities.wisdom, abilities.charisma, attackRolls, damageRolls, abilityChecks,
 savingThrows, savingThrow.<ability>, abilityCheck.<ability>, initiative,
 spellSaveDC, spellAttackBonus.
+A spell that adds a die to attack rolls, saving throws or ability checks
+(Bless: 1d4) uses {"stat":"attackRolls", "die":"1d4"} in place of value, never
+an average. A die is accepted only on attackRolls, savingThrows,
+savingThrow.<ability>, abilityChecks and abilityCheck.skill.<skill>. Guidance
+is one modifier on the skill the caster chose, the skill in lowercase with
+hyphens: {"stat":"abilityCheck.skill.sleight-of-hand", "die":"1d4"}.
+An effect that sets armor class to a base plus an ability modifier (Mage
+Armor: 13 + Dexterity) uses {"stat":"armorClass", "set":{"base":13,
+"plusAbility":"dexterity"}} in place of value (plusAbility null for a flat
+base); the engine computes the armor class.
+An effect that keeps armor class from falling below a number (Barkskin: at
+least 17) uses {"stat":"armorClass", "atLeast":17} in place of value, never
+set; the engine applies it.
 
 Current hit points are a resource, not a derived modifier. For Aid-like effects
 that raise maximum and current HP, use a maxHitPoints modifier plus matching
@@ -87,8 +115,17 @@ hitPoints in modifiers. Leave onApply/onRemove empty for normal effects.
 
 Conditions use standard lowercase names. Set incapacitates=true only when the
 target cannot take actions. For concentration, use the effect's maximum stated
-duration. Do not calculate timestamps. Do not invent an effectId. Do not include
+duration and name the caster exactly as the change text does (the engine holds
+one concentration per caster and ends the spell on everyone when it breaks). Do not calculate timestamps. Do not invent an effectId. Do not include
 fields outside this contract."""
+
+
+def _system_prompt():
+    return """You classify temporary effects for a deterministic 5th-edition fantasy RPG engine.
+Return JSON only. The engine owns arithmetic, clocks, persistence, expiry, and removal.
+
+Return exactly:
+""" + EFFECT_CONTRACT_RULES
 
 
 _REQUIRED_EFFECT_FIELDS = {
@@ -102,6 +139,7 @@ _REQUIRED_EFFECT_FIELDS = {
     "durationValue",
     "restKind",
     "concentration",
+    "caster",
     "onApply",
     "onRemove",
 }
@@ -115,6 +153,20 @@ def _parse(content):
         result = json.loads(blob)
     except json.JSONDecodeError as exc:
         raise EffectsAgentContractError("T078 returned malformed JSON") from exc
+    return _check_contract(result)
+
+
+# T078's correction after a contract failure; T079's loop sends the same text (D-COST-8).
+CONTRACT_CORRECTION = (
+    "Your previous response failed the strict contract: %s. "
+    "Return a corrected complete JSON object only. Remember: operation=remove takes an "
+    "empty effect {}; a change that casts a new spell is operation=add for that new spell "
+    "with an empty remove {} (a replaced concentration ends by itself)."
+)
+
+
+def _check_contract(result):
+    """The strict {operation, effect, remove} contract, for T078's answer and T079's effectChange object."""
     if not isinstance(result, dict) or set(result) != {"operation", "effect", "remove"}:
         raise EffectsAgentContractError("T078 requires exactly operation, effect, and remove")
     if (
@@ -154,6 +206,10 @@ def _parse(content):
     if set(result["effect"]) != _REQUIRED_EFFECT_FIELDS:
         raise EffectsAgentContractError("T078 effect has missing or extra fields")
     effect = result["effect"]
+    if not isinstance(effect.get("caster"), str):
+        raise EffectsAgentContractError("T078 caster must be a string")
+    if effect.get("concentration") is True and not effect["caster"].strip():
+        raise EffectsAgentContractError("T078 concentration effect requires a caster")
     if effect["restKind"] not in ("short_rest", "long_rest", "none"):
         raise EffectsAgentContractError("T078 restKind is invalid")
     kind = effect["durationKind"]
@@ -192,21 +248,10 @@ def _finalize(effect, now_scalar, owner, change_description):
             int(now_scalar) + int(float(value) * multiplier)
         )
     effect["duration"] = "%s %s" % (value, kind.replace("_", " "))
-    identity_material = json.dumps(
-        {
-            "owner": owner,
-            "change": str(change_description),
-            "gameTimeScalar": int(now_scalar),
-            "name": effect.get("name"),
-            "source": effect.get("source"),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    effect["effectId"] = "FX-%s" % hashlib.sha256(
-        identity_material.encode("utf-8")
-    ).hexdigest()[:24]
+    # A code-minted id with no content in it (#193 AP-7): never a digest of
+    # the change text. The same effect named again replaces this record by
+    # name (core/effects/lifecycle.py), not by id.
+    effect["effectId"] = "FX-%s" % uuid.uuid4().hex
     effect["authoredBy"] = "classifier"
     effect["created"] = {
         "gameTimeScalar": int(now_scalar),
@@ -218,6 +263,20 @@ def _finalize(effect, now_scalar, owner, change_description):
     if problems:
         raise EffectsAgentContractError("T078 effect failed validation: %s" % "; ".join(problems))
     return normalized
+
+
+def classification_from_object(obj, character_name, change_description, now_scalar):
+    """T079's effectChange object (D-COST-8, #193), checked against the same contract T078 answers and
+    finalized the same way. Raises EffectsAgentContractError with the contract's message."""
+    result = _check_contract(deepcopy(obj))
+    if result["operation"] == "add":
+        try:
+            result["effect"] = _finalize(result["effect"], now_scalar, character_name, change_description)
+        except ValueError as exc:
+            # A malformed modifier (a value with a set or a die, #1322) is a contract failure that
+            # T079's loop corrects, as T078's retry already does, not an uncaught error.
+            raise EffectsAgentContractError("T078 effect failed validation: %s" % exc) from exc
+    return result
 
 
 def classify_effect(character_name, change_description, sheet, now_scalar, max_attempts=2):
@@ -260,10 +319,12 @@ def classify_effect(character_name, change_description, sheet, now_scalar, max_a
                     result["effect"], now_scalar, character_name, change_description
                 )
             return result
+        except (LiveProviderCompletedError, LiveProviderSuperseded, ReadOnlySaveStop):
+            # A provider refusal cannot heal by reissuing the same request
+            # (#240), and a supersession must reach the caller; neither is a
+            # contract failure to correct (#432, D-432-4(iii)).
+            raise
         except Exception as exc:
             last_error = exc
-            correction = (
-                "Your previous response failed the strict contract: %s. "
-                "Return a corrected complete JSON object only." % exc
-            )
+            correction = CONTRACT_CORRECTION % exc
     raise EffectsAgentContractError("T078 failed after retries: %s" % last_error)

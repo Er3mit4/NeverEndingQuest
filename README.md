@@ -35,70 +35,70 @@ the separately billed OpenAI API GPT-6 matrix, the stable GPT-4.1 baseline,
 Gemini, the OpenCode Go subscription
 (DeepSeek V4.1 Flash — custom fork feature), or an OpenAI-compatible local or
 remote server.
+## Help build NeverEndingQuest
 
----
+Find current opportunities, offer a hand, and pick up contributor guidance on
+[NeverEndingQuest's GitMeUp page](https://gitmeup.com/projects/neverendingquest-381865#help).
+Testing, documentation, design and code contributions are welcome. Read
+[GITMEUP.md](GITMEUP.md) and the applicable repository instructions before starting;
+code review and merging stay on GitHub.
 
-## 🎮 Get Started | 💬 Join the Community
 
-**Ready to play?** → [Quick Start Guide](#quick-start) | [Upstream Windows Installer](https://raw.githubusercontent.com/MoonlightByte/NeverEndingQuest/main/install_neverendingquest_windows.bat) *(installs upstream, without this fork's Codex provider)*
+## Launch the game: React by default
 
-**Need help or want to share your adventures?** → [r/NeverEndingQuest on Reddit](https://www.reddit.com/r/NeverEndingQuest/)
+After installation, run these commands from your game folder with its Python
+environment activated:
 
-**Report bugs or request features** → [GitHub Issues](https://github.com/MoonlightByte/NeverEndingQuest/issues)
+- **React player (default):** `python run_web.py`
+- **Legacy player (explicit opt-in):** `python run_web.py --ui legacy`
 
----
+For Windows installer users, run `launch_game.bat` for React, or
+`launch_game.bat --ui legacy` for legacy.
 
-## Table of Contents
+Both interfaces open in your browser. React is selected automatically; there is
+no interface-selection prompt and no automatic fallback to legacy. If React needs
+setup or repair, follow the launcher's instructions, or explicitly run legacy.
+Node.js/npm are needed to build or rebuild React, not to run an already-current
+build or the legacy player. See [Quick Start](#quick-start) for installation.
 
-- [Quick Start](#quick-start)
-- [Key Features](#key-features)
-- [Module Toolkit](#module-toolkit)
-- [Installation](#installation)
-- [How It Overcomes AI Limitations](#how-it-overcomes-ai-limitations)
-- [Advanced Token Compression System](#advanced-token-compression-system)
-- [Game Features](#game-features)
-- [Technical Architecture](#technical-architecture)
-- [Advanced Features](#advanced-features)
-- [Usage Examples](#usage-examples)
-- [Project Structure](#project-structure)
-- [Configuration](#configuration)
-- [Community Module Safety](#community-module-safety)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License](#license)
-- [Recent Updates](#recent-updates)
+**Version 0.3.5 (Alpha)**
 
-## Quick Start
+An AI-powered Dungeon Master for running SRD 5.2.1 compatible tabletop RPG campaigns with infinite adventure potential. Experience the world's most popular roleplaying game with an intelligent AI that remembers every decision, adapts to your playstyle, and creates endless adventures tailored to your party.
 
-### 🎯 One-Click Windows Installer (upstream only)
+## Rules first: the Firelight Engine
 
-**For non-technical users on Windows:** This installer clones
-`MoonlightByte/NeverEndingQuest`. To use the Codex GPT-6 and OpenCode Go
-providers in this fork, follow [Manual Installation](#manual-installation)
-with the fork clone command below.
+At its heart NeverEndingQuest is a rules-based game, not just a continuing
+narration. Attacks, damage, hit points, inventory, conditions and the clock are typed
+game mechanics. A compiled rules engine decides most of them by the SRD 5.2.1
+rules ([what it covers today](#the-rules-engine)), and the AI Dungeon Master
+narrates what the engine decided.
 
-1. **Download the installer**: [install_neverendingquest_windows.bat](https://raw.githubusercontent.com/MoonlightByte/NeverEndingQuest/main/install_neverendingquest_windows.bat)
-   - **Right-click the link** and select **"Save link as..."** or **"Save target as..."**
-   - Save the `.bat` file to your computer (e.g., Downloads folder)
-2. **Run the installer**: Double-click the `.bat` file
-3. **Choose whether to add an OpenAI API key**: Enter one in the popup, or skip
-   it and configure a provider later from the in-game Settings panel
-4. **Launch the game**: Run `launch_game.bat` in the `NeverEndingQuest` folder
+A language model cannot keep those books by itself: over a long game it forgets
+numbers and drifts from the rules. Holding the rules steady needed an engine of
+its own, so we created one.
 
-The installer automatically:
-- ✅ Checks Python/Git and offers Node.js LTS installation with your consent
-- ✅ Clones the repository to a `NeverEndingQuest` folder
-- ✅ Creates a virtual environment
-- ✅ Installs all dependencies
-- ✅ Creates the local configuration and offers an optional OpenAI-key dialog
-- ✅ Builds React and creates a React-default `launch_game.bat`; explicit legacy remains available
+We are now sharing that engine with anyone who wants to build on it:
+**Firelight Engine v0.1.0, by Eternal Tavern**, public at
+[github.com/MoonlightByte/firelight](https://github.com/MoonlightByte/firelight)
+under the Fair Source License 1.0, which becomes the Apache License 2.0 five years
+after first publication. NeverEndingQuest ships it in `bin/` as `firelight-apply`
+(`firelight-apply.exe` on Windows). To build on it, start with the engine's
+[README](https://github.com/MoonlightByte/firelight#readme) and its
+[protocol](https://github.com/MoonlightByte/firelight/blob/main/docs/PROTOCOL.md).
 
-**To restart the game later:**
-- Run `launch_game.bat` in the `NeverEndingQuest` installation folder
+**NEW: The Firelight Engine** - Dice, totals, inventories, conditions and the clock are
+now decided by a separate compiled rules engine, not by the language model. The AI
+Dungeon Master tells the story and declares what happens; the engine applies the SRD
+rules, keeps the books and journals every change. See
+[The Rules Engine](#the-rules-engine) for what it covers today and what is still moving.
 
----
-
-### Manual Installation
+**🚀 NEW: React Player and Multi-Provider AI** - The component-based React player
+is now the default; the established legacy player remains an explicit launch option.
+Run the game with the economical Codex GPT-6 matrix (**default for new installs**),
+the separately billed OpenAI API GPT-6 matrix, the stable GPT-4.1 baseline,
+Gemini, the OpenCode Go subscription (DeepSeek V4.1 Flash, a custom fork feature),
+or an OpenAI-compatible local or remote server.
+### 🛠️ Manual Installation
 
 The launcher handles React setup automatically after the Python environment is
 ready:
@@ -233,7 +233,7 @@ be entered again after a restart. Existing keys in the local, gitignored
 - **Automatic Routing** - Intelligent model selection for optimal cost/quality balance
 
 ### Core Game Systems
-- **SRD 5.2.1 Rules Engine** - Complete 5th edition compatible mechanics
+- **Firelight Engine** - SRD 5.2.1 mechanics decided by a compiled rules engine, not the language model (see [The Rules Engine](#the-rules-engine))
 - **AI Dungeon Master** - GPT-powered storytelling that adapts to your actions
 - **Turn-Based Combat** - Tactical combat with initiative tracking and AI validation
 - **Character Progression** - Full leveling system from 1-20 with all class features
@@ -411,6 +411,79 @@ See [LICENSING.md](LICENSING.md) for complete details, FAQ, and legal informatio
 - Both web players use the same game state; React provides the component-based
   interface while legacy remains available through explicit boot selection
 
+## The Rules Engine
+
+### Why a separate engine
+Language models tell good stories and keep poor ledgers. Left to do their own
+bookkeeping they drift: a wand that never runs out, an arrow count that goes up, a
+long rest that forgets a condition, a purse that pays twice. Validation prompts catch
+some of this at a token cost, but they cannot make the arithmetic right by
+construction.
+
+NeverEndingQuest now separates the two jobs. The AI Dungeon Master narrates and
+declares typed actions ("Eirik fires the wand at the blight", "the party rests until
+morning"). A compiled rules engine, Firelight, applies the SRD 5.2.1 rules to those
+declarations, refuses what the rules do not allow, and returns the resulting facts.
+Code reconciles the engine's answer onto the character sheets. Nothing is matched by
+keyword in the prose and nothing is guessed.
+
+### How it works
+- **Shipped binary**: the engine is a compiled command in `bin/` (`firelight-apply`
+  for Linux, `firelight-apply.exe` for Windows; `nql-apply` is the same build under
+  its old name until it is retired). `bin/FIRELIGHT_ENGINE_VERSION.txt` records the
+  engine release the shipped pair was built from, and the code on `main` never runs
+  ahead of its engine. The engine's source is public in its own repository,
+  [Firelight](https://github.com/MoonlightByte/firelight).
+- **One call, one process**: each request is one JSON document each way. The engine
+  holds no state between calls; the game keeps the returned checkpoint and hands it
+  back on the next call.
+- **The world is built at startup** from the party's character sheets, storage
+  containers, the installed modules' places and people, and the SRD rules and item
+  pack in `data/srd/`.
+- **Journal and replay**: every change the engine makes is journaled with the
+  request that caused it. A save can be replayed from the journal without the engine,
+  and a retried request is applied once.
+- **Refusals correct the storyteller**: when the engine refuses a declaration (not
+  enough charges, an item the character does not hold, a condition that forbids the
+  action) the Dungeon Master is told why and redeclares. For a player's own action
+  the game narrates the failure and asks what they do instead; it never chooses for
+  them.
+- **If the binary cannot run**, engine-backed actions are either refused with a
+  message or kept on the previous arithmetic path, depending on the surface. Saves
+  are never corrupted either way.
+
+### What the engine decides today
+| Area | Decided by the engine |
+|---|---|
+| Money and trade | Coin balances, buying from the SRD item pack, giving and splitting between characters, inventory consolidation |
+| Storage | Location containers: store, retrieve, shared party access |
+| Equipment | Quantity changes, equipped state, armor class from what is worn, the link from a row to its SRD pack definition |
+| Character totals | Ability modifiers, proficiency, saves, skills, expertise; checks and saving throws with advantage, disadvantage and condition roll modes |
+| Resources | Hit points, temporary hit points, spell slots, class feature uses, long rests, ammunition (shots, pickups, after-fight recovery) |
+| Conditions and effects | Timed effects on the engine's clock, SRD conditions and exhaustion, concentration and its saves |
+| Combat | Damage and healing, saves, conditions, concentration, monster save abilities and recharge riders, XP awards |
+| Charged items | Charge counts, recharge from the item's rule at its boundary, engine-minted dice seeds, use in and out of combat, exhausted outcomes (a wand that crumbles or holds on its last charge) |
+| Progression | Experience totals, level-up growth tables |
+| Quests | Quest status as an engine record, including quests the party bypassed |
+| World and places | Who and what is at every location (the live roster), module declarations and NPC dispositions, drop-in module typing, the party's position after travel |
+
+### What is still being moved
+- **Travel led by the engine's map** inside a module: built and in live acceptance.
+  Travel time and cross-module travel follow it.
+- **Module build time**: routes and travel ticks from the generator, and the engine
+  consulted during generation.
+- **Module publication edge cases**, such as a dropped-in module refused for a stale
+  party tracker (issue #586).
+- **Not yet engine-backed**: charged items held by monsters and NPC shop stock.
+- **Not being migrated**: fights started under the pre-agentic combat pipeline, and
+  saves from before the engine, stay on the old path.
+
+Each step lands as one small change with an offline gate against the real engine and a
+live headless playthrough before it merges. The merge history on `main` records the
+sequence (branches named `feat/nql-*`, `feat/e12*`, `feat/c*`, `feat/charges-host-*`,
+`feat/m*`, `feat/n*`).
+
+
 ## How It Overcomes AI Limitations
 
 ### The Context Window Challenge
@@ -419,6 +492,13 @@ Traditional AI systems have limited memory - typically 100-200k tokens. In a tex
 - NPCs "forget" your previous interactions
 - Story continuity breaks between sessions
 - Module transitions lose important context
+
+### The Bookkeeping Challenge
+A second limit is arithmetic. A model narrating a fight will miscount arrows, forget a
+spent charge, or heal past the maximum, and no amount of context fixes that. The answer
+is a separate rules engine that decides the mechanics; see
+[The Rules Engine](#the-rules-engine).
+
 
 ### Our Solution: Intelligent Conversation Compression
 
@@ -501,14 +581,14 @@ The Advanced Token Compression System has graduated from experimental to **CORE 
 
 ### Compression Technologies
 
-#### 1. Parallel Conversation Compression (`core/ai/conversation_compression.py`)
+#### 1. Parallel Conversation Compression (`utils/compression/conversation_compressor_parallel.py`)
 The system uses advanced parallel processing to compress conversation history in real-time:
 
 - **Parallel Processing**: ThreadPoolExecutor with up to 5 workers for concurrent compression
 - **Smart Caching**: MD5 hash-based caching prevents re-compression of identical messages
 - **Selective Compression**: Preserves last 2 user messages for immediate context while compressing older history
 - **Token Reduction**: Achieves 76-82% reduction per message while maintaining narrative continuity
-- **Configuration**: Toggle system-wide with `COMPRESSION_ENABLED` flag in `config.py`
+- **Configuration**: Toggle system-wide with `COMPRESSION_ENABLED` flag in `model_config.py`
 
 **Performance Metrics:**
 - Average compression ratio: 76-82% per message
@@ -715,11 +795,11 @@ The system automatically adjusts compression based on content type:
 
 ### SRD 5.2.1 Rules Implementation
 - **Complete Character System** - All classes, races, backgrounds from SRD
-- **Spell System** - Full spellcasting with components and concentration
-- **Combat Mechanics** - Actions, bonus actions, reactions, opportunity attacks
-- **Conditions & Effects** - All standard conditions tracked automatically
-- **Equipment & Magic Items** - Complete inventory with attunement rules
-- **Skill Checks & Saves** - Advantage/disadvantage, proficiency bonuses
+- **Spell System** - Full spellcasting with components and concentration; slots and concentration tracked by the engine
+- **Combat Mechanics** - Actions, bonus actions, reactions, opportunity attacks; damage, saves and XP applied by the engine
+- **Conditions & Effects** - Standard conditions, exhaustion and timed effects kept on the engine's clock
+- **Equipment & Magic Items** - Inventory and attunement, plus the SRD item pack with charged items that recharge and run out
+- **Skill Checks & Saves** - Totals, advantage/disadvantage and condition roll modes from the engine
 
 ### AI-Powered Features
 - **Adaptive Storytelling** - AI responds to creative solutions and unexpected actions
@@ -773,6 +853,14 @@ The codebase follows a clean Manager Pattern for all major subsystems:
 - **IncrementalLocationCompressor** - Automatically compresses conversation history at current location
 - **CompanionMemoryManager** - Tracks NPC relationships and interactions
 
+### Rules Engine Integration
+- **`bin/firelight-apply`** - The compiled Firelight engine; `core/nql/apply.py` runs it as a subprocess, one JSON document each way, with a timeout
+- **`core/nql/`** - One host module per rules domain: genesis, storage, currency, transfer, equipment, armor_class, checks, effects, resources, ammunition, concentration, experience, leveling, occupants, travel, acquisition, item_catalog, stats
+- **Typed declarations** - The Dungeon Master's structured actions are the only input; prose is never parsed for rules
+- **Checkpoint and journal** - The host keeps the engine's checkpoint and journals every applied change with its request id; replay is deterministic and a retried request applies once
+- **Version pinning** - `bin/FIRELIGHT_ENGINE_VERSION.txt` names the engine release; code and binary move together
+
+
 ### Module-Centric Architecture
 ```
 modules/[module_name]/
@@ -782,6 +870,7 @@ modules/[module_name]/
 ├── encounters/         # Combat encounters
 ├── images/            # Screenshots and portraits
 ├── module_plot.json   # Quest progression
+├── module_items.json  # Typed loot items (optional)
 ├── party_tracker.json # Party state
 └── [name]_module.json # Module metadata
 ```
@@ -1300,6 +1389,22 @@ This is unofficial Fan Content and is not affiliated with, endorsed, sponsored, 
 
 ## Recent Updates
 
+### Current Main - The Firelight Engine
+The mechanical side of the game has moved, one small merged change at a time, from the
+language model to a compiled rules engine. Highlights in merge order:
+- **Storage, giving, coins, armor typing, the validator** (#472-#477) - the first seams: containers, hand-offs and purses as engine transactions.
+- **Resources, temporary hit points, equipment deltas** (#478-#482) - hit points, slots, feature uses and quantities.
+- **Effects, stats, checks and conditions** (#486-#505) - timed effects on the engine's clock, derived totals, checks and saves with roll modes, exhaustion.
+- **Experience and concentration** (#506-#510); **combat hit points, concentration, saves and conditions** (#513-#519); **monster abilities** (#520-#521); **ammunition** (#515-#516).
+- **Location rosters** (#522-#529, #545) - the engine keeps who is where; typed occupant actions and escort receipts.
+- **Quests** (#548-#549) - quest status as an engine record.
+- **SRD item pack and buying** (#550-#551) - the catalog in `data/srd/`; acquiring an item by name at a catalog price.
+- **Compact context** (#554-#559) - validation evidence once per fact, the atlas built once per revision.
+- **Modules** (#562-#564, #575, #578, #582, #589) - registry stub recovery, managed import with re-prefixing, module declarations, NPC dispositions, drop-in typing.
+- **Charged items** (#563, #583, #585, #588, #590) - recharge rules and the clock, 74 charged items from the pack, engine-minted seeds, use in combat, and player agency when a wand cannot pay.
+- **Travel** (#584, #587) - the engine world is the published modules; the engine's party follows the tracker.
+
+
 ### Current Main - React Player, Multi-Provider AI, and Startup Improvements
 
 #### Player Interfaces
@@ -1414,6 +1519,7 @@ This is the first iteration of the compression system designed to reduce API cos
 - **Storage System** - Natural language inventory management
 
 ### Roadmap
+- **Rules Engine** - Engine-led travel and travel time, module build-time integration, remaining item edge cases (see [The Rules Engine](#the-rules-engine))
 - **Mobile Support** - Responsive web interface
 - **Voice Integration** - Speech-to-text commands
 - **AI Image Generation** - Scene and character art

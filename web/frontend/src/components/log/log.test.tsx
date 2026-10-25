@@ -132,6 +132,7 @@ describe('InputBar', () => {
     expect(input.disabled).toBe(true)
     expect((screen.getByText('Send') as HTMLButtonElement).disabled).toBe(true)
     expect(screen.getByRole('status').textContent).toContain('The DM is thinking...')
+    expect(input.placeholder).toBe('Enter your command...')
   })
 
   it('stays visible but locked during the startup handoff', () => {

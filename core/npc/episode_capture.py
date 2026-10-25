@@ -17,6 +17,7 @@ scope exists; extraction failure never breaks the gameplay turn.
 """
 
 from __future__ import annotations
+from core.ai import history_markers as hm
 
 import logging
 import re
@@ -47,16 +48,23 @@ def segment_witness_names(messages: Sequence[Mapping[str, Any]]) -> List[str]:
     engine-authored 'Party NPCs: ... Party stats:' field in DM notes (never prose)."""
     names: List[str] = []
     for message in messages:
-        content = message.get("content") if isinstance(message, Mapping) else None
-        if not isinstance(content, str) or "Party NPCs: " not in content:
+        if not isinstance(message, Mapping) or message.get("role") != "user":
             continue
-        start = content.find("Party NPCs: ") + len("Party NPCs: ")
-        end = content.find(" Party stats:", start)
+        content = message.get("content")
+        # Only the engine's turn note carries the field; DM narration never counts.
+        if not isinstance(content, str) or not content.startswith("Dungeon Master Note:"):
+            continue
+        # The engine's fields come before the player's words; only they are read.
+        head = content.split(" Player: ", 1)[0]
+        if "Party NPCs: " not in head:
+            continue
+        start = head.find("Party NPCs: ") + len("Party NPCs: ")
+        end = head.find(" Party stats:", start)
         if end > start:
-            roster = content[start:end]
+            roster = head[start:end]
         else:
-            line_end = content.find("\n", start)
-            roster = content[start:] if line_end < 0 else content[start:line_end]
+            line_end = head.find("\n", start)
+            roster = head[start:] if line_end < 0 else head[start:line_end]
         for part in roster.split(","):
             name = part.strip()
             paren = name.find(" (")
@@ -145,12 +153,9 @@ def location_close_position(
     upper = min(transition_index + 1, len(conversation_history))
     for i in range(upper):
         message = conversation_history[i]
-        content = message.get("content") if isinstance(message, Mapping) else None
         if (
             isinstance(message, Mapping)
-            and message.get("role") == "user"
-            and isinstance(content, str)
-            and "Location transition:" in content
+            and hm.is_marker(dict(message), hm.LOCATION_TRANSITION)
         ):
             count += 1
     return count
@@ -535,9 +540,7 @@ def consolidate_module_episodes(
         for i, message in enumerate(conversation_history):
             if (
                 isinstance(message, Mapping)
-                and message.get("role") == "user"
-                and isinstance(message.get("content"), str)
-                and "Location transition:" in message["content"]
+                and hm.is_marker(dict(message), hm.LOCATION_TRANSITION)
             ):
                 last_marker = i
         final_segment = [

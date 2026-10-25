@@ -1,5 +1,18 @@
 # Travel and Transitions
 
+## T065 prompt trim and review limits (2026-10-20; D-COST-3 and D-COST-4, #193)
+
+The validator prompt no longer states rules that code enforces (#1320). Transition order
+(exactly one transitionLocation, first) and the cross-module pair (updatePartyTracker
+then one updateTime) are main.py's invalid_transition_actions retries. Route validity is
+pre_validate_transition (core/ai/action_handler.py), whose reason codes main.py turns into
+typed retry corrections. T065 still judges what may follow a transition (the one-turn
+boundary, including the #594 CHECK RESULTS exception) and same-location moves. A paired
+replay of 50 recorded T065 inputs lost no transition reject (kit
+agents/play/records/t065-trim-step1). Rejected drafts per turn stay capped at
+_DM_REVIEW_REJECTION_LIMIT = 10 (#488), counted across all review stages. An exhausted
+turn ends without change and shows the same authored fail-forward line as T065.
+
 ## #248 implementation candidate (2026-09-06; acceptance pending)
 
 Interrupted-travel recovery now runs through the same inspector and v2 continuation before gameplay input, not inside the next player turn. Startup ownership begins before the ordered module-completion drain. T013/T063/T064 and existing receipts remain unchanged; no new crash store or replacement arrival. A retained conflict keeps control-only recovery active. Normal route/atlas/guardian validation is unchanged.
@@ -19,8 +32,8 @@ Verified against NeverEndingQuest `20f2b0eaf142c33b7f509ce072b55c6a799dfe66` on 
 | One-beat semantic boundary | T065 exact verdict | Invalid candidate returns to T067 correction with no mutation |
 | Route and topology | Request-bound `ApprovedTransitionPlan` from active-module disk | Identity reverified under transition lock before movement |
 | Current location | `party_tracker.json.worldConditions` | Atomic destination write occurs before departure effects/prose |
-| Recovery progress | `pending_location_transition.json` v2 checkpoint | Receipt advances after each durable step; removed after completion |
-| Origin departure | Checkpoint preimages plus canonical origin area/journal | Receipt-based reconcile after movement |
+| Recovery progress | `pending_location_transition.json` v2 checkpoint | Receipt advances after each durable step; an unparseable `journal.json` is set aside before a staged departure finishes (#636); removed after completion |
+| Origin departure | Checkpoint preimages plus canonical origin area/journal | Receipt-based reconcile after movement; T091 also reconciles the current location's `monsters[]` when a fight ends |
 | Player-facing travel prose | Committed destination/roster and retained narration identity | T013/T063/T064 retained, projection-checked, then published |
 | Conversation atlas | Fresh rendering of current module area files | Advisory T067 context only; not movement authorization |
 | Cross-module target | Canonical target-module projection | Root checkpoint then party-module transition publication |
@@ -29,11 +42,11 @@ Verified against NeverEndingQuest `20f2b0eaf142c33b7f509ce072b55c6a799dfe66` on 
 
 Local-party/shared-review delta checked on 2026-09-06 in the uncommitted guardian integration based on `185f8997a5055521f04fe7a55ca908a41f0d412f`; older flow anchors retain their stated pins. Doctrine: live #193, D-NPC-PARTY-1 and D-NPC-PARTY-6. Combined-code live acceptance remains pending.
 
-The DM and validator distinguish local companion scouting from party travel and genuine membership changes. Requests for player-directed companion missions in another location are corrected agentically, not converted into travel or dismissal. Existing updatePartyNPCs leaving/rejoining remains a membership operation; departure context is not remote-mission authority. T067 receives the common DM Note; T065 separately receives raw player intent and its own validation prompt. PR299's existing in-place roster/travel cancellation and the destination-first party-travel transaction remain unchanged. References: main common DM Note/validation assembly, action_handler.update_party_npcs, and the full/compact local-party prompt blocks. Lifecycle regression coverage: #304; known rejoin defect: #298.
+The DM and validator distinguish local companion scouting from party travel and genuine membership changes. Requests for player-directed companion missions in another location are corrected agentically, not converted into travel or dismissal. Existing updatePartyNPCs leaving/rejoining remains a membership operation, and it names the companion by occupantId (or rosterSlot for a companion saved before ids); departure context is not remote-mission authority. An updatePartyTracker that carries partyNPCs is refused and the DM answers again. Occupant actions refuse a current companion's id; a companion's person joins and leaves the world only through the party change. The DM Note shows each companion's id or [slot n] and, after Party stats, the joined people no row carries. T067 receives the common DM Note; T065 separately receives raw player intent and its own validation prompt. PR299's existing in-place roster/travel cancellation and the destination-first party-travel transaction remain unchanged. References: main common DM Note/validation assembly, action_handler.update_party_npcs, and the full/compact local-party prompt blocks. Lifecycle regression coverage: #304; known rejoin defect: #298.
 
-Cancellation establishes only that party travel was removed, not membership consent or commitment. `_review_dm_candidate` (`main.py:9585`) owns canonical normalization/target projection, T114, provisional route preflight, then T065. Each rejection revises the latest draft with applicable earlier feedback; changed candidates repeat applicable checks. Rejected drafts never become accepted history. T067 may discard unauthorized removal while keeping travel cancelled. Existing receipts/Save/Load are not fresh membership proposals.
+Cancellation establishes only that party travel was removed, not membership consent or commitment. `_review_dm_candidate` (`main.py`) owns canonical normalization/target projection, T114, provisional route preflight, then T065. Each rejection revises the latest draft with applicable earlier feedback; changed candidates repeat applicable checks. Rejected drafts never become accepted history. T067 may discard unauthorized removal while keeping travel cancelled. Existing receipts/Save/Load are not fresh membership proposals.
 
-Fresh internal follow-ups use `_process_fresh_dm_response` (`main.py:9551`) outside response fences; raw parent player input remains explicit. Earlier committed beats survive a child failure. The sole `resolve_retryable_ai_result` (`main.py:6756`) retains the exact stale child's candidate, feedback, accepted-history and party snapshot for renewed review. This transient envelope is not movement authority and is never persisted. Detached recovery rechecks its existing scope, lease and accepted values; ordinary recovery prepares current canonical context. Unreadable travel records return a truthful content handback, not invented terrain or provider failure.
+Fresh internal follow-ups use `_process_fresh_dm_response` (`main.py`) outside response fences; raw parent player input remains explicit. Earlier committed beats survive a child failure. The sole `resolve_retryable_ai_result` (`main.py`) retains the exact stale child's candidate, feedback, accepted-history and party snapshot for renewed review, at most twice per turn on a budget separate from regeneration; then the turn ends with `travel_content_unavailable` and a fixed line that names no cause (#707). This transient envelope is not movement authority and is never persisted. Detached recovery rechecks its existing scope, lease and accepted values; ordinary recovery prepares current canonical context. Unreadable travel records return a truthful content handback, not invented terrain or provider failure.
 
 ### Within-module travel
 
@@ -61,15 +74,20 @@ Fresh internal follow-ups use `_process_fresh_dm_response` (`main.py:9551`) outs
 2. Only movement and approved travel-owned `updateTime`/`updatePlot` siblings belong to the beat.
 3. Shopping, resting, saving, exiting, and other future clauses remain deferred player intent.
 4. Cross-module travel is the exact pair `updatePartyTracker` then one intrinsic `updateTime`.
+   That `updatePartyTracker` never carries `partyNPCs`; a checkpoint saved with it is loaded
+   without it. A staged `updatePartyNPCs` receipt carries the planned kind and ids; one saved
+   before ids is worked out from its rosters once, written back, then applied as usual.
 5. T013/T063/T064 remain one complete narration chain inside that single player turn.
 
 ### Crash/restart
 
 1. Recovery compares the checkpoint with canonical party location.
 2. Origin plus planned state retires/replans; committed destination resumes existing receipts.
-3. Resume completes origin reconciliation, T013/T063/T064, history compaction, staged siblings,
+3. Before the staged departure finishes, an unparseable `journal.json` is set aside (State and
+   atomicity) and the staged entry becomes entry 0 of a fresh chronicle (#636).
+4. Resume completes origin reconciliation, T013/T063/T064, history compaction, staged siblings,
    final context, and stable publication in checkpoint order.
-4. Operation-ID correlation prevents an unrelated transition from clearing the checkpoint.
+5. Operation-ID correlation prevents an unrelated transition from clearing the checkpoint.
 
 ### Atlas and gate
 
@@ -122,7 +140,8 @@ Fresh internal follow-ups use `_process_fresh_dm_response` (`main.py:9551`) outs
 - Precommit travel freshness rejection returns to the same detached correction loop,
   retaining semantic constraints and revising the latest candidate. It does not use
   the bounded generic regeneration shortcut or retain rejected narration/voice effects.
-- Temporary read contention waits outside the party lock and remains cancellable.
+- Temporary read contention waits outside the party lock and remains cancellable
+  (one exception, the chronicle read at departure staging, is under State and atomicity).
   D-303-2 permits only an unverified move to be refused for permanent unreadability:
   preserve files/position, explain truthfully without a fictional obstacle, and
   return control for another action or Load. Committed travel still resumes its
@@ -135,6 +154,35 @@ acceptance verdict. The verification pin above describes the historical baseline
 
 - Stores: `party_tracker.json`, transition checkpoint, origin area JSON, `journal.json`, main
   conversation history, and optional staged episode/chronicle/handoff records.
+- An unparseable `journal.json` found when a departure is staged is renamed to
+  `journal.json.unreadable-<stamp>-<unique>` (bytes kept, never overwritten) and the chronicle
+  starts again from the next recorded departure (#620, D-620-1); the chronicle is history, not
+  travel evidence, so the unreadable-record handback above does not apply to it. A busy
+  `journal.json` there is waited for while an in-module move holds the party lock; the wait stays
+  cancellable, because a superseding control sets its flag before it takes that lock.
+- The same set-aside runs when a staged departure finishes (`resolve_current_transition_departure`,
+  at resume or in the same session; #636, D-636-2/7): the staged entry becomes entry 0 of the fresh
+  chronicle. The checkpoint's `departure_commit.journal_entry_index` is rebased to 0 just before the
+  rename and written back at once if the rename fails. It stays rebased with the journal still in
+  place only after a process kill or an interrupt inside that bracket, a failed restore write, or a
+  directory-fsync failure (disclosed); the next drain then sets the journal aside, but a journal
+  that has become readable by then ends the departure in `blocked_conflict`. While a departure-summary marker exists or cannot be checked, including
+  one a failed removal left behind, the journal is left alone. The set-aside pre-empts the reads; it
+  does not change them. These stay fail-closed and raise if a corruption lands after it:
+  `build_journal_update` (`adv_summary.py:701`), the commit read (`action_handler.py:1138`), the
+  commit's reads under the target locks (`adv_summary.py:1105`, `:1149`), the marker-recovery reads
+  (`adv_summary.py:922`, `:1010`). Legacy repair no longer raises here: since #731 it reads the
+  journal through `action_handler._read_journal_setting_aside`
+  (`main.py::check_and_process_location_transitions`), which sets an unreadable journal aside
+  (bytes kept) and starts it afresh (#636, D-636-13). Neither caller of
+  resolve holds the party lock, so a busy `journal.json` here is waited for unlocked, and the wait
+  stays cancellable.
+- The departure commit waits while module refresh is busy and never refuses (#637). It makes
+  short attempts with an interruptible beat between them (`_wait_for_module_refresh` in
+  `adv_summary.py`) and shows "Waiting for module work to finish before recording your journey
+  (N seconds).", in the turn and at the startup resume alike. Neither caller holds another lock
+  there, and each beat checks the read-only save stop and the turn's authority, so a superseding
+  Load, Reset or Quit still ends the wait.
 - `safe_json_dump` publishes each JSON by same-directory temp, fsync, and `os.replace`.
 - The workflow is multi-file, not one rename; the checkpoint carries preimages, phases, stable
   message IDs, deferred cursor/operation IDs, and before/after projections for convergence.
@@ -143,21 +191,21 @@ acceptance verdict. The verification pin above describes the historical baseline
 
 ## Load-bearing seams
 
-1. `main.py:6665` - physical T067 call.
-2. `main.py:3350-3373` - T065 verdict and reissue boundary.
-3. `main.py:8754-8877` - semantic acceptance before route authority.
-4. `core/ai/action_handler.py:1871-2124` - route prevalidation and immutable plan.
-5. `utils/path_encounter_analyzer.py:160-235` - active-module disk snapshot.
-6. `core/ai/action_handler.py:2140-2206` - plan identity revalidation.
-7. `core/ai/action_handler.py:3467-3611` - checkpoint, proposals, locked movement receipt.
-8. `core/managers/location_manager.py:486-546` - destination-first commit.
-9. `main.py:4981-5050` - movement execution and suffix staging.
-10. `main.py:5232-5283` - committed-context chain and supersession recheck.
-11. `main.py:1263-1310` - T013 departure layer.
-12. `main.py:1341-1412` - T063 arrival layer.
-13. `main.py:1462-1515` - T064 stitch and handback.
-14. `main.py:1829-2224` - v2 resume and checkpoint completion.
-15. `core/ai/conversation_utils.py:609-636` - fresh advisory atlas injection.
+1. `main.py::_get_ai_response_impl` at `response = capture_and_fanout("T067", api_client.create_completion,` - physical T067 call.
+2. `main.py::validate_ai_response` from `attempt = 0` - T065 verdict and reissue boundary.
+3. `main.py::_review_dm_candidate` from `validation_result = validate_ai_response(` - T065 verdict on the guardian- and route-checked draft, structure recheck and acceptance; publication keeps committed route authority.
+4. `core/ai/action_handler.py:2131-2553` - route prevalidation and immutable plan.
+5. `utils/path_encounter_analyzer.py:165-641` - active-module disk snapshot.
+6. `core/ai/action_handler.py:2569-2652` - plan identity revalidation.
+7. `core/ai/action_handler.py:4018-4182` - checkpoint, proposals, locked movement receipt.
+8. `core/managers/location_manager.py:412-472` - destination-first commit.
+9. `main.py::process_ai_response` from `# If it's a transition, handle it with the special two-step process` - movement execution and suffix staging.
+10. `main.py::process_ai_response` from `# Step 2: Reload the state to get the NEW location context` - committed-context chain and supersession recheck.
+11. `main.py::generate_transition_narration` - T013 departure layer.
+12. `main.py::generate_arrival_narration` - T063 arrival layer.
+13. `main.py::generate_seamless_transition_narration` - T064 stitch and handback.
+14. `main.py::_resume_v2_location_transition` - v2 resume and checkpoint completion.
+15. `core/ai/conversation_utils.py:946-973` - fresh advisory atlas injection.
 
 ## Invariants
 

@@ -57,7 +57,9 @@ import jsonschema
 from utils.encoding_utils import safe_json_load, safe_json_dump
 from utils.module_path_manager import ModulePathManager
 from utils.file_operations import safe_read_json, safe_write_json
+from core.nql import ammunition as nql_ammunition, storage as nql_storage
 from core.validation.character_validator import AICharacterValidator
+from utils.character_sheet_contract import repair_required_ammunition_field
 from utils.enhanced_logger import debug, info, warning, error, set_script_name
 
 # Set script name for logging
@@ -141,6 +143,13 @@ class StorageManager:
             
     def _find_item_in_character(self, character_data: Dict[str, Any], item_name: str, quantity: int) -> Tuple[bool, int, Dict[str, Any]]:
         """Find and validate item in character inventory"""
+        # #366: the typed ammunition row is the stock first, as the engine
+        # transaction takes it; a read-only view for the checks below.
+        found = nql_ammunition.declared_row(character_data, item_name)
+        if found is not None:
+            row = found[1]
+            view = {"item_name": row["name"], "quantity": row["quantity"], "item_type": "ammunition"}
+            return row["quantity"] >= quantity, row["quantity"], view
         equipment = character_data.get("equipment", [])
         
         for item in equipment:
@@ -186,6 +195,19 @@ class StorageManager:
         new_item["quantity"] = quantity
         equipment.append(new_item)
         
+    def _validate_character_before_write(self, character_data: Dict[str, Any], before: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Run the contract repair and AI validation on the in-memory sheet,
+        so the character and storage files can be written together (#391).
+        Provider failure keeps the deterministic repairs (fail-open, as before)."""
+        repaired, _repair_changes = repair_required_ammunition_field(character_data)
+        result = self.character_validator.validate_and_correct_character_smart_with_result(repaired, before=before)
+        if not result.success:
+            warning(
+                f"Character validation failed open before storage write: {result.error or 'validation unavailable'}",
+                category="storage_operations",
+            )
+        return result.data
+
     def _find_storage_at_location(self, location_id: str) -> List[Dict[str, Any]]:
         """Find all storage containers at a specific location"""
         storage_data = safe_read_json(self.storage_file)
@@ -310,6 +332,7 @@ class StorageManager:
             
             # Load character data
             character_data = safe_read_json(character_file)
+            character_before = copy.deepcopy(character_data) if character_data else None
             if not character_data:
                 raise Exception(f"Could not load character data for {operation['character']}")
             
@@ -338,6 +361,8 @@ class StorageManager:
                 items_to_store.append((operation["item_name"], operation["quantity"], item_data))
 
             # Equipment changes belong to the character tool, before ownership moves.
+            # (The engine also refuses to place a worn item; this early check keeps
+            # the DM-facing facts contract without touching any file.)
             equipped_items = [
                 {"item_name": item_data["item_name"], "quantity": quantity, "equipped": True}
                 for name, quantity, item_data in items_to_store
@@ -387,33 +412,17 @@ class StorageManager:
             if not storage_container:
                 raise Exception(f"Storage container {storage_id} not found")
                 
-            # Process all items for storage
-            storage_contents = storage_container["contents"]
-            stored_item_names = []
-            
-            for item_name, quantity, item_data in items_to_store:
-                # Remove item from character
-                if not self._remove_item_from_character(character_data, item_name, quantity):
-                    raise Exception(f"Failed to remove {item_name} from character")
-                
-                # Add item to storage
-                # Check if item already exists in storage
-                item_found = False
-                for stored_item in storage_contents:
-                    if stored_item["item_name"] == item_name:
-                        stored_item["quantity"] = stored_item.get("quantity", 1) + quantity
-                        item_found = True
-                        break
-                        
-                if not item_found:
-                    # Add new item to storage - preserve ALL metadata from character equipment
-                    stored_item = item_data.copy()  # Copy complete item object
-                    stored_item["quantity"] = quantity  # Override quantity
-                    # Set equipped to False when storing (items in storage are not equipped)
-                    stored_item["equipped"] = False
-                    storage_contents.append(stored_item)
-                
-                stored_item_names.append(f"{quantity} {item_name}")
+            # The engine moves the stock (core/nql/storage.py): it checks stock,
+            # worn state and location, commits once, and both records below are
+            # rewritten from its custody facts. No quantity is computed here.
+            outcome = nql_storage.transact(character_data, storage_data, storage_container, operation,
+                                           reserved=nql_storage.held_ids_on_disk())
+            if not outcome.ok:
+                raise Exception(outcome.reason)
+            character_data = outcome.character
+            storage_container.clear()
+            storage_container.update(outcome.container)
+            stored_item_names = [f"{quantity} {item_name}" for item_name, quantity in outcome.moved]
                 
             # Update access log
             storage_container["lastAccessed"] = datetime.now().isoformat()
@@ -435,14 +444,14 @@ class StorageManager:
                     "timestamp": datetime.now().isoformat()
                 })
             
+            # Validate the debited sheet in memory (#391): the model validation
+            # runs before either file is touched, so the character and the
+            # container are written back to back instead of ~20 s apart.
+            character_data = self._validate_character_before_write(character_data, before=character_before)
+
             # Save updated character data
             if not safe_write_json(character_file, character_data):
                 raise Exception("Failed to save character data")
-            
-            # Validate and save character data with AI validation
-            validated_character_data, validation_success = self.character_validator.validate_character_file_safe(character_file)
-            if not validation_success:
-                raise Exception("Character validation failed after store operation")
             
             # Save updated storage data
             if not safe_write_json(self.storage_file, storage_data):
@@ -496,6 +505,7 @@ class StorageManager:
             
             # Load data
             character_data = safe_read_json(character_file)
+            character_before = copy.deepcopy(character_data) if character_data else None
             if not character_data:
                 raise Exception(f"Could not load character data for {operation['character']}")
             storage_data = safe_read_json(self.storage_file)
@@ -520,14 +530,14 @@ class StorageManager:
                     # Find item in storage and validate availability
                     stored_item = None
                     for item in storage_container["contents"]:
-                        if item["item_name"] == item_info["item_name"]:
+                        if item.get("item_name") == item_info["item_name"]:
                             stored_item = item
                             break
                             
                     if not stored_item:
                         raise Exception(f"{item_info['item_name']} not found in storage")
                         
-                    available_quantity = stored_item.get("quantity", 1)
+                    available_quantity = nql_storage.stored_quantity(storage_container["contents"], stored_item)
                     if available_quantity < item_info["quantity"]:
                         raise Exception(f"Storage only has {available_quantity} {item_info['item_name']}, requested {item_info['quantity']}")
                         
@@ -536,34 +546,28 @@ class StorageManager:
                 # Single item operation
                 stored_item = None
                 for item in storage_container["contents"]:
-                    if item["item_name"] == operation["item_name"]:
+                    if item.get("item_name") == operation["item_name"]:
                         stored_item = item
                         break
                         
                 if not stored_item:
                     raise Exception(f"{operation['item_name']} not found in storage")
                     
-                available_quantity = stored_item.get("quantity", 1)
+                available_quantity = nql_storage.stored_quantity(storage_container["contents"], stored_item)
                 if available_quantity < operation["quantity"]:
                     raise Exception(f"Storage only has {available_quantity} {operation['item_name']}, requested {operation['quantity']}")
                     
                 items_to_retrieve.append((operation["item_name"], operation["quantity"], stored_item))
             
-            # Process all items for retrieval
-            retrieved_item_names = []
-            
-            for item_name, quantity, stored_item in items_to_retrieve:
-                # Remove item from storage
-                available_quantity = stored_item.get("quantity", 1)
-                if available_quantity == quantity:
-                    storage_container["contents"].remove(stored_item)
-                else:
-                    stored_item["quantity"] = available_quantity - quantity
-                    
-                # Add item to character
-                self._add_item_to_character(character_data, stored_item, quantity)
-                
-                retrieved_item_names.append(f"{quantity} {item_name}")
+            # The engine moves the stock back (core/nql/storage.py); see store_item.
+            outcome = nql_storage.transact(character_data, storage_data, storage_container, operation,
+                                           reserved=nql_storage.held_ids_on_disk())
+            if not outcome.ok:
+                raise Exception(outcome.reason)
+            character_data = outcome.character
+            storage_container.clear()
+            storage_container.update(outcome.container)
+            retrieved_item_names = [f"{quantity} {item_name}" for item_name, quantity in outcome.moved]
             
             # Update access log
             storage_container["lastAccessed"] = datetime.now().isoformat()
@@ -585,14 +589,12 @@ class StorageManager:
                     "timestamp": datetime.now().isoformat()
                 })
             
+            # Validate the credited sheet in memory (#391) before both writes.
+            character_data = self._validate_character_before_write(character_data, before=character_before)
+
             # Save updated character data
             if not safe_write_json(character_file, character_data):
                 raise Exception("Failed to save character data")
-            
-            # Validate and save character data with AI validation
-            validated_character_data, validation_success = self.character_validator.validate_character_file_safe(character_file)
-            if not validation_success:
-                raise Exception("Character validation failed after retrieve operation")
             
             # Save updated storage data
             if not safe_write_json(self.storage_file, storage_data):
@@ -631,6 +633,7 @@ class StorageManager:
         operation_id: str,
     ) -> Dict[str, Any]:
         """Freeze one travel-owned storage mutation before its first write."""
+        operation = _create_with_items_as_store(operation)
         if not self._validate_storage_operation(operation):
             raise ValueError("invalid storage operation")
         action = operation.get("action")
@@ -741,52 +744,24 @@ class StorageManager:
                         "quantity": operation.get("quantity"),
                     }
                 ]
-            moved_names = []
             for item_request in requested:
                 item_name = item_request.get("item_name")
                 quantity = item_request.get("quantity")
                 if not isinstance(item_name, str) or not isinstance(quantity, int) or quantity <= 0:
                     raise ValueError("storage item and quantity must be exact")
-                if action == "store_item":
-                    has_item, available, item_data = self._find_item_in_character(
-                        character_after, item_name, quantity
-                    )
-                    if not has_item or available < quantity:
-                        raise ValueError("character does not own the requested storage quantity")
-                    if not self._remove_item_from_character(character_after, item_name, quantity):
-                        raise RuntimeError("could not stage character inventory removal")
-                    stored = next(
-                        (
-                            item
-                            for item in container["contents"]
-                            if item.get("item_name") == item_name
-                        ),
-                        None,
-                    )
-                    if stored is None:
-                        stored = copy.deepcopy(item_data)
-                        stored["quantity"] = quantity
-                        stored["equipped"] = False
-                        container["contents"].append(stored)
-                    else:
-                        stored["quantity"] = stored.get("quantity", 1) + quantity
-                else:
-                    stored = next(
-                        (
-                            item
-                            for item in container["contents"]
-                            if item.get("item_name") == item_name
-                        ),
-                        None,
-                    )
-                    if stored is None or stored.get("quantity", 1) < quantity:
-                        raise ValueError("storage does not own the requested quantity")
-                    if stored.get("quantity", 1) == quantity:
-                        container["contents"].remove(stored)
-                    else:
-                        stored["quantity"] = stored.get("quantity", 1) - quantity
-                    self._add_item_to_character(character_after, stored, quantity)
-                moved_names.append("%s %s" % (quantity, item_name))
+            # The engine stages the move (core/nql/storage.py): same transaction
+            # as the immediate path, applied to the working copies.
+            outcome = nql_storage.transact(character_after, storage_working, container, operation,
+                                           request_id="storage:%s" % operation_id,
+                                           reserved=nql_storage.held_ids_on_disk())
+            if not outcome.ok:
+                if outcome.worn_items:
+                    raise ValueError("selected items are still equipped")
+                raise ValueError(outcome.reason)
+            character_after = outcome.character
+            container.clear()
+            container.update(outcome.container)
+            moved_names = ["%s %s" % (quantity, item_name) for item_name, quantity in outcome.moved]
 
             event_action = "store_items" if action == "store_item" else "retrieve_items"
             container["lastAccessed"] = timestamp
@@ -808,8 +783,9 @@ class StorageManager:
             )
 
             validator = AICharacterValidator()
-            validation = validator.validate_and_correct_character_with_result(
+            validation = validator.validate_and_correct_character_smart_with_result(
                 character_after,
+                before=character_before,
                 max_attempts=1,
             )
             character_after = validation.data
@@ -928,9 +904,20 @@ def get_storage_manager() -> StorageManager:
     """Get storage manager instance"""
     return StorageManager()
 
+def _create_with_items_as_store(operation: Dict[str, Any]) -> Dict[str, Any]:
+    """A create_storage that names items is a store into a new container
+    (#377): the existing create-then-store path, where the engine moves the
+    stock. A plain create is returned unchanged."""
+    if (isinstance(operation, dict) and operation.get("action") == "create_storage"
+            and (operation.get("items") or operation.get("item_name"))):
+        operation = dict(operation, action="store_item")
+        operation.pop("storage_id", None)
+    return operation
+
 def execute_storage_operation(operation: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a storage operation"""
     manager = get_storage_manager()
+    operation = _create_with_items_as_store(operation)
     
     action = operation.get("action")
     

@@ -19,7 +19,8 @@ vi.mock('socket.io-client', () => ({
 }))
 
 import { emitC } from './socket'
-import { useDialogs, useSession } from '../stores'
+import { useDialogs, useLog, useSession } from '../stores'
+import { useRulesRoll } from '../stores/rulesRoll'
 
 const initialSession = useSession.getState()
 
@@ -29,6 +30,25 @@ describe('socket reconnect synchronization', () => {
     socketMock.connected = false
     useSession.setState(initialSession, true)
     useDialogs.setState({ moduleOperation: null, actionResult: null })
+    useRulesRoll.getState().setPrompt(null)
+  })
+
+  it('never buffers a check answer while disconnected and restores the server prompt', () => {
+    emitC('submit_check_roll', { id: 'old', faces: [15] })
+    expect(socketMock.emit).not.toHaveBeenCalled()
+    socketMock.connected = true
+    socketMock.handlers.get('connect')?.()
+    const prompt = { id: 'current', characterName: 'Hero', label: 'Perception', faces: 1 as const,
+      netMode: 'normal', reason: 'Look', submitted: false }
+    socketMock.handlers.get('ui_state_snapshot')?.({ revision: 20, game_running: true,
+      is_processing: false, status_message: 'Ready', roll_prompt: prompt })
+    expect(useRulesRoll.getState().prompt).toEqual(prompt)
+    socketMock.handlers.get('ui_state_snapshot')?.({ revision: 19, game_running: true,
+      is_processing: false, status_message: 'Ready', roll_prompt: null })
+    expect(useRulesRoll.getState().prompt).toEqual(prompt)
+    socketMock.connected = false
+    socketMock.handlers.get('disconnect')?.()
+    expect(useRulesRoll.getState().prompt).toBeNull()
   })
 
   it('allows Socket.IO to fall back to HTTP polling when WebSocket is unavailable', () => {
@@ -195,5 +215,16 @@ describe('socket reconnect synchronization', () => {
       kind: 'exit',
       message: 'You can now safely close this browser tab.',
     })
+  })
+
+  it('drops the old game\'s lines when setup resets another adventure\'s save (#1285)', () => {
+    useLog.getState().append({ type: 'narration', content: 'The old game goes on.' })
+    expect(useLog.getState().messages).toHaveLength(1)
+
+    socketMock.handlers.get('message_log_cleared')?.({})
+
+    expect(useLog.getState().messages).toEqual([])
+    useLog.getState().append({ type: 'narration', content: 'A new game begins.' })
+    expect(useLog.getState().messages.map((m) => m.content)).toEqual(['A new game begins.'])
   })
 })

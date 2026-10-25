@@ -2,19 +2,19 @@
 # SPDX-License-Identifier: Fair-Source-1.0
 # License: See LICENSE file in the repository root
 
-"""Authoritative context, integrity linting, and fallback combat narration.
+"""Authoritative context and fallback combat narration.
 
 The helpers in this module are deterministic. They never call a model and
-never mutate encounter or character state. Model prose is accepted only after
-it agrees with the compact scene dossier built from committed combat facts.
+never mutate encounter or character state. They build the compact scene
+dossier from committed combat facts; the model's narration is not checked
+against it by keyword (D-KW-4).
 """
 
 from __future__ import annotations
 
-import re
 from copy import deepcopy
 
-from core.managers.combat_state import combatant_presentation_name
+from core.managers.combat_state import combatant_presentation_name, display_status
 
 
 _SHEET_FIELDS = (
@@ -23,7 +23,9 @@ _SHEET_FIELDS = (
     "level",
     "race",
     "hitPoints",
+    "temporaryHitPoints",
     "maxHitPoints",
+    "concentration",
     "armorClass",
     "speed",
     "status",
@@ -47,37 +49,6 @@ _SHEET_FIELDS = (
     "senses",
 )
 
-_INTERNAL_RE = re.compile(
-    r"(?:\bcmb-[a-z0-9-]+\b|\b[A-Za-z0-9_-]+-R\d+-[a-f0-9]{8,}-A\d+\b|"
-    r"\b(?:eventId|stateVersion|pendingDelivery|turnCursor|actorId|combatState)\b)",
-    re.IGNORECASE,
-)
-_DAMAGE_RE = re.compile(r"\b(\d+)\s+(?:points?\s+of\s+)?damage\b", re.IGNORECASE)
-_HEAL_RE = re.compile(
-    r"\b(?:heals?|healed|restores?|regains?)\D{0,24}(\d+)\s+(?:hit points?|hp)\b",
-    re.IGNORECASE,
-)
-_HP_RE = re.compile(
-    r"\b(?:at|to|with|has|leaves?\s+\w+\s+at)\s+(\d+)\s+(?:hit points?|hp)\b",
-    re.IGNORECASE,
-)
-_AC_RE = re.compile(r"\bAC\s*(?:of\s*)?(\d+)\b", re.IGNORECASE)
-_ROUND_RE = re.compile(r"\bround\s+(\d+)\b", re.IGNORECASE)
-_ATTACK_ROLL_RE = re.compile(
-    r"\b(?:attack\s+roll|rolls?)(?:\s+of|\s+is|:)?\s*(\d+)\b",
-    re.IGNORECASE,
-)
-_SLOT_RE = re.compile(
-    r"\b(?:level\s*)?(\d+)(?:st|nd|rd|th)?[- ]level\s+spell\s+slot\b",
-    re.IGNORECASE,
-)
-_AMMUNITION_RE = re.compile(
-    r"\b(?:uses?|used|expends?|expended|spends?|spent|leaving|left(?:\s+with)?)"
-    r"\D{0,24}(\d+)\s+(?:arrows?|bolts?|ammunition|ammo)\b",
-    re.IGNORECASE,
-)
-
-
 def _public_copy(value):
     """Copy complete JSON-like combat data while omitting private keys."""
     if isinstance(value, dict):
@@ -91,6 +62,14 @@ def _public_copy(value):
     if isinstance(value, str):
         return value
     return deepcopy(value)
+
+
+def _narrated_riders(riders):
+    """The riders records as T097 has always seen them: without the engine flag."""
+    if not isinstance(riders, list):
+        return riders
+    return [{key: value for key, value in rider.items() if key != "engine"} if isinstance(rider, dict) else rider
+            for rider in riders]
 
 
 def _combat_sheet(sheet):
@@ -152,6 +131,62 @@ def _action_name(event):
     return "combat action"
 
 
+def _drawn_item(event):
+    """NUM-B2: the weapon drawn after the swing, once the draw landed on the
+    sheet. Owner N1/N2: nothing else of the hands record reaches the narrator."""
+    hands = event.get("hands")
+    draw = hands.get("draw") if isinstance(hands, dict) else None
+    if not isinstance(draw, dict) or draw.get("applied") is not True:
+        return None
+    name = draw.get("item_name")
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def _bonus_fact(event, creatures, presentation=None):
+    """R2: the typed Bonus Action resolved before this event's Action."""
+    bonus = event.get("bonusAction")
+    if not isinstance(bonus, dict):
+        return None
+    if bonus.get("featureName"):
+        fact = {"featureName": bonus["featureName"]}
+    elif isinstance(bonus.get("item"), dict):
+        # #1338: the item Bonus Action (#1333) is keyed by its stored id; name it
+        # from the engine's resource row, never from the sheet or the player's text.
+        row = next((r for r in bonus.get("resources") or []
+                    if isinstance(r, dict) and r.get("kind") == "item"), {})
+        fact = {"item": _public_copy(bonus["item"])}
+        if row.get("name"):
+            fact["itemName"] = row["name"]
+    else:
+        return None
+    if bonus.get("option"):
+        fact["option"] = bonus["option"]
+    if bonus.get("order") == "afterAction":
+        # R3: the Off-hand Attack, taken after the Action (or not, its target down).
+        fact["after"] = "the Action"
+        fact["weapon"] = bonus.get("ability")
+        if bonus.get("notTaken"):
+            fact["notTaken"] = bonus["notTaken"]
+        outcome = bonus.get("outcome") or {}
+        for key in ("hit", "critical"):
+            if type(outcome.get(key)) is bool:
+                fact[key] = outcome[key]
+    targets = []
+    for target in (bonus.get("outcome") or {}).get("targets") or []:
+        before, after = target.get("hpBefore"), target.get("hpAfter")
+        targets.append({
+            "targetName": _display_name(creatures, target.get("combatantId"), "the target", presentation),
+            "hpBefore": before,
+            "hpAfter": after,
+            "hpDelta": after - before if type(before) is int and type(after) is int else None,
+        })
+    if targets:
+        fact["targets"] = [{k: v for k, v in row.items() if v is not None} for row in targets]
+    if bonus.get("resources"):
+        fact["resources"] = _public_copy(bonus["resources"])
+    return fact
+
+
 def _fact_event(event, creatures, presentation=None):
     outcome = event.get("outcome") or {}
     intent = event.get("intent") or {}
@@ -179,7 +214,21 @@ def _fact_event(event, creatures, presentation=None):
             "hpAfter": after,
             "hpDelta": hp_delta,
             "declaredHpDelta": declared_deltas.get(target.get("combatantId")),
-            "statusAfter": target.get("statusAfter"),
+            "tempHpBefore": target.get("tempHpBefore"),
+            "tempHpAfter": target.get("tempHpAfter"),
+            "statusAfter": display_status(
+                creatures.get(target.get("combatantId")) or {}, target.get("statusAfter"),
+                hp=after,
+            ),
+            # CC: the engine's concentration save lines and what ended on a failure
+            "engineChecks": target.get("engineChecks"),
+            "concentrationEnded": target.get("concentrationEnded"),
+            "concentrationEndedEffects": target.get("concentrationEndedEffects"),
+            # MS-b: a hit's rider save (venom): ability, save, dc, saved, damage, conditions
+            # (K1's `engine` flag is bookkeeping, not part of the story.)
+            "riders": _narrated_riders(target.get("riders")),
+            # #669: a class-feature heal clamped to its typed limit (supplied, allowed)
+            "featureHeal": target.get("featureHeal"),
         }
         targets.append({key: value for key, value in row.items() if value is not None})
     fact = {
@@ -197,6 +246,14 @@ def _fact_event(event, creatures, presentation=None):
         "targetAC": outcome.get("targetAC"),
         "resources": _public_copy(event.get("resources") or []),
         "effects": _public_copy(event.get("effects") or []),
+        # MS-b: recharge abilities spent by this action, and the d6 draws made
+        # at the start of the actor's turn (name, value, rechargesOn, recharged)
+        "rechargeSpent": [spent.get("name") for spent in event.get("recharge") or [] if spent.get("name")] or None,
+        "rechargeRolls": _public_copy(event.get("rechargeRolls")) if event.get("rechargeRolls") else None,
+        # NUM-B2: a carried weapon drawn after this swing (item name)
+        "drew": _drawn_item(event),
+        # R2: the Bonus Action taken first (feature, option, its HP changes)
+        "bonusAction": _bonus_fact(event, creatures, presentation),
     }
     return {key: value for key, value in fact.items() if value is not None}
 
@@ -237,8 +294,30 @@ def _spell_references(facts):
     return references
 
 
-def build_scene_dossier(encounter, events, characters=None):
-    """Build the complete compact T097 scene, with exact facts last."""
+def party_scene_time(path="party_tracker.json"):
+    """The hour outside from the party tracker's clock (#1423): the time of day
+    label the game's prompts use and the clock, or None when unreadable."""
+    from utils.encoding_utils import safe_json_load
+    from utils.time_context import get_time_context
+
+    try:
+        tracker = safe_json_load(path)
+    except Exception:
+        # A corrupt tracker never blocks the narration; it goes without the hour.
+        return None
+    world = tracker.get("worldConditions") if isinstance(tracker, dict) else None
+    time_str = world.get("time") if isinstance(world, dict) else None
+    if not isinstance(time_str, str):
+        return None
+    label = get_time_context(time_str)
+    if label == "unknown time":
+        return None
+    return {"timeOfDay": label, "clock": time_str[:5]}
+
+
+def build_scene_dossier(encounter, events, characters=None, scene_time=None):
+    """Build the complete compact T097 scene, with exact facts last.
+    `scene_time` is the hour outside (party_scene_time), when known."""
     encounter = encounter if isinstance(encounter, dict) else {}
     events = [event for event in (events or []) if isinstance(event, dict)]
     characters = characters if isinstance(characters, dict) else {}
@@ -281,10 +360,13 @@ def build_scene_dossier(encounter, events, characters=None):
                 "armorClass": effective.get(
                     "armorClass", creature.get("armorClass")
                 ),
-                "status": (
+                # #1404: shown after the sheet-authority choice; stored unchanged.
+                "status": display_status(
+                    creature,
                     sheet.get("status", creature.get("status"))
                     if sheet_is_state_authority
-                    else creature.get("status")
+                    else creature.get("status"),
+                    encounter=encounter,
                 ),
                 "condition": (
                     sheet.get("condition", creature.get("condition"))
@@ -305,7 +387,7 @@ def build_scene_dossier(encounter, events, characters=None):
                     creatures, actor_id, presentation=presentation
                 ),
                 "initiative": creature.get("initiative"),
-                "status": creature.get("status"),
+                "status": display_status(creature, encounter=encounter),
                 "actedThisRound": actor_id in (state.get("actedThisRound") or []),
             }
         )
@@ -317,6 +399,7 @@ def build_scene_dossier(encounter, events, characters=None):
             for value in (
                 [row.get("name") for row in combatants]
                 + [fact.get("actionName") for fact in facts]
+                + [fact.get("drew") for fact in facts]
                 + [encounter.get("locationName"), encounter.get("location")]
             )
             if isinstance(value, str) and value.strip()
@@ -327,6 +410,7 @@ def build_scene_dossier(encounter, events, characters=None):
         "contextVersion": 1,
         "encounterId": encounter.get("encounterId"),
         "location": encounter.get("locationName") or encounter.get("location"),
+        **({"scene": dict(scene_time)} if isinstance(scene_time, dict) else {}),
         "combatants": combatants,
         "initiative": {
             "round": state.get("round"),
@@ -430,7 +514,7 @@ def update_narration_activity(activity, events):
         resources = [
             {
                 key: resource.get(key)
-                for key in ("owner", "kind", "name", "delta", "before", "after")
+                for key in ("owner", "kind", "name", "delta", "before", "after", "exhausted")
                 if key in resource
             }
             for resource in event.get("resources", []) or []
@@ -468,232 +552,6 @@ def update_narration_activity(activity, events):
     return result
 
 
-def _allowed_values(dossier):
-    facts = ((dossier or {}).get("authoritativeFacts") or {}).get("events") or []
-    values = {
-        "damage": set(),
-        "healing": set(),
-        "hp": set(),
-        "ac": set(),
-        "attackRoll": set(),
-        "slotLevel": set(),
-        "round": set(),
-    }
-    round_number = ((dossier or {}).get("authoritativeFacts") or {}).get("round")
-    if type(round_number) is int:
-        values["round"].add(round_number)
-    committed_slice = (dossier or {}).get("committedSlice") or {}
-    for key in ("roundBefore", "roundAfter"):
-        value = committed_slice.get(key)
-        if type(value) is int:
-            values["round"].add(value)
-    for combatant in (dossier or {}).get("combatants", []) or []:
-        if isinstance(combatant, dict) and type(combatant.get("armorClass")) is int:
-            values["ac"].add(combatant["armorClass"])
-    damage_by_actor = {}
-    healing_by_actor = {}
-    for fact in facts:
-        if not isinstance(fact, dict):
-            continue
-        for key, bucket in (
-            ("damage", "damage"),
-            ("attackRoll", "attackRoll"),
-            ("totalAttack", "attackRoll"),
-            ("targetAC", "ac"),
-        ):
-            value = fact.get(key)
-            if type(value) is int:
-                values[bucket].add(value)
-        applied_damage = 0
-        applied_healing = 0
-        declared_damage = 0
-        declared_healing = 0
-        for target in fact.get("targets", []) or []:
-            if not isinstance(target, dict):
-                continue
-            before, after, delta = (
-                target.get("hpBefore"),
-                target.get("hpAfter"),
-                target.get("hpDelta"),
-            )
-            if type(before) is int:
-                values["hp"].add(before)
-            if type(after) is int:
-                values["hp"].add(after)
-            if type(delta) is int and delta < 0:
-                values["damage"].add(abs(delta))
-                applied_damage += abs(delta)
-            if type(delta) is int and delta > 0:
-                values["healing"].add(delta)
-                applied_healing += delta
-            declared = target.get("declaredHpDelta")
-            if type(declared) is int and declared < 0:
-                values["damage"].add(abs(declared))
-                declared_damage += abs(declared)
-            if type(declared) is int and declared > 0:
-                values["healing"].add(declared)
-                declared_healing += declared
-        for resource in fact.get("resources", []) or []:
-            if not isinstance(resource, dict):
-                continue
-            if resource.get("kind") == "spellSlot":
-                match = re.search(r"(\d+)", str(resource.get("name") or ""))
-                if match:
-                    values["slotLevel"].add(int(match.group(1)))
-        actor_id = fact.get("actorId")
-        event_damage = (
-            fact.get("damage")
-            if type(fact.get("damage")) is int
-            else declared_damage or applied_damage
-        )
-        event_healing = declared_healing or applied_healing
-        if isinstance(actor_id, str) and type(event_damage) is int and event_damage > 0:
-            damage_by_actor[actor_id] = damage_by_actor.get(actor_id, 0) + event_damage
-        if isinstance(actor_id, str) and event_healing > 0:
-            healing_by_actor[actor_id] = healing_by_actor.get(actor_id, 0) + event_healing
-    values["damage"].update(value for value in damage_by_actor.values() if value > 0)
-    values["healing"].update(value for value in healing_by_actor.values() if value > 0)
-    if damage_by_actor:
-        values["damage"].add(sum(damage_by_actor.values()))
-    if healing_by_actor:
-        values["healing"].add(sum(healing_by_actor.values()))
-    return values
-
-
-def lint_combat_narration(narration, dossier):
-    """Return conservative rejecting violations and warning-only findings."""
-    text = str(narration or "").strip()
-    rejects = []
-    warnings = []
-    if not text:
-        return {"reject": ["empty_narration"], "warnings": []}
-    if _INTERNAL_RE.search(text):
-        rejects.append("internal_identifier_leak")
-    mechanical_checks = (
-        _DAMAGE_RE,
-        _HEAL_RE,
-        _HP_RE,
-        _AC_RE,
-        _ROUND_RE,
-        _ATTACK_ROLL_RE,
-        _SLOT_RE,
-        _AMMUNITION_RE,
-    )
-    for pattern in mechanical_checks:
-        if pattern.search(text):
-            rejects.append("mechanical_bookkeeping_leak")
-            break
-    facts = ((dossier or {}).get("authoritativeFacts") or {}).get("events") or []
-    combatants = [
-        row
-        for row in (dossier or {}).get("combatants", []) or []
-        if isinstance(row, dict)
-    ]
-    combatants_by_name = {
-        str(row.get("name") or "").casefold(): row
-        for row in combatants
-        if isinstance(row.get("name"), str)
-    }
-    living_hostiles = [
-        row
-        for row in combatants
-        if row.get("type") == "enemy"
-        and str(row.get("status") or "alive").casefold()
-        not in {"dead", "defeated", "unconscious"}
-        and (
-            type(row.get("currentHitPoints")) is not int
-            or row.get("currentHitPoints") > 0
-        )
-    ]
-    for fact in facts:
-        if not isinstance(fact, dict):
-            continue
-        for target in fact.get("targets", []) or []:
-            if not isinstance(target, dict) or target.get("statusAfter") not in {
-                "dead", "defeated", "unconscious"
-            }:
-                continue
-            target_name = str(target.get("targetName") or "").strip()
-            if not target_name:
-                continue
-            base_name = re.sub(r"[_ ]\d+$", "", target_name).strip()
-            same_kind_remains = any(
-                re.sub(r"[_ ]\d+$", "", str(row.get("name") or "")).casefold()
-                == base_name.casefold()
-                for row in living_hostiles
-            )
-            if same_kind_remains and re.search(
-                r"\b(?:last|final|only\s+remaining)\s+" + re.escape(base_name) + r"\b",
-                text,
-                re.IGNORECASE,
-            ):
-                rejects.append("hostile_count_mismatch")
-
-            target_row = combatants_by_name.get(target_name.casefold()) or {}
-            hp_before = target.get("hpBefore")
-            max_hp = target_row.get("maxHitPoints")
-            if (
-                type(hp_before) is int
-                and type(max_hp) is int
-                and hp_before >= max_hp
-                and (
-                    re.search(
-                        r"\b(?:wounded|injured|bloodied|weakened|battered)\s+"
-                        + re.escape(target_name)
-                        + r"\b",
-                        text,
-                        re.IGNORECASE,
-                    )
-                    or re.search(
-                        r"\b"
-                        + re.escape(base_name)
-                        + r"\b\s*,?\s*(?:though\s+)?(?:already\s+|still\s+)?"
-                        r"(?:wounded|injured|bloodied|weakened|battered)\b",
-                        text,
-                        re.IGNORECASE,
-                    )
-                )
-            ):
-                rejects.append("stale_condition_mismatch")
-
-    for action_name in {
-        str(fact.get("actionName") or "").strip()
-        for fact in facts
-        if isinstance(fact, dict)
-        and isinstance(fact.get("actionName"), str)
-        and str(fact.get("actionName") or "").strip()
-    }:
-        if not re.search(r"\b%s\b" % re.escape(action_name), text, re.IGNORECASE):
-            warnings.append("committed_action_name_missing")
-            break
-    names = [
-        row.get("name")
-        for row in (dossier or {}).get("combatants", [])
-        if isinstance(row, dict) and isinstance(row.get("name"), str)
-    ]
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    for fact in facts:
-        if not isinstance(fact, dict):
-            continue
-        actor = fact.get("actorName")
-        action = fact.get("actionName")
-        if not isinstance(actor, str) or not isinstance(action, str):
-            continue
-        for other in names:
-            if other == actor:
-                continue
-            for sentence in sentences:
-                if re.match(
-                    r"^\s*%s\b" % re.escape(other), sentence, re.IGNORECASE
-                ) and re.search(r"\b%s\b" % re.escape(action), sentence, re.IGNORECASE):
-                    warnings.append("actor_attribution_mismatch")
-                    break
-    return {
-        "reject": list(dict.fromkeys(rejects)),
-        "warnings": list(dict.fromkeys(warnings)),
-    }
-
-
 def render_committed_events(encounter, events):
     """Render a truthful last-resort sentence from committed typed facts."""
     creatures = _creature_map(encounter if isinstance(encounter, dict) else {})
@@ -708,21 +566,17 @@ def render_committed_events(encounter, events):
         target = targets[0] if targets else None
         target_name = target.get("targetName") if isinstance(target, dict) else None
         if fact.get("kind") == "attack":
+            # NUM-B2: a committed draw is part of the swing
+            attacker = "%s draws the %s and" % (actor, fact["drew"]) if fact.get("drew") else actor
             if fact.get("hit"):
-                damage = fact.get("damage")
-                if type(damage) is not int and isinstance(target, dict):
-                    delta = target.get("hpDelta")
-                    damage = abs(delta) if type(delta) is int and delta < 0 else None
                 sentence = "%s attacks %s with %s and hits" % (
-                    actor,
+                    attacker,
                     target_name or "the target",
                     action,
                 )
-                if type(damage) is int:
-                    sentence += " for %d damage" % damage
             else:
                 sentence = "%s attacks %s with %s and misses" % (
-                    actor,
+                    attacker,
                     target_name or "the target",
                     action,
                 )
@@ -730,11 +584,10 @@ def render_committed_events(encounter, events):
             sentence = "%s uses %s" % (actor, action)
             if target_name:
                 sentence += " on %s" % target_name
-        if isinstance(target, dict) and type(target.get("hpAfter")) is int:
-            sentence += "; %s has %d HP remaining" % (
-                target.get("targetName", "the target"),
-                target["hpAfter"],
-            )
+        # #511: no damage or HP numbers in this sentence; a target the
+        # committed facts leave at 0 HP is down.
+        if isinstance(target, dict) and type(target.get("hpAfter")) is int and target["hpAfter"] == 0:
+            sentence += "; %s is down" % target.get("targetName", "the target")
         parts.append(sentence + ".")
     return " ".join(parts) or "The committed combat actions resolve, and the battle continues."
 

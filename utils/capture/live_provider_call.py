@@ -26,7 +26,6 @@ _LOGGER = logging.getLogger(__name__)
 
 _REQUIRED_TASK_IDS = frozenset(
     {
-        "T014",
         "T015",
         "T016",
         "T021",
@@ -38,12 +37,9 @@ _REQUIRED_TASK_IDS = frozenset(
         "T042",
         "T043",
         "T044",
-        "T047",
-        "T048",
         "T049",
         "T065",
         "T067",
-        "T077",
         "T078",
         "T079",
         "T082",
@@ -52,12 +48,9 @@ _REQUIRED_TASK_IDS = frozenset(
         "T096",
         "T097",
         "T114",
-        "T115",
-        "T116",
-        "T117",
-        "T118",
-        "T119",
-        "T120",
+        "T121",
+        "T124",
+        "T126",
     }
 )
 _ADVISORY_TASK_IDS = frozenset(
@@ -66,18 +59,16 @@ _ADVISORY_TASK_IDS = frozenset(
         "T018",
         "T019",
         "T027",
-        "T050",
         "T051",
         "T052",
-        "T053",
         "T054",
         "T063",
+        "T125",
         "T064",
         "T084",
         "T085",
         "T087",
         "T090",
-        "T091",
         "T107",
         "T108",
         "T113",
@@ -90,20 +81,39 @@ _HEARTBEAT_SECONDS = 10.0
 _WATCHDOG_SECONDS = 600.0
 _WIZARD_READ_INACTIVITY_SECONDS = 40.0
 _WIZARD_BACKSTOP_SECONDS = 180.0
-_WIZARD_TASK_IDS = frozenset({"T092", "T093"})
+_WIZARD_TASK_IDS = frozenset({"T092", "T093", "T124"})
+# TCP connect bound per resolved address: the OpenAI SDK default, which the
+# in-process path already uses. A bare float deadline is also the connect
+# timeout for each resolved address, so an endpoint whose first addresses
+# silently drop SYNs (a broken but routed IPv6 path in a VM) cost the OS SYN
+# limit per address (about 134 s on Linux) and the wizard backstop fired
+# every generation at "connecting" (#557). It fires only before any connection exists; the next
+# address is tried, then the existing reissue loop (#193 B2-iii).
+_CONNECT_SECONDS = 5.0
 # Level-up interview and specialist calls answer in 10 to 30 s; a provider
 # that accepts the body and never replies (run 9, 2026-09-14: one call in
 # ~330) is reissued after 2 minutes instead of 10. Still a reissue trigger,
 # never a terminal (#193 B2-iii); owner ruling 2026-09-14.
-_LEVEL_UP_TASK_IDS = frozenset({"T047", "T048", "T115", "T116", "T117", "T118", "T119", "T120"})
+_LEVEL_UP_TASK_IDS = frozenset({"T121"})
 _LEVEL_UP_BACKSTOP_SECONDS = 120.0
 _NO_WATCHDOG_ADVISORY_TASK_IDS = frozenset({"T105", "T112"})
+# Combat-turn tasks, from their call sites (#1271): combat_manager.py
+# T040-T044, combat_agent.py T096/T097, roll_answer.py T126 (read only by the
+# combat orchestrator today).
+_COMBAT_TASK_IDS = frozenset({"T040", "T041", "T042", "T043", "T044", "T096", "T097", "T126"})
 # Tasks whose SUCCESS envelopes are also written to the master log by the
 # parent (their callers do not log_api_call themselves).
-_SUCCESS_LOG_TASK_IDS = frozenset({"T047", "T048", "T105", "T108", "T113",
-                                   "T115", "T116", "T117", "T118", "T119", "T120"})
+_SUCCESS_LOG_TASK_IDS = frozenset({"T105", "T108", "T113", "T121"})
 _MAX_BACKOFF_SECONDS = 8.0
-_PERMANENT_ERROR_SECONDS = 60.0
+# #1342: reissues one logical call may spend. A billed generation reached the
+# provider's working phases (or answered empty or runaway), so the full prompt
+# was charged; a free one failed before acknowledgment and cost no tokens.
+_BILLED_REISSUE_LIMIT = 2
+_FREE_REISSUE_LIMIT = 6
+_BILLED_PHASES = frozenset({"acknowledged", "working", "receiving", "done"})
+# #1342: provider generations one live turn scope may spend, reissues
+# included. Every scope (play turn, combat round, wizard) has the same bound.
+_TURN_GENERATION_CEILING = 24
 # Transport phases the child reports, in the order a healthy generation
 # passes through them (#409 plan section 4). Evidence only: never authority.
 _PHASE_NAMES = (
@@ -121,7 +131,9 @@ _ACK_BACKSTOP_SECONDS = 30.0
 _ACK_ENDPOINTS = frozenset({"responses"})
 # httpcore trace events -> transport phases (the child observes them through
 # the library's own logging trace; nothing is patched).
-_RETRYABLE_STREAM_ERROR_CODES = frozenset({"server_error", "rate_limit_exceeded"})
+# "runaway_output": the stream consumer abandoned a whitespace-only runaway
+# (core/ai/api_client.RUNAWAY_STREAM_CODE); reissued like a provider fault.
+_RETRYABLE_STREAM_ERROR_CODES = frozenset({"server_error", "rate_limit_exceeded", "runaway_output"})
 _HTTPCORE_PHASES = (
     ("connect_tcp.started", "connecting"),
     ("connect_tcp.complete", "connected"),
@@ -187,17 +199,35 @@ class LiveTurnScope:
     controls_open: bool = True
     advisory_scopes: list = field(default_factory=list)
     purpose: str = "turn"
+    provider_generations: int = 0
 
     def next_generation(self):
         with self.lock:
             self.generation += 1
             return self.generation
 
+    def claim_provider_generation(self):
+        """Count one provider generation; False once the turn ceiling is spent (#1342)."""
+        with self.lock:
+            if self.provider_generations >= _TURN_GENERATION_CEILING:
+                return False
+            self.provider_generations += 1
+            return True
+
     def request_supersession(self, kind, operation_id=None):
         with self.lock:
             if not self.controls_open:
                 return {
                     "kind": "turn_complete",
+                    "operation_id": self.operation_id,
+                    "accepted": False,
+                }
+            if str(kind) == "player_acted" and self.phase == "APPLYING":
+                # A startup welcome already being applied (it may be running a
+                # fight) is not discarded by the player's input: the text
+                # stays queued for the next input() (#990).
+                return {
+                    "kind": "welcome_applying",
                     "operation_id": self.operation_id,
                     "accepted": False,
                 }
@@ -257,6 +287,9 @@ class AdvisoryProviderScope:
         with self.lock:
             self.generation += 1
             return self.generation
+
+    def claim_provider_generation(self):
+        return self.parent.claim_provider_generation()
 
     def is_superseded(self):
         return self.sealed.is_set() or self.parent.is_superseded()
@@ -680,6 +713,11 @@ def service_live_input_boundary():
     Deliberately called outside best-effort presentation hooks: supersession
     must unwind the game, not become EOF or a swallowed status failure.
     """
+    from utils.transient_filesystem import raise_if_save_stopped
+
+    # A read-only save stop unwinds the game at the next input, the way
+    # supersession does, even inside combat or a level-up (issue #654).
+    raise_if_save_stopped()
     scope = get_live_turn_scope()
     if scope is None:
         return False
@@ -1030,6 +1068,27 @@ class _GenerationReader(threading.Thread):
             self.finished = True
 
 
+WAIT_PURPOSES = frozenset({
+    "character_setup", "adventure_choice", "starting_location", "level_up", "combat", "turn",
+})
+
+
+def wait_purpose(task_id, override=None):
+    """What a waiting model call is for (#1271): from its task id, unless the
+    caller names a known purpose (#1422 F2: T092 also writes the adventure menu)."""
+    if override in WAIT_PURPOSES:
+        return override
+    if task_id in ("T092", "T124"):
+        return "character_setup"
+    if task_id == "T093":
+        return "starting_location"
+    if task_id in _LEVEL_UP_TASK_IDS:
+        return "level_up"
+    if task_id in _COMBAT_TASK_IDS:
+        return "combat"
+    return "turn"
+
+
 def _emit_working(message):
     from core.managers.status_manager import status_manager
 
@@ -1200,9 +1259,14 @@ def _check_live_authority(scope, authority_check=None):
 
 
 def _interruptible_wait(seconds, scope, message, emit=None, authority_check=None):
+    from utils.transient_filesystem import raise_if_save_stopped
+
     emit = emit if emit is not None else _emit_working
     deadline = time.monotonic() + max(0.0, float(seconds))
     while True:
+        # A wait that retries a save must not outlast a read-only save stop:
+        # no save can succeed until the session ends (issue #654).
+        raise_if_save_stopped()
         try:
             _check_live_authority(scope, authority_check)
         except OSError:
@@ -1235,9 +1299,9 @@ def _delay_for_error(envelope, failure_count):
     retry_after = envelope.get("retry_after")
     if isinstance(retry_after, (int, float)) and retry_after >= 0:
         return float(retry_after)
-    status = envelope.get("http_status")
-    if isinstance(status, int) and 400 <= status < 500:
-        return _PERMANENT_ERROR_SECONDS
+    # A retryable 4xx (408/409, a 429 without a quota code) takes the normal
+    # backoff unless the provider sent Retry-After; a flat 60 s per reissue
+    # hung the turn (#1342). Deterministic 4xx never reach here (#240).
     # Exponent capped at 4: 0.5 * 2**4 already equals _MAX_BACKOFF_SECONDS,
     # and an unbounded count overflows float at 2**1024 (#284 review C3-1).
     base = min(
@@ -1270,6 +1334,78 @@ def _synthesized_envelope(error_class, task_id, request_kwargs, operation_id,
             "operation_id": operation_id,
             "generation": generation,
         },
+    }
+
+
+def _spend_provider(request_provider):
+    """The session cost line's provider kind (#1388): only OpenAI is priced.
+    Legacy runs on the OpenAI API with the same key, so it counts as openai."""
+    if request_provider in ("openai", "legacy"):
+        return "openai"
+    if request_provider == "gemini":
+        return "gemini"
+    return "local"
+
+
+def _is_billed_failure(envelope):
+    """True when a failed generation was likely charged in full (#1342)."""
+    if envelope.get("disposition") == "empty" or envelope.get("error_code") == "runaway_output":
+        return True
+    return envelope.get("last_phase") in _BILLED_PHASES
+
+
+def _record_unused_generation(output, phase_state, frozen_kwargs, operation_id, generation):
+    """Count a generation whose result is not used (#1435): superseded, or
+    dropped on an unreadable authority. A completed answer is a call; one
+    stopped in a billed phase (#1342) is possibly billed. Never raises."""
+    try:
+        from utils.session_spend import record_generation, record_possibly_billed
+
+        envelope = None
+        if output:
+            try:
+                envelope = pickle.loads(output)
+            except (EOFError, pickle.PickleError, ValueError, TypeError):
+                envelope = None
+        envelope = envelope if isinstance(envelope, dict) else {}
+        if (
+            envelope.get("correlation") == {"operation_id": operation_id, "generation": generation}
+            and envelope.get("kind") == "success"
+            and isinstance(envelope.get("content"), str)
+            and bool(envelope["content"].strip())
+            and isinstance(envelope.get("usage"), dict)
+        ):
+            record_generation(
+                frozen_kwargs.get("model"),
+                envelope["usage"],
+                provider=_spend_provider(frozen_kwargs.get("_request_provider")),
+                turn_key=operation_id,
+            )
+            return
+        probe = {
+            "last_phase": (phase_state or {}).get("current"),
+            "disposition": envelope.get("disposition"),
+            "error_code": envelope.get("error_code"),
+        }
+        if _is_billed_failure(probe):
+            record_possibly_billed(turn_key=operation_id)
+    except Exception:
+        pass
+
+
+def _limit_envelope(error_class, task_id, request_kwargs):
+    """Terminal envelope for a #1342 bound; classified non-retryable upstream."""
+    return {
+        "kind": "error",
+        "error_class": error_class,
+        "cause_class": None,
+        "error_code": error_class,
+        "disposition": "deterministic",
+        "provider": str(request_kwargs.get("_request_provider", "") or ""),
+        "model": str(request_kwargs.get("model", "") or ""),
+        "task_id": task_id,
+        "http_status": None,
+        "retry_after": None,
     }
 
 
@@ -1322,6 +1458,7 @@ def call_live_provider(
     scope=None,
     status_emit=None,
     authority_check=None,
+    purpose=None,
 ):
     """Run one frozen selected request under its required/advisory policy.
 
@@ -1333,6 +1470,8 @@ def call_live_provider(
     input-locking status manager.
     ``authority_check`` optionally observes the completion epoch in the parent,
     outside locks. It is never serialized into the provider request.
+    ``purpose`` names what the player is waiting for when the task id alone
+    cannot (#1422 F2); an unknown value falls back to the task id's purpose.
     """
     if task_id not in _LIVE_TASK_IDS:
         raise ValueError("task is outside the reviewed live provider allowlist")
@@ -1356,29 +1495,51 @@ def call_live_provider(
     operation_id = scope.operation_id if scope is not None else str(uuid4())
     frozen_messages = copy.deepcopy(messages)
     frozen_kwargs = copy.deepcopy(request_kwargs)
+    if frozen_kwargs.get("_request_provider") == "lmstudio":
+        import model_config
+
+        # Local/Custom also has request-owned connection settings. Re-reading
+        # them in each fresh child can change the endpoint, credential or model
+        # after dispatch (or on a retry), despite the pinned provider ID. Keep
+        # the resolved settings on the private stdin pipe only, never in capture
+        # records, process arguments or environment variables (#557).
+        frozen_kwargs["_request_local_endpoint"] = copy.deepcopy(
+            model_config.get_local_endpoint()
+        )
     wizard_task = task_id in _WIZARD_TASK_IDS
     # The per-generation transport deadline is the REISSUE TRIGGER, never a
     # terminal (#193 B2-iii). It is set for every provider; each adapter
     # translates it (OpenAI-compatible: request option with SDK retries
     # zeroed; Gemini: http_options timeout). The task-level exclusion for
-    # plain-advisory T105/T112 is unchanged (D-VS-3).
+    # plain-advisory T105/T112 is unchanged (D-VS-3). Every deadline carries
+    # the bounded connect (#557); Gemini reads only its read/total value.
+    import httpx
+
     level_up_task = task_id in _LEVEL_UP_TASK_IDS
     if level_up_task:
-        frozen_kwargs["timeout"] = _LEVEL_UP_BACKSTOP_SECONDS
+        frozen_kwargs["timeout"] = httpx.Timeout(
+            _LEVEL_UP_BACKSTOP_SECONDS, connect=_CONNECT_SECONDS
+        )
     elif completion_required:
-        frozen_kwargs["timeout"] = _WATCHDOG_SECONDS
+        frozen_kwargs["timeout"] = httpx.Timeout(
+            _WATCHDOG_SECONDS, connect=_CONNECT_SECONDS
+        )
     elif wizard_task and frozen_kwargs.get("_request_provider") in (
         "openai", "opencodego"
     ):
-        import httpx
-
         frozen_kwargs["timeout"] = httpx.Timeout(
             _WATCHDOG_SECONDS,
             read=_WIZARD_READ_INACTIVITY_SECONDS,
+            connect=_CONNECT_SECONDS,
         )
     elif task_id not in _NO_WATCHDOG_ADVISORY_TASK_IDS:
-        frozen_kwargs["timeout"] = _WATCHDOG_SECONDS
+        frozen_kwargs["timeout"] = httpx.Timeout(
+            _WATCHDOG_SECONDS, connect=_CONNECT_SECONDS
+        )
     failure_count = 0
+    runaway_trips = 0
+    billed_reissues = 0
+    free_reissues = 0
     logical_started = time.monotonic()
     notices_shown = set()
     player_turn = scope is not None and scope is get_live_turn_scope()
@@ -1423,19 +1584,82 @@ def call_live_provider(
 
     def wizard_heartbeat():
         elapsed = max(1, int(time.monotonic() - logical_started))
+        if purpose == "adventure_choice":
+            return "Still preparing your adventure choices (%d seconds elapsed)..." % elapsed
         return "Still working on character setup (%d seconds elapsed)..." % elapsed
+
+    # #1271: the input-locking channel also carries a typed record of this
+    # call. Caller-owned sinks (the welcome channel, the T105 batch) do not.
+    publish_wait = emit is _emit_working
+    purpose = wait_purpose(task_id, purpose)
+
+    def wait_record(retry_until=None):
+        reader = current_reader["reader"]
+        state = reader.snapshot() if reader is not None else None
+        generation_started = current_reader["started"]
+        last = state.get("last_progress") if state else None
+        return {
+            "purpose": purpose,
+            "taskId": task_id,
+            "provider": frozen_kwargs.get("_request_provider"),
+            "providerName": provider_name,
+            # The attempt in progress, or during a retry wait the next one.
+            "attempt": failure_count + 1,
+            "maxAttempts": None,
+            "startedAt": logical_started,
+            "phase": state.get("current") if state else None,
+            "lastActivityAt": (generation_started + float(last)
+                               if last is not None and generation_started is not None else None),
+            "retryUntil": retry_until,
+        }
+
+    def emit_status(message, retry_until=None):
+        if not publish_wait:
+            _safe_emit(emit, message)
+            return
+        from core.managers.status_manager import status_manager
+
+        record = wait_record(retry_until)
+        _safe_emit(lambda text: status_manager.update_status(text, True, wait=record), message)
+
+    def retry_wait(seconds, message):
+        retry_until = time.monotonic() + max(0.0, float(seconds))
+        _interruptible_wait(
+            seconds, scope, message,
+            lambda text: emit_status(text, retry_until), authority_check,
+        )
+
+    if publish_wait:
+        # Elapsed time from 0 s, without a new text line (headless unchanged).
+        try:
+            from core.managers.status_manager import status_manager
+
+            status_manager.publish_wait(wait_record())
+        except Exception:
+            pass
 
     while True:
         try:
             _check_live_authority(scope, authority_check)
         except OSError:
             failure_count += 1
-            _interruptible_wait(
-                _delay_for_error({}, failure_count), scope,
-                "Still working; checking the current adventure...", emit,
-                authority_check,
+            retry_wait(
+                _delay_for_error({}, failure_count),
+                "Still working; checking the current adventure...",
             )
             continue
+        claim = getattr(scope, "claim_provider_generation", None)
+        if claim is not None and not claim():
+            # #1342: the turn spent its provider generations. Nothing is sent;
+            # the caller's completed-refusal path ends the turn with one line.
+            _LOGGER.warning(
+                "LIVE_PROVIDER_TURN_CEILING task=%s generations=%d operation=%s",
+                task_id, _TURN_GENERATION_CEILING, operation_id,
+            )
+            raise LiveProviderCompletedError(
+                task_id,
+                _limit_envelope("turn_call_ceiling", task_id, frozen_kwargs),
+            )
         generation = (
             scope.next_generation() if scope is not None else failure_count + 1
         )
@@ -1477,14 +1701,11 @@ def call_live_provider(
                     task_id, {"error_class": "process_setup_unavailable"}
                 )
             failure_count += 1
-            _interruptible_wait(
+            retry_wait(
                 _delay_for_error({}, failure_count),
-                scope,
                 wizard_heartbeat if wizard_task else (
                     "Still working; preparing a fresh provider connection..."
                 ),
-                emit,
-                authority_check,
             )
             continue
 
@@ -1532,7 +1753,8 @@ def call_live_provider(
         current_reader["started"] = started
         next_heartbeat = started + _HEARTBEAT_SECONDS
         envelope = None
-        superseded = False
+        superseded_error = None
+        spend_recorded = False
         output = None
         backstop_exhausted = False
         ack_backstop_exhausted = False
@@ -1541,8 +1763,8 @@ def call_live_provider(
             while True:
                 try:
                     _check_live_authority(scope, authority_check)
-                except LiveProviderSuperseded:
-                    superseded = True
+                except LiveProviderSuperseded as exc:
+                    superseded_error = exc
                     break
                 except OSError:
                     authority_unavailable = True
@@ -1580,8 +1802,7 @@ def call_live_provider(
                     break
                 time.sleep(0.25)
                 if time.monotonic() >= next_heartbeat:
-                    _safe_emit(
-                        emit,
+                    emit_status(
                         wizard_heartbeat() if wizard_task else (
                             turn_heartbeat(generation)
                         ),
@@ -1599,12 +1820,20 @@ def call_live_provider(
                 _close_process_streams(process)
             writer.join()
         phase_state = reader.snapshot()
-        if superseded:
-            raise LiveProviderSuperseded("live player turn superseded")
-        try:
-            _check_live_authority(scope, authority_check)
-        except OSError:
-            authority_unavailable = True
+        if superseded_error is None:
+            try:
+                _check_live_authority(scope, authority_check)
+            except LiveProviderSuperseded as exc:
+                superseded_error = exc
+            except OSError:
+                authority_unavailable = True
+        if superseded_error is not None:
+            # #1435: an answer that finished, or was stopped part-way, still costs.
+            _record_unused_generation(output, phase_state, frozen_kwargs, operation_id, generation)
+            raise superseded_error
+        if output and authority_unavailable:
+            _record_unused_generation(output, phase_state, frozen_kwargs, operation_id, generation)
+            spend_recorded = True
         if output and not authority_unavailable:
             try:
                 envelope = pickle.loads(output)
@@ -1667,20 +1896,67 @@ def call_live_provider(
             and correlation_accepted
         ):
             response = _reconstruct_response(envelope)
+            # #1388: the session cost line, priced by the requested catalog id.
+            # Counted before the authority check: a dropped answer was still
+            # billed (#1435).
+            from utils.session_spend import record_generation
+
+            record_generation(
+                frozen_kwargs.get("model"),
+                envelope.get("usage"),
+                provider=_spend_provider(frozen_kwargs.get("_request_provider")),
+                turn_key=operation_id,
+            )
             try:
                 _check_live_authority(scope, authority_check)
             except OSError:
                 failure_count += 1
-                _interruptible_wait(
-                    _delay_for_error({}, failure_count), scope,
-                    "Still working; checking the current adventure...", emit,
-                    authority_check,
+                retry_wait(
+                    _delay_for_error({}, failure_count),
+                    "Still working; checking the current adventure...",
                 )
                 continue
             return response
 
         failure_count += 1
         envelope = envelope if isinstance(envelope, dict) else {}
+        if envelope.get("error_code") == "runaway_output":
+            # The stream consumer abandoned the answer (whitespace runaway or
+            # past the callsite's output ceiling) and the identical request
+            # is reissued. A ceiling that trips twice on the same request is
+            # judging a real answer, not a runaway: lift it for the rest of
+            # this logical call so the turn cannot loop (fail-forward). The
+            # whitespace guard is unconditional and stays.
+            runaway_trips += 1
+            if runaway_trips >= 2 and "_output_ceiling_chars" in frozen_kwargs:
+                _LOGGER.warning(
+                    "LIVE_PROVIDER_CEILING_LIFTED task=%s ceiling=%s trips=%d",
+                    task_id, frozen_kwargs.get("_output_ceiling_chars"), runaway_trips,
+                )
+                frozen_kwargs.pop("_output_ceiling_chars", None)
+        if envelope.get("disposition") in {"retryable_http", "retryable_transport", "empty"}:
+            # #1342: bound the reissues of one logical call by billing class.
+            if _is_billed_failure(envelope):
+                billed_reissues += 1
+                from utils.session_spend import record_possibly_billed
+
+                if not spend_recorded:  # already counted as an unused generation
+                    record_possibly_billed(turn_key=operation_id)
+                exhausted = billed_reissues > _BILLED_REISSUE_LIMIT
+            else:
+                free_reissues += 1
+                exhausted = free_reissues > _FREE_REISSUE_LIMIT
+            if exhausted:
+                _LOGGER.warning(
+                    "LIVE_PROVIDER_REISSUE_LIMIT task=%s billed=%d free=%d last=%s",
+                    task_id, billed_reissues, free_reissues,
+                    envelope.get("error_class"),
+                )
+                limit = _limit_envelope("reissue_limit", task_id, frozen_kwargs)
+                limit["http_status"] = envelope.get("http_status")
+                if policy == "advisory" and not completion_required:
+                    raise LiveProviderUnavailable(task_id, limit)
+                raise LiveProviderCompletedError(task_id, limit)
         if (
             policy == "advisory"
             and completion_required
@@ -1695,13 +1971,7 @@ def call_live_provider(
                 envelope.get("error_class", "transport_unavailable"),
                 envelope.get("http_status"),
             )
-            _interruptible_wait(
-                _delay_for_error(envelope, failure_count),
-                scope,
-                "",
-                emit,
-                authority_check,
-            )
+            retry_wait(_delay_for_error(envelope, failure_count), "")
             continue
         if policy == "advisory":
             raise LiveProviderUnavailable(task_id, envelope)
@@ -1750,15 +2020,12 @@ def call_live_provider(
             notify_player_once(
                 "class:%s" % envelope.get("disposition"), reason
             )
-            _safe_emit(emit, "%s %s" % (turn_heartbeat(generation), reason))
-        _interruptible_wait(
+            emit_status("%s %s" % (turn_heartbeat(generation), reason))
+        retry_wait(
             _delay_for_error(envelope, failure_count),
-            scope,
             wizard_heartbeat if wizard_task else (
                 lambda: turn_heartbeat(generation)
             ),
-            emit,
-            authority_check,
         )
 
 

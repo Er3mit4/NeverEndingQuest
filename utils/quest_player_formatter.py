@@ -122,6 +122,14 @@ def _capture_plot_source(module_dir, plot_path):
         raise _QuestSourceDriftError("Plot source is not valid UTF-8 JSON") from exc
     if not isinstance(payload, dict):
         raise _QuestSourceDriftError("Plot source is not a JSON object")
+    # QS: statuses, impacts and requirements come from the rules engine's
+    # quest record (utils/quest_record.module_plot); the file holds the
+    # authored text. The digest is of what the formatter sees, so the
+    # journal tracks the engine's record, not the file's bytes.
+    from utils import quest_record
+    engine_payload = quest_record.module_plot(os.path.basename(canonical_module))
+    if isinstance(engine_payload, dict):
+        payload = engine_payload
     return {
         "module_path": canonical_module,
         "module_real": module_real,
@@ -129,7 +137,7 @@ def _capture_plot_source(module_dir, plot_path):
         "plot_path": canonical_plot,
         "plot_real": plot_real,
         "plot_identity": file_identity,
-        "digest": hashlib.sha256(raw).hexdigest(),
+        "digest": quest_record.plot_digest(payload),
         "payload": payload,
     }
 
@@ -171,8 +179,10 @@ CRITICAL RULES:
 FORMATTING GUIDELINES:
 - Main quests: Clear objective + atmospheric context
 - Side quests: Brief, intriguing hooks
-- Completed quests: Past tense summary of what was accomplished
-- In-progress quests: Present tense, current situation
+- Each quest may carry a "log": the rules engine's record of what actually happened, in order (kind: started / note / completed / failed / reopened; text; for a completion, "ahead" names the quests the party skipped and "reason" says how). Summarize ONLY what the log says happened. The description is the goal the quest was given, not what the party did; never present its objectives as achievements.
+- Completed quests: past tense, what the log says was done; when the log entry names skipped quests ("ahead"), say the party went another way and what it skipped
+- Failed quests: past tense, how the log says it was lost
+- In-progress quests: present tense, the current situation from the newest log text, then what remains of the goal
 
 OUTPUT FORMAT:
 Return ONLY a JSON object with quest IDs as keys and reformatted descriptions as values.
@@ -180,6 +190,20 @@ Do not include any markdown formatting or code blocks.
 
 Example input: "The party arrives at Marrow's Rest Village (MRV001), shrouded in dense mist. This sets the stage for the adventure."
 Example output: {"description": "You find yourself in the mist-shrouded village of Marrow's Rest, where an unsettling quiet hangs in the air."}"""
+
+
+def _log_projection(record):
+    """The engine's log entries of one quest, as T090 sees them."""
+    out = []
+    for entry in record.get("log") or []:
+        if not isinstance(entry, dict):
+            continue
+        item = {"kind": sanitize_text(str(entry.get("kind") or "")), "text": sanitize_text(str(entry.get("text") or ""))}
+        if entry.get("ahead"):
+            item["ahead"] = [str(x) for x in entry["ahead"]]
+            item["reason"] = sanitize_text(str(entry.get("reason") or ""))
+        out.append(item)
+    return out
 
 
 def _quest_source_projection(plot_data):
@@ -190,10 +214,16 @@ def _quest_source_projection(plot_data):
             key: sanitize_text(plot_point.get(key, ""))
             for key in ("id", "title", "description", "status", "plotImpact")
         }
+        item["log"] = _log_projection(plot_point)
+        item["bypassed"] = bool(plot_point.get("bypassed"))
         item["sideQuests"] = [
             {
-                key: sanitize_text(side_quest.get(key, ""))
-                for key in ("id", "title", "description", "status", "plotImpact")
+                **{
+                    key: sanitize_text(side_quest.get(key, ""))
+                    for key in ("id", "title", "description", "status", "plotImpact")
+                },
+                "log": _log_projection(side_quest),
+                "bypassed": bool(side_quest.get("bypassed")),
             }
             for side_quest in plot_point.get("sideQuests", [])
             if isinstance(side_quest, dict)
@@ -219,7 +249,8 @@ def format_quest_batch(quests_to_format):
             quest_input[quest_id] = {
                 'title': quest_data.get('title', ''),
                 'description': quest_data.get('description', ''),
-                'status': quest_data.get('status', 'not started')
+                'status': quest_data.get('status', 'not started'),
+                'log': _log_projection(quest_data),
             }
         
         user_prompt = f"Reformat these quest descriptions into player-friendly journal entries:\n\n{json.dumps(quest_input, indent=2)}"
@@ -550,7 +581,8 @@ def apply_staged_player_quests(receipt):
         if not acquired:
             raise RuntimeError("module refresh is busy during T090 commit")
         with _quest_file_lock(receipt["target_path"]):
-            plot = safe_read_json(receipt["plot_path"])
+            from utils import quest_record
+            plot = quest_record.module_plot(receipt["module"])
             if _quest_source_projection(plot or {}) != receipt["source_plot"]:
                 return "blocked_conflict"
             exists = os.path.exists(receipt["target_path"])

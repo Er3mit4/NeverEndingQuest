@@ -15,7 +15,9 @@ module_progress_queue = queue.Queue()
 # Reentrant because captured diagnostic output may flush a pending DM message.
 message_cache_lock = threading.RLock()
 
-# Player-facing action failures use one static message. Internal/provider
+# Player-facing action failures use curated messages: this generic line, the
+# module-recovery line below, or an account-refusal line chosen by category
+# (utils/provider_errors.account_refusal_message, #432). Raw internal/provider
 # details stay in server logs and are never promoted into game output.
 SAFE_ACTION_FAILURE_MESSAGE = (
     "That action could not be completed safely. No further actions from "
@@ -65,7 +67,8 @@ def emit_player_output(message, *, commit_guard=None):
     if sink is None:
         return False
     try:
-        # ``False`` means the sink could not durably accept the message. None
+        # ``False`` means the sink did not deliver the message; True means it
+        # was shown (and cached when the frontend could record it, #710). None
         # remains a successful legacy sink result; modern sinks return True.
         if commit_guard is None:
             return sink(payload) is not False
@@ -76,3 +79,25 @@ def emit_player_output(message, *, commit_guard=None):
         return False
 
 print("[SHARED STATE] Module progress queue initialized")
+
+
+# #1285: how the active frontend clears its message log when setup resets
+# another adventure's save. Only the web registers one.
+_message_log_reset_listener = None
+
+
+def set_message_log_reset_listener(listener):
+    global _message_log_reset_listener
+    _message_log_reset_listener = listener
+
+
+def message_log_reset():
+    """Best-effort, as player output is: a failed listener is never fatal."""
+    listener = _message_log_reset_listener
+    if listener is None:
+        return False
+    try:
+        listener()
+    except Exception:
+        return False
+    return True

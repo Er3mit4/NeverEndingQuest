@@ -202,15 +202,91 @@ def is_turn_eligible(creature):
     return creature.get("effectIncapacitated") is not True
 
 
+def has_left_fight(creature):
+    """Return whether a party member left the fight on their feet (#466).
+
+    A ``flee`` or ``yield`` intent marks its actor ``defeated`` without
+    touching hit points. For a party member that value with hit points above
+    zero can only mean "out of the fight": attacks never produce it (a party
+    member at zero is ``unconscious``, D-242-1). Decided from the roster
+    values, never from a name or entity type.
+    """
+    if not isinstance(creature, dict) or not is_party_member(creature):
+        return False
+    if normalize_status(creature.get("status")) != "defeated":
+        return False
+    hit_points = creature.get("currentHitPoints")
+    return not isinstance(hit_points, (int, float)) or hit_points > 0
+
+
+LEFT_FIGHT_DISPLAY = "left the fight"
+
+
+_UNSET = object()
+PARTICIPATION_DISPLAY = {
+    "observer": "watching, not fighting",
+    "departed": "left the scene",
+    "hidden": "not in the fight",
+    "unaware": "not in the fight",
+}
+
+
+def _hp_display(creature, hp):
+    if isinstance(hp, bool) or not isinstance(hp, (int, float)):
+        return "unknown"
+    if hp > 0:
+        return ACTIVE_STATUS
+    return "unconscious" if is_party_member(creature) else "down"
+
+
+def display_status(creature, status=_UNSET, *, hp=_UNSET, encounter=None):
+    """The status a model is shown for ``creature`` (#1404), never empty.
+
+    A party member who left the fight on their feet (flee or yield) is
+    stored ``defeated``, the marker has_left_fight reads; shown verbatim, a
+    model reads it as a defeat. Such a member is shown "left the fight".
+    ``status`` is the value the caller chose (a sheet's status, an event's
+    statusAfter); it is replaced only when it is that same ``defeated``
+    marker. Omitted, the creature's stored status is read. The stored status
+    never changes.
+
+    A missing value (None, empty, not a string) is shown from typed fields.
+    An event caller passes ``hp`` (the target's hpAfter): only that HP is
+    read, never the creature's current state, so an earlier event does not
+    borrow a later status. Otherwise: left the fight, then the creature's
+    sceneFacts participation in ``encounter``, then its current HP. A party
+    member at 0 HP is unconscious (D-242-1), anyone else down.
+    """
+    value = creature.get("status") if status is _UNSET and isinstance(creature, dict) else status
+    if isinstance(value, str) and value.strip():
+        if normalize_status(value) == "defeated" and has_left_fight(creature):
+            return LEFT_FIGHT_DISPLAY
+        return value
+    if hp is not _UNSET:
+        return _hp_display(creature, hp)
+    if has_left_fight(creature):
+        return LEFT_FIGHT_DISPLAY
+    combatant_id = creature.get("combatantId") if isinstance(creature, dict) else None
+    for row in (((encounter or {}).get("sceneFacts") or {}).get("participants") or []):
+        if isinstance(row, dict) and combatant_id and row.get("combatantId") == combatant_id:
+            if row.get("participation") in PARTICIPATION_DISPLAY:
+                return PARTICIPATION_DISPLAY[row["participation"]]
+            break
+    return _hp_display(creature, (creature or {}).get("currentHitPoints") if isinstance(creature, dict) else None)
+
+
 def is_down(creature):
     """Return whether an encounter creature is down (D-242 house rule).
 
-    Exactly the complement of ``is_combatant_targetable`` so the boundary that
-    speaks to a downed human and the windows that skip that human can never
-    disagree. Rescuability is not part of this value: the down-scene rules
-    text renders each member's status verbatim.
+    The complement of ``is_combatant_targetable`` so the boundary that speaks
+    to a downed human and the windows that skip that human can never
+    disagree, except that a party member who left the fight on their feet
+    (``has_left_fight``) is not down. Rescuability is not part of this value:
+    the down-scene rules text renders each member's status verbatim.
     """
-    return isinstance(creature, dict) and not is_combatant_targetable(creature)
+    if not isinstance(creature, dict) or is_combatant_targetable(creature):
+        return False
+    return not has_left_fight(creature)
 
 
 def sheet_is_down(sheet):
@@ -292,13 +368,55 @@ def resolve_creature_controller(creature, combat_state=None):
     return "actor_agent"
 
 
-def all_hostiles_resolved(encounter):
+def victory_hostiles(encounter):
+    """Return the hostiles the victory rule counts.
+
+    A typed encounter commits which participants may act in
+    ``sceneFacts.participants`` (``initiativeEligible``). A hostile outside
+    that membership (observer, hidden, unaware, departed) never receives a
+    turn, so play can never defeat it; counting it would leave the fight
+    unable to end (#446). Legacy and pre-typed encounters keep counting
+    every hostile, byte-identical to the previous rule.
+    """
     hostiles = [c for c in encounter.get("creatures", []) if is_hostile(c)]
+    if combat_provenance(encounter) != "typed":
+        return hostiles
+    eligible = initiative_eligible_ids(encounter)
+    return [c for c in hostiles if c.get("combatantId") in eligible]
+
+
+def all_hostiles_resolved(encounter):
+    hostiles = victory_hostiles(encounter)
     return bool(hostiles) and all(
         normalize_status(c.get("status")) in RESOLVED_HOSTILE_STATUSES
         or (isinstance(c.get("currentHitPoints"), (int, float)) and c["currentHitPoints"] <= 0)
         for c in hostiles
     )
+
+
+def party_withdrawn(encounter):
+    """Return whether the fight ended because the party left it (#466).
+
+    True when at least one party member left the fight on their feet and no
+    party member can still act. The remaining hostiles are untouched: the
+    encounter completes as a withdrawal, not a victory or a defeat. Only the
+    committed initiative membership counts (#1354).
+    """
+    members = initiative_eligible_ids(encounter)
+    party = [
+        creature
+        for creature in encounter.get("creatures", [])
+        if is_party_member(creature) and creature.get("combatantId") in members
+    ]
+    if not any(has_left_fight(creature) for creature in party):
+        return False
+    return not any(is_combatant_targetable(creature) for creature in party)
+
+
+def combat_resolved(encounter):
+    """Return whether the fight is over: every actable hostile is resolved,
+    or the party has withdrawn (#446, #466)."""
+    return all_hostiles_resolved(encounter) or party_withdrawn(encounter)
 
 
 def player_control_unavailable(encounter):
@@ -342,11 +460,20 @@ def player_control_unavailable(encounter):
 
 
 def all_party_resolved(encounter):
-    """Return whether every player/NPC combatant is physically down."""
+    """Return whether every player/NPC combatant is physically down.
+
+    A party member who left the fight on their feet (#466) is neither down
+    nor still fighting, so it is left out of the count. On a typed encounter
+    only the committed initiative membership counts (#1354): an observer
+    standing beside a downed solo player is not a standing ally.
+    """
+    members = initiative_eligible_ids(encounter)
     party = [
         creature
         for creature in encounter.get("creatures", [])
         if is_party_member(creature)
+        and creature.get("combatantId") in members
+        and not has_left_fight(creature)
     ]
     return bool(party) and all(
         normalize_status(creature.get("status")) != ACTIVE_STATUS
@@ -436,6 +563,95 @@ def canonical_initiative_order(encounter):
     return [creature["combatantId"] for creature in ordered]
 
 
+def bystanders_attacked(encounter, event):
+    """#1415: the present observers a human actor's event attacks, in order.
+
+    An observer is a typed participant with participation "observer" and
+    initiativeEligible false. Attacked means the event's intent is an
+    ``attack`` naming it as targetId, or an outcome target row lowers its HP.
+    Only typed fields are read; a non-typed encounter has no observers.
+    """
+    if combat_provenance(encounter) != "typed" or not isinstance(event, dict):
+        return []
+    scene = encounter.get("sceneFacts") or {}
+    observers = {
+        participant.get("combatantId")
+        for participant in scene.get("participants", []) or []
+        if isinstance(participant, dict)
+        and participant.get("participation") == "observer"
+        and participant.get("initiativeEligible") is not True
+        and combatant_by_id(encounter, participant.get("combatantId")) is not None
+    }
+    named = []
+    intent = event.get("intent") if isinstance(event.get("intent"), dict) else {}
+    if intent.get("action") == "attack" and intent.get("targetId"):
+        named.append(intent.get("targetId"))
+    for target in (event.get("outcome") or {}).get("targets", []) or []:
+        if not isinstance(target, dict):
+            continue
+        before, after = target.get("hpBefore"), target.get("hpAfter")
+        if type(before) is int and type(after) is int and after < before:
+            named.append(target.get("combatantId"))
+    result = []
+    for combatant_id in named:
+        if combatant_id in observers and combatant_id not in result:
+            result.append(combatant_id)
+    return result
+
+
+def join_as_hostile(encounter, combatant_id, by=None):
+    """#1415 (D-2026-10-24-BYSTANDER): an observer the player attacked joins
+    the fight as a hostile participant. Its participant row becomes active and
+    initiative-eligible, its faction hostile; it is inserted into the
+    initiative order at its initiative and counted as having acted this
+    round, so it first acts next round. The row keeps ``joinedHostile``
+    ({by, round}): the fight's end reads it, the turn record does not last.
+    Idempotent: a creature already eligible is left as it is. Returns
+    whether anything changed."""
+    if combat_provenance(encounter) != "typed":
+        return False
+    creature = combatant_by_id(encounter, combatant_id)
+    scene = encounter.get("sceneFacts") or {}
+    row = next(
+        (
+            participant
+            for participant in scene.get("participants", []) or []
+            if isinstance(participant, dict)
+            and participant.get("combatantId") == combatant_id
+        ),
+        None,
+    )
+    if creature is None or row is None or row.get("initiativeEligible") is True:
+        return False
+    row["participation"] = "active"
+    row["initiativeEligible"] = True
+    creature["faction"] = "hostile"
+    state = encounter.setdefault("combatState", {})
+    row["joinedHostile"] = {"by": by, "round": state.get("round")}
+
+    def _key(entry):
+        return (
+            -int(entry.get("initiative", 0) or 0),
+            -int(entry.get("initiativeTieBreaker", 0) or 0),
+            entry.get("combatantId") or "",
+        )
+
+    order = [cid for cid in state.get("initiativeOrder") or [] if cid != combatant_id]
+    position = len(order)
+    for index, other_id in enumerate(order):
+        other = combatant_by_id(encounter, other_id) or {}
+        if _key(creature) < _key(other):
+            position = index
+            break
+    order.insert(position, combatant_id)
+    state["initiativeOrder"] = order
+    acted = list(state.get("actedThisRound") or [])
+    if combatant_id not in acted:
+        acted.append(combatant_id)
+    state["actedThisRound"] = acted
+    return True
+
+
 def initiative_eligible_ids(encounter):
     """Return the committed initiative membership for this provenance route."""
     creature_ids = {
@@ -453,22 +669,46 @@ def initiative_eligible_ids(encounter):
     }
 
 
-def initiative_ui_projection(encounter):
+def _projected_member(creature, include_downed_party):
+    """Return whether a creature belongs in the UI projection.
+
+    Living combatants always do. With ``include_downed_party`` a downed party
+    member stays too (#282): the player's own row at 0 HP is what tells them
+    they are down rather than out of the fight. Targeting and turn order are
+    unaffected; the projection is display-only.
+    """
+    if not isinstance(creature, dict):
+        return False
+    if is_combatant_targetable(creature):
+        return True
+    return include_downed_party and is_party_member(creature) and is_down(creature)
+
+
+def _projected_copy(creature):
+    projected = deepcopy(creature)
+    if not is_combatant_targetable(creature):
+        projected["downed"] = True
+    return projected
+
+
+def initiative_ui_projection(encounter, include_downed_party=False):
     """Project initiative order and typed input ownership for UI consumers.
 
     Legacy encounters retain the existing living-roster/raw-initiative shape.
     Typed encounters are projected strictly from the committed stable ledger;
     observers never appear merely because they are alive, and source ``type``
-    never decides who owns the current input window.
+    never decides who owns the current input window. ``include_downed_party``
+    keeps downed party members in place, marked ``downed`` (the initiative
+    bar only; NPC access and scene context keep the living roster).
     """
     creatures = [
         creature
         for creature in encounter.get("creatures", [])
-        if isinstance(creature, dict) and is_combatant_targetable(creature)
+        if _projected_member(creature, include_downed_party)
     ]
     if combat_provenance(encounter) != "typed":
         return [
-            deepcopy(creature)
+            _projected_copy(creature)
             for creature in sorted(
                 creatures,
                 key=lambda creature: creature.get("initiative", 0),
@@ -512,7 +752,7 @@ def initiative_ui_projection(encounter):
 
     projection = []
     for combatant_id in committed_order:
-        creature = deepcopy(by_id[combatant_id])
+        creature = _projected_copy(by_id[combatant_id])
         creature["controller"] = resolve_creature_controller(creature, state)
         creature["isCurrent"] = combatant_id == current_id
         projection.append(creature)
@@ -936,7 +1176,119 @@ def stage_turn_events(encounter, turn_id, events):
         )
     pending["events"] = normalized
     pending["stage"] = "events_staged"
+    # Item 3: the code-issued roll phase ends with the staged events (they
+    # journal its faces); a later return to intent goes to the model's path.
+    pending.pop("weaponAttack", None)
     return pending
+
+
+ROUND_EVENTS_KEEP_ROUNDS = 3
+ROUND_EVENTS_MAX_PER_ROUND = 64
+ROUND_EVENT_DESCRIPTION_CHARS = 300
+ROUND_EVENT_NAME_CHARS = 80
+
+
+def compact_combat_event(event):
+    """The mechanical record of one committed event, for the round summary.
+
+    Actor, action, every target's hp before and after with its status, the
+    rolls and the resources spent. The narration and the provider payload are
+    left out; the full event stays on the pending delivery as before.
+    """
+    intent = event.get("intent") if isinstance(event.get("intent"), dict) else {}
+    outcome = event.get("outcome") if isinstance(event.get("outcome"), dict) else {}
+    targets = []
+    for target in outcome.get("targets") or []:
+        if isinstance(target, dict):
+            targets.append({
+                key: target.get(key)
+                for key in ("combatantId", "hpBefore", "hpAfter", "statusAfter")
+            })
+    resources = []
+    for record in event.get("resources") or []:
+        if isinstance(record, dict):
+            resources.append({
+                key: record.get(key)
+                for key in ("owner", "kind", "name", "delta", "before", "after")
+                if key in record
+            })
+    rolls = []
+    # #879: a Great Weapon Fighting die keeps what it counted as.
+    for roll in event.get("rolls") or []:
+        if isinstance(roll, dict):
+            rolls.append({
+                key: roll.get(key)
+                for key in ("purpose", "die", "total", "value", "success", "treated", "faces", "facesTreated", "rule")
+                if key in roll
+            })
+    description = intent.get("description") or outcome.get("description") or ""
+    if not isinstance(description, str):
+        description = str(description)
+    ticks = []
+    for tick in event.get("effectTicks") or []:
+        if isinstance(tick, dict):
+            compact_tick = {
+                key: tick.get(key)
+                for key in ("owner", "combatantId", "effectId", "name", "roundsBefore", "roundsAfter", "expired")
+                if key in tick
+            }
+            if isinstance(compact_tick.get("name"), str):
+                compact_tick["name"] = compact_tick["name"][:ROUND_EVENT_NAME_CHARS]
+            ticks.append(compact_tick)
+    compact = {
+        "eventId": event.get("eventId"),
+        "actorId": event.get("actorId"),
+        "action": intent.get("action") or outcome.get("kind"),
+        "description": description[:ROUND_EVENT_DESCRIPTION_CHARS],
+        "targets": targets,
+        "rolls": rolls,
+        "resources": resources,
+    }
+    if ticks:
+        compact["effectTicks"] = ticks
+    return compact
+
+
+def record_round_events(state, round_number, events):
+    """Keep the committed events of a round on the combat state, bounded.
+
+    ``roundEvents`` maps the round number (as a string) to its compact
+    events. Only the current round and the two before it are kept, because
+    round compression summarizes round N once round N+2 has begun. Encounters
+    written before this field exist read as having no round events.
+    """
+    try:
+        current = int(round_number)
+    except (TypeError, ValueError):
+        return
+    store = state.get("roundEvents")
+    if not isinstance(store, dict):
+        store = {}
+    rows = list(store.get(str(current)) or [])
+    rows.extend(compact_combat_event(event) for event in events if isinstance(event, dict))
+    store[str(current)] = rows[-ROUND_EVENTS_MAX_PER_ROUND:]
+    kept = {}
+    for key, value in store.items():
+        try:
+            number = int(key)
+        except (TypeError, ValueError):
+            continue
+        # Only the window current-2 .. current: rows above the current round
+        # (a restored or re-staged turn, a reused encounter) never linger and
+        # never receive appended events once the round catches up.
+        if current - ROUND_EVENTS_KEEP_ROUNDS < number <= current:
+            kept[str(number)] = value
+    state["roundEvents"] = kept
+
+
+def round_events(encounter, round_number):
+    """The compact committed events of one round, or an empty list."""
+    state = (encounter or {}).get("combatState") or {}
+    store = state.get("roundEvents")
+    if not isinstance(store, dict):
+        return []
+    rows = store.get(str(round_number))
+    return list(rows) if isinstance(rows, list) else []
 
 
 def commit_turn(encounter, turn_id, applied_event_ids):
@@ -954,6 +1306,11 @@ def commit_turn(encounter, turn_id, applied_event_ids):
     duplicate = set(staged_ids).intersection(state["appliedEventIds"])
     if duplicate:
         raise CombatStateConflict(f"Combat events were already applied: {sorted(duplicate)!r}")
+
+    committed_round = pending.get("round")
+    if committed_round is None:
+        committed_round = state["round"]
+    record_round_events(state, committed_round, pending.get("events") or [])
 
     actor_ids = pending["actorIds"]
     consumed_actor_ids = list(pending.get("skippedActorIds") or []) + actor_ids
@@ -1007,7 +1364,7 @@ def commit_turn(encounter, turn_id, applied_event_ids):
         )
     state["pendingTurn"] = None
     state["revision"] += 1
-    if all_hostiles_resolved(encounter):
+    if combat_resolved(encounter):
         state["phase"] = "complete"
         state["completion"]["status"] = "complete"
     else:

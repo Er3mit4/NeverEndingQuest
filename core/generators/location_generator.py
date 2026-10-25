@@ -21,6 +21,13 @@ import config
 import jsonschema
 from utils.module_path_manager import ModulePathManager
 from utils.encoding_utils import normalize_typography_deep
+from utils.status_words import NPC_STATUS_WORDS, status_word_refusal
+from utils.schema_feedback import (
+    SchemaIssue as _SchemaIssue,
+    compact_issue_message as _compact_issue_message,
+    format_schema_issues as _format_schema_issues,
+    schema_issues as _schema_issues,
+)
 from utils.capture.multi_model_capture import (
     capture_and_fanout,
     register_callsite,
@@ -31,28 +38,6 @@ register_callsite("T025", "core/generators/location_generator.py", 693)
 register_callsite("T026", "core/generators/location_generator.py", 884)
 
 
-_T026_OFFICIAL_SKILLS = frozenset(
-    {
-        "Acrobatics",
-        "Animal Handling",
-        "Arcana",
-        "Athletics",
-        "Deception",
-        "History",
-        "Insight",
-        "Intimidation",
-        "Investigation",
-        "Medicine",
-        "Nature",
-        "Perception",
-        "Performance",
-        "Persuasion",
-        "Religion",
-        "Sleight of Hand",
-        "Stealth",
-        "Survival",
-    }
-)
 _T026_CALENDAR_MONTHS = (
     "Firstmonth",
     "Coldmonth",
@@ -68,10 +53,6 @@ _T026_CALENDAR_MONTHS = (
     "Yearend",
 )
 _T026_DANGER_LEVELS = frozenset({"Low", "Medium", "High", "Very High"})
-_T026_ABILITY_SKILL_CHECK = re.compile(
-    r"^(?:Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma) "
-    r"\(([^)]+)\) (DC [0-9]+: .+)$"
-)
 
 
 def _location_stub_ids(location_stubs: List[Dict[str, Any]]) -> List[str]:
@@ -311,15 +292,6 @@ def _canonicalize_t026_mechanical_fields(parsed: Any) -> Any:
         # can never inject a bad date or a phantom encounter into a new module.
         location["encounters"] = []
 
-        checks = location.get("dcChecks")
-        if isinstance(checks, list):
-            for index, check in enumerate(checks):
-                if not isinstance(check, str):
-                    continue
-                match = _T026_ABILITY_SKILL_CHECK.fullmatch(check)
-                if match and match.group(1) in _T026_OFFICIAL_SKILLS:
-                    checks[index] = f"{match.group(1)} {match.group(2)}"
-
         encounters = location.get("encounters")
         if not isinstance(encounters, list):
             continue
@@ -336,85 +308,6 @@ def _canonicalize_t026_mechanical_fields(parsed: Any) -> Any:
                 world_conditions["month"] = _T026_CALENDAR_MONTHS[month - 1]
 
     return corrected
-
-
-@dataclass(frozen=True)
-class _SchemaIssue:
-    """One deterministic, user-prompt-safe schema issue."""
-
-    path: str
-    message: str
-
-
-def _compact_issue_message(message: Any, limit: int = 240) -> str:
-    """Bound model-derived validation text before it enters a retry prompt."""
-    compact = " ".join(str(message).split())
-    if len(compact) <= limit:
-        return compact
-    return compact[: limit - 3] + "..."
-
-
-def _json_path(parts) -> str:
-    """Render a jsonschema path deterministically as dotted/indexed JSON."""
-    rendered = ""
-    for part in parts:
-        if isinstance(part, int):
-            rendered += f"[{part}]"
-        else:
-            rendered += ("." if rendered else "") + str(part)
-    return rendered or "$"
-
-
-def _schema_issues(
-    instance: Any,
-    schema: Dict[str, Any],
-    prefix=(),
-) -> List[_SchemaIssue]:
-    """Return all schema errors with stable paths and stable ordering."""
-    validator = jsonschema.Draft7Validator(schema)
-    errors = sorted(
-        validator.iter_errors(instance),
-        key=lambda error: (
-            tuple(str(part) for part in error.absolute_path),
-            str(error.validator),
-            error.message,
-        ),
-    )
-    issues = []
-    for error in errors:
-        path_parts = tuple(prefix) + tuple(error.absolute_path)
-        if error.validator == "required" and isinstance(error.instance, dict):
-            missing = sorted(
-                key
-                for key in error.validator_value
-                if key not in error.instance
-            )
-            for key in missing:
-                issues.append(
-                    _SchemaIssue(
-                        _json_path(path_parts + (key,)),
-                        "required property is missing",
-                    )
-                )
-            continue
-        issues.append(
-            _SchemaIssue(
-                _json_path(path_parts),
-                _compact_issue_message(error.message),
-            )
-        )
-    return sorted(issues, key=lambda issue: (issue.path, issue.message))
-
-
-def _format_schema_issues(issues: List[_SchemaIssue], limit: int = 24) -> str:
-    """Compact schema feedback without embedding the full model response."""
-    shown = issues[:limit]
-    rendered = "; ".join(
-        f"{issue.path}: {issue.message}" for issue in shown
-    )
-    if len(issues) > limit:
-        rendered += f"; ... {len(issues) - limit} additional issue(s)"
-    return rendered
 
 
 def _validate_location_envelope(
@@ -662,7 +555,25 @@ def _validate_location_batch_contract(
         raise ValueError(
             f"schema validation failed: {_format_schema_issues(issues)}"
         )
+    refusals = _status_word_npc_names(parsed["locations"])
+    if refusals:
+        raise ValueError("NPC names refused: " + "; ".join(refusals))
     return copy.deepcopy(parsed)
+
+
+def _status_word_npc_names(locations: List[Dict[str, Any]]) -> List[str]:
+    """Each location NPC name that carries a status word, with its path (#1119).
+    Only the structured npcs[].name field is read; monsters are creature types
+    and keep their names."""
+    refusals = []
+    for index, location in enumerate(locations):
+        for npc_index, npc in enumerate(location.get("npcs") or []):
+            if not isinstance(npc, dict):
+                continue
+            refusal = status_word_refusal(npc.get("name"))
+            if refusal:
+                refusals.append(f"locations[{index}].npcs[{npc_index}].name: {refusal}")
+    return refusals
 
 
 @dataclass
@@ -677,7 +588,7 @@ class LocationPromptGuide:
     - Cave Entrance: "The Whispering Threshold", "Maw of Shadows"
     - Chamber: "Hall of Echoing Stone", "The Crystal Sanctum"  
     - Corridor: "The Winding Descent", "Passage of Whispers"
-    - Throne Room: "Court of the Fallen King", "Ember Throne Chamber"
+    - Throne Room: "Court of the Fallen King", "Hall of the Iron Seat"
     
     Format: 2-5 words, capitalize major words
     Style: Atmospheric, hints at location's nature
@@ -741,7 +652,7 @@ class LocationPromptGuide:
     "The pillars conceal pressure plates (DC 15 Perception to notice). 
     Triggering one releases poison darts (DC 13 Dex save, 2d4 poison 
     damage). The sealed door requires the proper ritual phrase or DC 20 
-    Strength to force. Behind it lies the forge guardian, which activates 
+    Strength to force. Behind it lies the stone guardian, which activates 
     if the seal is broken violently. The sulfur smell intensifies near 
     the secret passage (DC 18 Investigation to find) leading to area R07."
     
@@ -771,12 +682,15 @@ class LocationPromptGuide:
     - name: Their name or identifier
     - description: Brief physical/personality note
     - attitude: hostile, neutral, friendly, cautious, etc.
+    - disposition: exactly one of friendly, indifferent or hostile -- how
+      this NPC first treats the party (attitude stays free text)
     
     Example:
     {
         "name": "Grimtooth the Gatekeeper",
         "description": "A scarred hobgoblin veteran with a missing eye",
-        "attitude": "hostile"
+        "attitude": "hostile",
+        "disposition": "hostile"
     }
     
     NPCs should:
@@ -902,7 +816,8 @@ class LocationPromptGuide:
     Interactive or descriptive elements.
     
     Each feature needs:
-    - name: What to call it
+    - name: What to call it, as the player sees it (never a plot-point or
+      side-quest id such as SQ004, or a quest title)
     - description: What it looks like and does
     
     Examples:
@@ -917,10 +832,11 @@ class LocationPromptGuide:
     
     dcChecks: str = """
     Skill challenges available in the location.
-    Format: "SkillName DC XX: Result description"
+    Format: "Ability (Skill) DC XX: Result description", or the skill or the
+    ability alone before "DC"
     
     Examples:
-    - "Perception DC 15: Notice the secret door behind the tapestry"
+    - "Wisdom (Perception) DC 15: Notice the secret door behind the tapestry"
     - "Investigation DC 12: Find the hidden compartment in the altar"
     - "Athletics DC 18: Climb the crumbling wall to the upper level"
     - "Arcana DC 16: Identify the magical aura around the crystals"
@@ -998,8 +914,8 @@ class LocationPromptGuide:
 #                           (generate_field), seeded with the location's own good
 #                           content; code splices the value back in.
 #   * Creative that still -> a minimal schema-valid floor so the build never
-#     fails (rare)          aborts; the field name is returned so the pipeline can
-#                           flag the location for the module doctor to enrich.
+#     fails (rare)          aborts: a creative string is left empty, and the DM
+#                           narrates the gap in play from the location's context.
 _T026_STRUCTURAL_STUB_FIELDS = (
     "locationId", "name", "type", "coordinates", "connectivity",
     "areaConnectivity", "areaConnectivityId",
@@ -1037,15 +953,14 @@ def _t026_creative_floor(field_schema: Dict[str, Any]) -> Any:
         return {}
     if kind in ("integer", "number"):
         return field_schema.get("minimum", 0) if isinstance(field_schema, dict) else 0
-    return "To be detailed by the module doctor."
+    return ""
 
 
 def _t026_surgical_repair_location(gen, location, stub, issues, item_schema, context):
     """Repair ONLY the broken fields of one location, preserving accepted content.
 
     Returns (fixed_location, floored_fields). The caller re-validates; any field in
-    floored_fields was code-filled as a last resort and should be flagged for the
-    module doctor.
+    floored_fields was code-filled as a last resort (an empty creative value).
     """
     fixed = copy.deepcopy(location)
     props = item_schema.get("properties", {}) if isinstance(item_schema, dict) else {}
@@ -1237,7 +1152,11 @@ CRITICAL COMPLETE LOCATION CHECKLIST -- field names and nesting must match EXACT
   no player events have occurred yet; runtime departure processing populates
   this living-history field later.
 - "npcs" (NOT "notableNPCs") is an array of complete objects. Every NPC
-  requires name (string), description (string), and attitude (string).
+  requires name (string), description (string), attitude (string, free
+  text), and disposition (exactly "friendly", "indifferent" or "hostile":
+  how the NPC first treats the party). An NPC's name is its proper name with
+  no status word ({', '.join(NPC_STATUS_WORDS)}): "Ranger Gareth", never
+  "Wounded Ranger Gareth"; a condition belongs in the description.
 - "monsters" (NOT "creatures") is an array of complete objects. Every
   monster requires name (string) and quantity (object); quantity requires
   min (integer, 0 or greater) and max (integer, 1 or greater).
@@ -1254,20 +1173,18 @@ CRITICAL COMPLETE LOCATION CHECKLIST -- field names and nesting must match EXACT
   in dmInstructions, plotHooks, or monsters.
 - Every door requires name, description, type, locked, lockDC, breakDC,
   keyname, trapped, and trap, using the types listed below.
-- "dcChecks" entries begin with an official skill or ability name only and use
-  "SkillOrAbility DC XX: Description". Use "Arcana DC 13:", not
-  "Intelligence (Arcana) DC 13:". Valid multiword examples include
-  "Animal Handling DC 12:" and "Sleight of Hand DC 15:". A raw ability
-  check such as "Wisdom DC 14:" is also valid.
-- SRD 5.2.1 check naming: an ability check is named for one of the six
-  abilities; a skill or tool proficiency can apply to that check. This output
-  contract also permits one official skill as shorthand, but the label before
-  "DC" must be exactly ONE of: Strength, Dexterity, Constitution,
-  Intelligence, Wisdom, Charisma, Acrobatics, Animal Handling, Arcana,
+- "dcChecks" entries use "Label DC XX: Description". SRD 5.2.1 check naming:
+  an ability check is named for one of the six abilities, with the skill that
+  applies in parentheses, as in "Wisdom (Perception) DC 13:" or
+  "Dexterity (Sleight of Hand) DC 15:". The skill alone ("Arcana DC 13:") and
+  the ability alone ("Wisdom DC 14:") are also valid. The ability is exactly
+  ONE of: Strength, Dexterity, Constitution, Intelligence, Wisdom, Charisma.
+  The skill is exactly ONE of: Acrobatics, Animal Handling, Arcana,
   Athletics, Deception, History, Insight, Intimidation, Investigation,
   Medicine, Nature, Perception, Performance, Persuasion, Religion,
   Sleight of Hand, Stealth, or Survival.
-- Never put a slash, "or", parentheses, or a tool name in the check label. If
+- Never put a slash, "or", or a tool name in the check label, and never more
+  than one skill in the parentheses. If
   alternate skills or a tool proficiency apply, use the governing ability as
   the label and state the applicable proficiencies in the description. For
   example: "Strength DC 13: Cross the broken stairs; Acrobatics or Athletics
@@ -1295,6 +1212,10 @@ AREA CONNECTIVITY RULES:
   The module builder assigns all cross-area connections deterministically from the
   plot route after generation; anything you put here is discarded. Note that
   "areaConnectivityId" holds destination LOCATION IDs, not area IDs.
+
+Location and feature names are in-world display names the player sees.
+Never put plot-point or side-quest ids (such as PP002 or SQ004) or quest
+titles in a name; keep quest links in dmInstructions and plotHooks.
 
 Check the location schema carefully for all required fields.
 Use only standard ASCII characters -- no smart quotes, no em-dashes, and no
@@ -1460,7 +1381,7 @@ Do not return commentary or Markdown.
         # fields are code-filled from the trusted stub, creative fields are
         # re-asked one at a time (generate_field) and spliced back in, and a
         # creative field the model still cannot produce gets a minimal valid floor
-        # flagged for the module doctor. Locations made valid drop out of the
+        # (an empty string the DM narrates in play). Locations made valid drop out of the
         # whole-location repair set below, so a weak model's stochastic field
         # omission never aborts the build.
         if invalid_by_index:
@@ -1490,7 +1411,7 @@ Do not return commentary or Markdown.
                         print(
                             "WARNING: T026 surgical repair floor-filled "
                             f"{location_stubs[index].get('locationId')} fields "
-                            f"{floored}; flag for module doctor enrichment"
+                            f"{floored}; left empty for the DM to narrate"
                         )
             invalid_by_index = remaining_invalid
 

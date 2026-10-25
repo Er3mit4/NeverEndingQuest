@@ -21,6 +21,7 @@ import model_config
 from utils.capture.file_writer import CaptureFileWriter
 from utils.capture.openai_caller import call_openai_variant
 from utils.capture.gemini_caller import call_gemini_variant
+from utils.transient_filesystem import raise_if_save_stopped
 
 # Shared thread pool - initialized once
 _executor = ThreadPoolExecutor(max_workers=8)
@@ -291,6 +292,18 @@ def _track_module_primary(response, task_id, provider, requested_model):
         pass
 
 
+def _variant_provider_configured(variant):
+    """True when the variant's provider can be called: OpenAI (the primary provider's own credentials), or
+    Gemini with a key available to its client (#1308). Any other provider is never fired."""
+    provider = variant.get("provider")
+    if provider == "openai":
+        return True
+    if provider == "gemini":
+        from utils.capture.gemini_caller import gemini_configured
+        return gemini_configured()
+    return False
+
+
 def _fire_background_variant(variant, task_id, messages, invocation_id,
                               caller_temperature, caller_kwargs):
     """Execute one variant call and write result. Runs in thread pool."""
@@ -344,6 +357,15 @@ def _resolve_effective_callsite_kwargs(task_id, provider, kwargs, attempt=0):
     for option in ("max_tokens", "max_completion_tokens"):
         if option in selected:
             effective[option] = copy.deepcopy(selected[option])
+    # Per-callsite output ceiling, OpenAI only: a streamed answer past it is
+    # abandoned and the identical request reissued (core/ai/api_client).
+    effective.pop("_output_ceiling_chars", None)
+    if provider == "openai":
+        from model_registry import openai_output_ceiling
+
+        ceiling = openai_output_ceiling(task_id)
+        if ceiling:
+            effective["_output_ceiling_chars"] = ceiling
     return effective
 
 
@@ -391,6 +413,9 @@ def capture_and_fanout(task_id, primary_fn, messages, **kwargs):
         response = capture_and_fanout("T013", client.chat.completions.create,
                                       messages=messages, model=..., temperature=0.7)
     """
+    # Issue #654: after a read-only save stop, no model call is made, whatever
+    # a caller's except clauses do. A no-op while no stop is recorded.
+    raise_if_save_stopped()
     live_selected = kwargs.pop("_live_selected", None)
     # Detached execution context (issue #214): an off-thread caller (the
     # startup welcome) passes its own cancellable scope + status sink so its
@@ -400,6 +425,9 @@ def capture_and_fanout(task_id, primary_fn, messages, **kwargs):
     detached_status = kwargs.pop("_detached_status", None)
     # Parent-only lifecycle observation: never a model option or capture field.
     authority_check = kwargs.pop("_live_authority_check", None)
+    # What the player waits for, when the task id alone cannot say (#1422 F2):
+    # parent-only, never a model option or capture field.
+    wait_purpose = kwargs.pop("_wait_purpose", None)
     if live_selected is None:
         from utils.capture.live_provider_call import live_provider_policy
 
@@ -446,6 +474,7 @@ def capture_and_fanout(task_id, primary_fn, messages, **kwargs):
     current_frame = inspect.currentframe()
     caller_frame = current_frame.f_back if current_frame is not None else None
     runtime_line = caller_frame.f_lineno if caller_frame is not None else 0
+    runtime_file = caller_frame.f_code.co_filename if caller_frame is not None else ""
     del caller_frame
     del current_frame
 
@@ -479,6 +508,7 @@ def capture_and_fanout(task_id, primary_fn, messages, **kwargs):
             scope=detached_scope,
             status_emit=detached_status,
             authority_check=authority_check,
+            purpose=wait_purpose,
         )
         primary_latency = round(time.time() - start, 3)
         _track_module_primary(
@@ -588,6 +618,13 @@ def capture_and_fanout(task_id, primary_fn, messages, **kwargs):
         # comparisons behind the player's back.
         variants = [] if live_policy or request_provider == "codex" else cfg.get("task_overrides", {}).get(task_id)
 
+        # An empty tier-variant list means shadows are off for that tier: no
+        # per-callsite config re-enables them (#1308). task_overrides above
+        # stays an explicit per-task opt-in.
+        tier_variants = cfg.get(f"{tier}_tier_variants", [])
+        if variants is None and not tier_variants:
+            variants = []
+
         # Then try per-callsite config dicts from model_config.py
         if variants is None:
             from model_config import get_capture_variants_for_task
@@ -595,10 +632,10 @@ def capture_and_fanout(task_id, primary_fn, messages, **kwargs):
 
         # Fall back to tier-based variants (backwards compatibility)
         if variants is None:
-            variants = cfg.get(f"{tier}_tier_variants", [])
+            variants = tier_variants
 
         # Get source location from registered metadata
-        meta = _CALLSITE_META.get(task_id, {})
+        meta = _callsite_meta_for(task_id, runtime_file)
         writer = _get_writer()
         writer.write_primary(
             task_id=task_id,
@@ -619,6 +656,9 @@ def capture_and_fanout(task_id, primary_fn, messages, **kwargs):
         for variant in variants:
             # Skip disabled variants (enabled defaults to True if not specified)
             if not variant.get("enabled", True):
+                continue
+            # Never call a provider that is not configured (#1308).
+            if not _variant_provider_configured(variant):
                 continue
             # Skip an exact effective duplicate of the selected primary call.
             if _variant_matches_primary(
@@ -646,8 +686,32 @@ def capture_and_fanout(task_id, primary_fn, messages, **kwargs):
 
 # Callsite metadata registry
 _CALLSITE_META = {}
+# Every registration per task_id, keyed by file: one task_id may have more than
+# one live callsite (T078, issue #816), and the last import must not relabel the
+# other's records.
+_CALLSITE_FILES = {}
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _path_key(path):
+    return os.path.normcase(path).replace("\\", "/")
 
 
 def register_callsite(task_id, file_path, line):
     """Register file/line metadata for a task_id. Called at module import."""
     _CALLSITE_META[task_id] = {"file": file_path, "line": line}
+    _CALLSITE_FILES.setdefault(task_id, {})[_path_key(file_path)] = _CALLSITE_META[task_id]
+
+
+def _callsite_meta_for(task_id, runtime_file):
+    """The registration of the file that made the call, else the last one."""
+    if runtime_file:
+        try:
+            relative = os.path.relpath(runtime_file, _REPO_ROOT)
+        except ValueError:  # another drive on Windows
+            relative = None
+        if relative is not None:
+            meta = _CALLSITE_FILES.get(task_id, {}).get(_path_key(relative))
+            if meta is not None:
+                return meta
+    return _CALLSITE_META.get(task_id, {})

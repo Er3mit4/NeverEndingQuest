@@ -59,6 +59,7 @@ import json
 import hashlib
 import os
 import shutil
+import stat
 import time
 import threading
 import logging
@@ -68,7 +69,18 @@ from contextlib import nullcontext
 from utils.capture.live_provider_call import LiveProviderSuperseded
 from utils.module_refresh_lock import RUNTIME_LOCKS_DIR
 from utils.path_transaction_lock import path_transaction_lock
-from utils.transient_filesystem import is_transient_filesystem_error
+from utils.transient_filesystem import (
+    ON_READ_ONLY_FAIL,
+    ON_READ_ONLY_STOP,
+    LockContention,
+    ReadOnlySaveStop,
+    ReplaceContention,
+    check_on_read_only,
+    is_transient_filesystem_error,
+    raise_if_save_stopped,
+    record_save_stop,
+    replace_target_is_read_only,
+)
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -77,6 +89,19 @@ logger = logging.getLogger(__name__)
 class FileLockError(Exception):
     """Raised when unable to acquire file lock"""
     pass
+
+
+def _restore_owner_write_bit(path: str) -> None:
+    """Give the game's own backup file back its owner write bit.
+
+    On Windows this clears only READONLY. A missing file is left to the copy.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        return
+    if not mode & stat.S_IWRITE:
+        os.chmod(path, stat.S_IMODE(mode) | stat.S_IWRITE)
 
 
 
@@ -88,41 +113,56 @@ class AtomicFileWriter:
         self.retry_delay = retry_delay
         self.lock_files = {}
     
-    def acquire_lock(self, filepath: str, timeout=None, *, commit_guard=None) -> Optional[int]:
-        """Wait for OS ownership; timeout is retained only for API compatibility."""
+    def acquire_lock(self, filepath: str, timeout=None, *, commit_guard=None,
+                     check_save_stop: bool = False, wait_reporter=None) -> Optional[int]:
+        """Wait for OS ownership; timeout is retained only for API compatibility.
+
+        While another thread or another copy of the game holds the lock, the
+        wait is reported (LockContention, #803). ``check_save_stop`` lets a
+        recorded read-only stop end it; ``wait_reporter`` replaces the status
+        line for a caller outside a live turn.
+        """
         canonical = os.path.normcase(os.path.abspath(os.path.normpath(os.fspath(filepath))))
         runtime_lock_target = os.path.join(
             RUNTIME_LOCKS_DIR, "atomic", hashlib.sha256(os.fsencode(canonical)).hexdigest()
         )
         key = (os.getpid(), threading.get_ident(), canonical)
-        while True:
-            if commit_guard is not None:
-                with commit_guard():
-                    pass
-            ownership = path_transaction_lock(
-                runtime_lock_target, suffix=".lock",
-                timeout_seconds=self.retry_delay, poll_seconds=self.retry_delay,
-            )
-            try:
-                acquired = ownership.__enter__()
-            except OSError as exc:
-                if not is_transient_filesystem_error(exc):
-                    raise
-                time.sleep(self.retry_delay)
-                continue
-            if acquired is None:
-                ownership.__exit__(None, None, None)
-                continue
-            try:
+        contention = LockContention(
+            filepath, check_save_stop=check_save_stop, wait_reporter=wait_reporter
+        )
+        try:
+            while True:
                 if commit_guard is not None:
                     with commit_guard():
                         pass
-                self.lock_files.setdefault(key, []).append(ownership)
-            except BaseException:
-                ownership.__exit__(None, None, None)
-                raise
-            logger.debug("Acquired lock for %s", canonical)
-            return 1
+                ownership = path_transaction_lock(
+                    runtime_lock_target, suffix=".lock",
+                    timeout_seconds=self.retry_delay, poll_seconds=self.retry_delay,
+                )
+                try:
+                    acquired = ownership.__enter__()
+                except OSError as exc:
+                    if not is_transient_filesystem_error(exc):
+                        raise
+                    contention.tick()
+                    time.sleep(self.retry_delay)
+                    continue
+                if acquired is None:
+                    ownership.__exit__(None, None, None)
+                    contention.tick()
+                    continue
+                try:
+                    if commit_guard is not None:
+                        with commit_guard():
+                            pass
+                    self.lock_files.setdefault(key, []).append(ownership)
+                except BaseException:
+                    ownership.__exit__(None, None, None)
+                    raise
+                logger.debug("Acquired lock for %s", canonical)
+                return 1
+        finally:
+            contention.finish()
 
     def release_lock(self, filepath: str):
         """Release only this thread's ownership, retaining the advisory inode."""
@@ -141,10 +181,17 @@ class AtomicFileWriter:
         """Create backup of existing file"""
         if not os.path.exists(filepath):
             return None
-            
+
         backup_path = f"{filepath}.bak"
         try:
+            # copy2 copies a read-only source's mode onto the .bak, and copy2
+            # onto that .bak then fails for good, even after the player
+            # clears the target (issue #654). Clear a stale one.
+            _restore_owner_write_bit(backup_path)
             shutil.copy2(filepath, backup_path)
+            # The next write, once the target is cleared, must not meet the
+            # read-only .bak this copy just made.
+            _restore_owner_write_bit(backup_path)
             logger.debug(f"Created backup: {backup_path}")
             return backup_path
         except Exception as e:
@@ -153,24 +200,37 @@ class AtomicFileWriter:
     
     def write_json(self, filepath: str, data: Dict[str, Any], 
                    create_backup: bool = True, acquire_lock: bool = True,
-                   *, commit_guard=None) -> bool:
+                   *, commit_guard=None, on_read_only: str = ON_READ_ONLY_STOP) -> bool:
         """
         Atomically write JSON data to file with optional backup and locking.
-        
+
         Args:
             filepath: Path to the JSON file
             data: Dictionary to write as JSON
             create_backup: Whether to create a backup before writing
             acquire_lock: Whether to use file locking
-            
+            on_read_only: For a read-only target, "stop" (the default) raises
+                ReadOnlySaveStop and the session stops; "raise" and "fail"
+                return False instead of waiting, for a caller that handles
+                False ("fail" only for a file that is not game state)
+
         Returns:
             True if successful, False otherwise
         """
         filepath = str(filepath)  # Handle Path objects
+        on_read_only = check_on_read_only(on_read_only)
+        stop_on_read_only = on_read_only == ON_READ_ONLY_STOP
+        if on_read_only != ON_READ_ONLY_FAIL:
+            # No game state is written after a read-only save stopped the
+            # session.
+            raise_if_save_stopped()
         temp_path = f"{filepath}.tmp"
         backup_path = None
         lock_acquired = False
-        
+        contention = ReplaceContention(
+            filepath, check_save_stop=on_read_only != ON_READ_ONLY_FAIL
+        )
+
         try:
             dir_path = os.path.dirname(filepath)
             if dir_path:
@@ -178,7 +238,10 @@ class AtomicFileWriter:
             # Acquire lock if requested
             if acquire_lock:
                 print(f"DEBUG: [FILE_OPS] Attempting to acquire lock for {filepath}")
-                self.acquire_lock(filepath, commit_guard=commit_guard)
+                self.acquire_lock(
+                    filepath, commit_guard=commit_guard,
+                    check_save_stop=on_read_only != ON_READ_ONLY_FAIL,
+                )
                 lock_acquired = True
                 print(f"DEBUG: [FILE_OPS] Lock acquired successfully")
             
@@ -211,8 +274,11 @@ class AtomicFileWriter:
             # destination. One such blip must not fail the write - a live
             # acceptance run lost an entire combat to a single WinError 5
             # here. Retry sharing contention patiently; nonretryable errors
-            # still follow the existing error path below.
-            _replace_attempt = 0
+            # still follow the existing error path below. A read-only target
+            # is not contention: waiting cannot clear it, so the save stops
+            # the session, or returns False for a caller that passed
+            # on_read_only="raise" or "fail" (issue #654). The wait is reported
+            # and, during a live turn, shown on screen (#653 item 6).
             while True:
                 try:
                     with commit_guard() if commit_guard is not None else nullcontext():
@@ -222,20 +288,26 @@ class AtomicFileWriter:
                     winerror = getattr(replace_error, "winerror", None)
                     if winerror not in (5, 32):
                         raise
-                    _replace_attempt += 1
-                    if _replace_attempt % 20 == 0:
+                    if winerror == 5 and replace_target_is_read_only(filepath):
+                        if stop_on_read_only:
+                            record_save_stop(filepath)
+                            logger.warning(
+                                "Stopping: the save to %s cannot finish, "
+                                "the file is read-only (WinError 5)", filepath
+                            )
+                            raise ReadOnlySaveStop(filepath) from replace_error
                         logger.warning(
-                            f"Transient Windows rename contention on "
-                            f"{filepath} (WinError {winerror}), attempt "
-                            f"{_replace_attempt}; still retrying"
+                            "Not retrying the write to %s: the file is "
+                            "read-only (WinError 5)", filepath
                         )
-                    time.sleep(0.1)
+                        raise
+                    contention.tick(winerror)
             # Suppress success messages - only log errors
             # logger.info(f"Successfully wrote {filepath}")
             
             return True
-            
-        except LiveProviderSuperseded:
+
+        except (LiveProviderSuperseded, ReadOnlySaveStop):
             raise
         except Exception as e:
             logger.error(f"Error writing {filepath}: {e}")
@@ -247,6 +319,7 @@ class AtomicFileWriter:
             return False
             
         finally:
+            contention.finish()
             if os.path.exists(temp_path) and (lock_acquired or not acquire_lock):
                 try:
                     os.unlink(temp_path)
@@ -310,10 +383,11 @@ atomic_writer = AtomicFileWriter()
 # Convenience functions
 def safe_write_json(filepath: str, data: Dict[str, Any], 
                    create_backup: bool = True, acquire_lock: bool = True,
-                   *, commit_guard=None) -> bool:
+                   *, commit_guard=None, on_read_only: str = ON_READ_ONLY_STOP) -> bool:
     """Atomically write JSON data to file"""
     return atomic_writer.write_json(filepath, data, create_backup, acquire_lock,
-                                    commit_guard=commit_guard)
+                                    commit_guard=commit_guard,
+                                    on_read_only=on_read_only)
 
 def safe_read_json(filepath: str, acquire_lock: bool = False) -> Optional[Dict[str, Any]]:
     """Safely read JSON file"""

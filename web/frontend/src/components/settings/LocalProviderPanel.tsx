@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { emitC } from '../../services/socket'
-import { useDialogs } from '../../stores'
+import { useDialogs, useLog } from '../../stores'
+import { spendDisclaimer } from '../layout/spendText'
+import {
+  GUIDE_FOOTER, GUIDE_HEADING, GUIDE_INTRO, GUIDE_STEPS, KEY_HELP, KEY_NO_KEYCHAIN, KEY_RESTART,
+  START_ADVENTURE, canStartAfter, keyCheckText, needsOpenaiKey,
+} from './keySetupText'
+import { resumeGatedAction } from './keyGate'
 import type { ClientEvents } from '../../contract/events'
 
 type ProviderValue = ClientEvents['set_model_provider']['provider']
@@ -24,6 +30,8 @@ const PROVIDER_HINTS: Record<ProviderValue, string> = {
   lmstudio:
     'Local / Custom Server: point at any OpenAI-compatible server below. Zero cost when local.',
 }
+
+const PROVIDER_LOADING = 'Loading provider...'
 
 const inputClass = 'neq-settings-select-parity'
 const smallButtonClass = 'neq-settings-button-small-parity'
@@ -74,8 +82,9 @@ function LocalProviderPanelBody() {
     return () => window.clearTimeout(timer)
   }, [pendingProvider])
 
-  const storedProvider = settings.provider ?? 'legacy'
-  const provider: string = pendingProvider ?? storedProvider
+  // #1422 F3: until the server reports the provider, show that it is loading;
+  // never a guessed provider.
+  const provider: string | null = pendingProvider ?? settings.provider
 
   const changeProvider = (value: string) => {
     if (!isProviderValue(value)) return
@@ -134,10 +143,22 @@ function LocalProviderPanelBody() {
 
   // ---- API keys (blank submit keeps the stored key server-side) ----
   const [openaiKey, setOpenaiKey] = useState('')
+  const pricedAt = useLog((s) => s.tokens.spend?.priced_at)
   const [geminiKey, setGeminiKey] = useState('')
   const [opencodegoKey, setOpencodegoKey] = useState('')
 
+  const keyGate = useDialogs((s) => s.keyGate)
+  const keyCheck = settings.keyCheck
+  const checking = keyCheck?.result === 'checking'
+  const keySection = useRef<HTMLDivElement>(null)
+  // A line from an earlier visit is stale; the gate scrolls to the key field.
+  useEffect(() => { useDialogs.getState().setOpenaiKeyCheck(null) }, [])
+  useEffect(() => {
+    if (keyGate) keySection.current?.scrollIntoView?.({ block: 'start' })
+  }, [keyGate])
+
   const saveOpenaiKey = () => {
+    if (checking) return
     emitC('set_openai_key', { api_key: openaiKey })
     setOpenaiKey('')
   }
@@ -163,19 +184,23 @@ function LocalProviderPanelBody() {
             <select
               id="model-provider-select"
               className={inputClass}
-              value={provider}
-              disabled={pendingProvider !== null}
+              value={provider ?? ''}
+              disabled={provider === null || pendingProvider !== null}
               onChange={(e) => changeProvider(e.target.value)}
             >
-              {PROVIDER_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>{o.label}</option>
-              ))}
+              {provider === null
+                ? <option value="">{PROVIDER_LOADING}</option>
+                : PROVIDER_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
             </select>
           </div>
         <p className="neq-settings-help-parity neq-settings-provider-help-parity">
-          {isProviderValue(provider)
-            ? PROVIDER_HINTS[provider]
-            : 'Models are selected per-task based on quality testing.'}
+          {provider === null
+            ? ''
+            : isProviderValue(provider)
+              ? PROVIDER_HINTS[provider]
+              : 'Models are selected per-task based on quality testing.'}
         </p>
         </div>
       </div>
@@ -299,12 +324,23 @@ function LocalProviderPanelBody() {
         </div>
       )}
 
-      {provider !== 'codex' ? <div className={sectionClass}>
+      {provider !== 'codex' ? <div className={sectionClass} ref={keySection}>
+        {needsOpenaiKey(settings) && (
+          <div className="neq-key-guide" role="note">
+            <div className={sectionTitleClass}>{GUIDE_HEADING}</div>
+            <p className="neq-settings-help-parity">{GUIDE_INTRO}</p>
+            <ol className="neq-settings-help-parity">
+              {GUIDE_STEPS.map((step) => <li key={step}>{step}</li>)}
+            </ol>
+            <p className="neq-settings-help-parity">{GUIDE_FOOTER}</p>
+          </div>
+        )}
         <div className={sectionTitleClass}>OpenAI API Key</div>
         <p className="neq-settings-help-parity">
-          Needed for the Legacy and OpenAI providers. Stored locally on this machine.
+          {KEY_HELP}
           <span>{keyStatusText(settings.openaiHasKey)}</span>
         </p>
+        {pricedAt && <p className="neq-settings-help-parity neq-spend-disclaimer">{spendDisclaimer(pricedAt)}</p>}
         <div className="neq-settings-item neq-settings-stack-parity"><input
           type="password"
           aria-label="OpenAI API key"
@@ -314,9 +350,23 @@ function LocalProviderPanelBody() {
           placeholder="sk-..."
           autoComplete="off"
         />
-        <button type="button" className={smallButtonClass} onClick={saveOpenaiKey}>
+        <button type="button" className={smallButtonClass} onClick={saveOpenaiKey} disabled={checking}>
           Save Key
         </button></div>
+        {keyCheck && keyCheckText(keyCheck) && (
+          <p className="neq-settings-status-parity neq-key-check" data-result={keyCheck.result} role="status">
+            {keyCheckText(keyCheck)}
+            {keyCheck.restart_needed && <> {KEY_RESTART}</>}
+          </p>
+        )}
+        {settings.openaiKeychain === false && settings.openaiHasKey && (
+          <p className="neq-settings-help-parity neq-key-no-keychain">{KEY_NO_KEYCHAIN}</p>
+        )}
+        {keyGate && canStartAfter(keyCheck) && (
+          <button type="button" className={smallButtonClass} onClick={resumeGatedAction}>
+            {START_ADVENTURE}
+          </button>
+        )}
       </div> : null}
 
       {provider === 'gemini' && (

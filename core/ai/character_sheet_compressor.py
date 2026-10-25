@@ -13,13 +13,10 @@ Features:
 
 Usage:
   python3 core/ai/character_sheet_compressor.py --char path/to/character.json
-
-Optional flags:
-  --keep-paren-info   Keep parenthetical info in EQUIP item names (default: removed).
 """
 
 import json, re, argparse
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List
 
 def slug(s: str) -> str:
     return re.sub(r'[^a-z0-9]+', '_', str(s).lower()).strip('_')
@@ -36,14 +33,6 @@ def describe_text(s) -> str:
         return ''
     return compact(str(s)).replace(';', ',')
 
-def strip_parens(text: str) -> Tuple[str, Optional[str]]:
-    # Don't strip +N modifiers for weapons/armor
-    if re.search(r'\+\d+', text):
-        return text, None
-    infos = re.findall(r'\(([^()]*)\)', text)
-    base = re.sub(r'\s*\([^)]*\)', '', text).strip()
-    return base, ('; '.join(compact(x) for x in infos) if infos else None)
-
 def squeeze_name(name: str) -> str:
     """Blessing of the Silent King -> BlessingSilentKing"""
     n = re.sub(r'\bof the\b', '', name, flags=re.IGNORECASE)
@@ -51,30 +40,15 @@ def squeeze_name(name: str) -> str:
     n = re.sub(r'\s+', '', n).strip()
     return n
 
-def normalize_feat(name: str, ability_uses: dict = None) -> str:
-    """Normalize features with ability counters if available"""
-    m = re.search(r'\(([^)]*)\)', name)
-    base_name = re.sub(r'\s*\([^)]*\)', '', name).strip() if m else name
-    
-    # Check if this ability has usage tracking
-    if ability_uses:
-        for ability_key in ability_uses:
-            if ability_key.lower() in base_name.lower():
-                uses = ability_uses[ability_key]
-                current = uses.get('current', uses.get('uses', 0))
-                max_uses = uses.get('max', uses.get('max_uses', 0))
-                base = squeeze_name(base_name)
-                if max_uses > 0:
-                    return f"{base}({current}/{max_uses})"
-    
-    if m:
-        inner = m.group(1).strip()
-        base = squeeze_name(base_name)
-        # Replace spaces in CR values
-        inner = re.sub(r'CR\s+', 'CR', inner)
-        if re.search(r'\d|cr|rest', inner, flags=re.IGNORECASE):
-            return f"{base}:{inner.replace(' ', '')}"
-        return base
+def normalize_feat(name: str) -> str:
+    """A feature's name squeezed, with what its parentheses hold kept as written
+    (spaces removed): "Divine Order (Protector)" -> "DivineOrder:Protector".
+    No word in the name decides what is shown."""
+    inner = [x.strip().replace(' ', '') for x in re.findall(r'\(([^)]*)\)', name)]
+    inner = [x for x in inner if x]
+    if inner:
+        base = squeeze_name(re.sub(r'\s*\([^)]*\)', '', name).strip())
+        return f"{base}:{','.join(inner)}"
     return squeeze_name(name)
 
 def normalize_attack(name: str, kind: str, dmg_die: str, dmg_type: str, atk_bonus: int = None, dmg_bonus: int = None) -> str:
@@ -107,7 +81,7 @@ def get_dict(d: Dict[str, Any], *keys) -> Dict[str, Any]:
             return d[k]
     return {}
 
-def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> str:
+def format_flatlist(character: Dict[str, Any]) -> str:
     try:
         from core.effects.effective import effective_sheet
         character = effective_sheet(character)
@@ -131,7 +105,7 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
     spd  = character.get('speed') or 30
     status = character.get('status') or 'alive'
     condition = character.get('condition') or 'none'
-    affected  = character.get('affected') or ''
+    affected  = ','.join(str(c) for c in character.get('condition_affected') or []) if isinstance(character.get('condition_affected'), list) else ''
 
     # Stats
     abilities = get_dict(character, 'abilities', 'STATS', 'stats')
@@ -147,16 +121,34 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
     m = {'strength':'str','dexterity':'dex','constitution':'con',
          'intelligence':'int','wisdom':'wis','charisma':'cha'}
     saves_out = ','.join(m.get(x.lower(), x[:3].lower()) for x in saves)
+    save_totals = character.get('savingThrowBonuses')
+    if isinstance(save_totals, dict) and save_totals:  # engine totals; proficient abilities stay listed
+        saves_out = ','.join(f"{m.get(a, a[:3])}:{v:+d}" for a, v in save_totals.items()) + (f"(prof:{saves_out})" if saves_out else '')
+    roll_modes = character.get('rollModes')
+    modes_out = (' MODES(engine applies at the roll prompt; never pass as mode)={' + ','.join(f'{k}:{v}' for k, v in roll_modes.items()) + '};') if isinstance(roll_modes, dict) and roll_modes else ''
 
-    # Skills
-    skills = get_dict(character, 'skills', 'SKILLS')
-    skills_out = ','.join(f"{k[:3]}:{v}" for k,v in skills.items())
+    # Skills: the engine's bonuses from a dict; a legacy list names the
+    # proficient skills with no number. No arithmetic and no defaults here:
+    # proficiency, initiative and passive perception are engine-written
+    # (core/nql/stats) and print as stored.
+    # Full skill names: a three-letter cut folded Perception, Persuasion and
+    # Performance into one 'per' key (#553).
+    skills_field = character.get('skills')
+    if isinstance(skills_field, dict):
+        skills_out = ','.join(f"{k}:{v}" for k,v in skills_field.items())
+    elif isinstance(skills_field, list):
+        skills_out = ','.join(str(k).lower() for k in skills_field)
+    else:
+        skills_out = ''
 
     # Proficiency bonus / Senses
-    prof_bonus = character.get('proficiencyBonus') or 3
+    prof_bonus = character.get('proficiencyBonus')
+    initiative = character.get('initiative')
     senses = get_dict(character, 'senses', 'SENSES')
     darkv = senses.get('darkvision') or 0
-    pp = senses.get('passivePerception') or 10
+    pp = senses.get('passivePerception')
+    expertise = character.get('expertise')
+    expertise_out = ','.join(str(k).lower() for k in expertise) if isinstance(expertise, list) else ''
 
     langs = character.get('languages') or []
     langs_out = ','.join(langs) if isinstance(langs, list) else str(langs)
@@ -177,17 +169,12 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
     # VULN/RES/IMM/COND_IMM
     vuln = character.get('vulnerabilities') or ''
     res  = character.get('damageResistances') or []
-    # Deduplicate and format resistances
+    # Each resistance as the sheet holds it (deduplicated), never merged or reworded
     res_clean = set()
     for r in res:
-        r_lower = r.lower().replace(' from ', '_from_').replace(' ', '_')
-        # Handle "poison_from_giant_spider" -> "spider_poison"
-        if 'poison_from_giant_spider' in r_lower:
-            res_clean.add('spider_poison')
-        elif 'poison' in r_lower and 'poison' not in res_clean:
-            res_clean.add('poison')
-        else:
-            res_clean.add(r_lower)
+        value = compact(r).lower().replace(' ', '_')
+        if value:
+            res_clean.add(value)
     res_out = ','.join(sorted(res_clean))
     cimm= character.get('conditionImmunities') or []
     cimm_out = ','.join(c.lower() for c in cimm)
@@ -205,13 +192,13 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
             # For abilities with usage, add (current/max) after the name
             if current is not None and max_uses is not None:
                 # First normalize the base name (keeping things like 2/rest)
-                base_norm = normalize_feat(feat_name, None)
+                base_norm = normalize_feat(feat_name)
                 # Then add the usage counter
                 cf_norm.append(f"{base_norm}({current}/{max_uses})")
             else:
-                cf_norm.append(normalize_feat(feat_name, None))
+                cf_norm.append(normalize_feat(feat_name))
         else:
-            cf_norm.append(normalize_feat(feat, None))
+            cf_norm.append(normalize_feat(feat))
     classfeat_out = ','.join(cf_norm)
 
     # Feats (D-242-D, ruling 5): every feat with its whole description, so the
@@ -223,6 +210,12 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
         if isinstance(feat, dict):
             feat_name = compact(feat.get('name') or '')
             feat_desc = describe_text(feat.get('description'))
+            if feat.get('grantedSpells'):
+                feat_desc += ' grantedSpells=' + json.dumps(feat['grantedSpells'], ensure_ascii=True)
+            # A feat's own use pool (#891), shown as class features show theirs (#937)
+            usage = feat.get('usage') if isinstance(feat.get('usage'), dict) else {}
+            if type(usage.get('current')) is int and type(usage.get('max')) is int:
+                feat_name = f"{feat_name}({usage['current']}/{usage['max']})"
         else:
             feat_name, feat_desc = compact(str(feat)), ''
         feats_out_parts.append(f"{feat_name}: {feat_desc}" if feat_desc else feat_name)
@@ -238,13 +231,26 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
             desc = describe_text(it.get('description'))
         else:
             raw, qty, desc = str(it), 1, ''
-        base, _ = strip_parens(raw) if not keep_paren_info else (raw, None)
-        nm = compact(base)
+        # The item's name as the sheet writes it, parentheses included.
+        nm = compact(raw)
         nm_qty = f"{nm} x{qty}" if qty and qty > 1 else nm
-        # D-242-D: the item's whole description after a colon (never inside
-        # parentheses, which strip_parens keys on for names).
+        if isinstance(it, dict) and it.get('equipped') is True:
+            nm_qty = f"{nm_qty} [equipped]"
+        # D-242-D: the item's whole description after a colon.
         equip_names.append(f"{nm_qty}: {desc}" if desc else nm_qty)
     equip_out = '[' + ','.join(equip_names) + ']'
+
+    # #359: the typed ammunition rows. The full sheet prints them (AMMO) and the
+    # DM Note does not, so the compressed sheet must; an empty list is printed
+    # so "none" is a fact, not a gap.
+    ammo_parts = []
+    for row in get_list(character, 'ammunition'):
+        if isinstance(row, dict) and row.get('name'):
+            part = f"{describe_text(row['name'])} x{row.get('quantity', 0)}"
+            if type(row.get('recoverable')) is int and row['recoverable'] > 0:
+                part += f"(recoverable {row['recoverable']})"
+            ammo_parts.append(part)
+    ammo_out = '[' + ','.join(ammo_parts) + ']'
 
     # Attacks
     attacks = get_list(character, 'attacksAndSpellcasting')
@@ -255,13 +261,9 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
         dtype = atk.get('damageType','') or ''
         atk_bonus = atk.get('attackBonus')
         dmg_bonus = atk.get('damageBonus')
-        desc = (atk.get('description') or '').lower()
-        if 'spell' in desc or an.lower().strip() == 'sacred flame':
-            kind = 'spell'
-        elif 'ranged' in desc or 'crossbow' in an.lower():
-            kind = 'ranged'
-        else:
-            kind = 'melee'
+        # The row's typed kind (char_schema: melee, ranged or spell); a row
+        # without one is shown as untyped, never guessed from its words.
+        kind = atk.get('type') if atk.get('type') in ('melee', 'ranged', 'spell') else 'untyped'
         atk_parts.append(normalize_attack(an, kind, dmg, dtype, atk_bonus, dmg_bonus))
     atk_out = '[' + ','.join(atk_parts) + ']'
 
@@ -272,8 +274,8 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
     ability_short = {'strength':'str', 'dexterity':'dex', 'constitution':'con',
                      'intelligence':'int', 'wisdom':'wis', 'charisma':'cha'}
     ability = ability_short.get(ability.lower(), ability[:3].lower())
-    dc = sc.get('spellSaveDC') or 0
-    atk_bonus = sc.get('spellAttackBonus') or 0
+    dc = sc.get('spellSaveDC')
+    atk_bonus = sc.get('spellAttackBonus')
     spellcast_out = f"{{ability:{ability},DC:{dc},ATK:+{atk_bonus}}}"
 
     spells = sc.get('spells') or {}
@@ -324,11 +326,15 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
             f"{effect['name']}({duration})" if duration else str(effect['name'])
         )
 
+    exhaustion = character.get('exhaustion')
+    exhaustion_out = f" EXH={exhaustion}(-{2 * exhaustion}d20; long rest -1);" if type(exhaustion) is int and exhaustion > 0 else ""
+    if type(exhaustion) is int and exhaustion > 0 and type(spd) is int:
+        spd = f"{max(0, spd - 5 * exhaustion)}now(base{spd},exh-{5 * exhaustion})"
     out = []
     # LVL removed - already in DM Note party stats
     out.append(f"CHAR={name}; RACE={race}; CLASS={cls}; ALIGN={align}; BG={bg}; AC={ac}; SPD={spd}; STATUS={status}; CONDITION={condition}; AFFECTED={affected};")
     # STATS removed - already in DM Note party stats (STR:X DEX:X etc.)
-    out.append(f"SAVES={saves_out}; SKILLS={{{skills_out}}}; PROF+{prof_bonus};")
+    out.append(f"SAVES={saves_out}; SKILLS={{{skills_out}}}; EXPERTISE={expertise_out}; PROF+{prof_bonus}; INIT={initiative}(final,prof+feats incl);{exhaustion_out}{modes_out}")
     out.append(f"SENSES={{darkvision:{darkv},PP:{pp}}}; LANG={langs_out};")
     out.append(f"PROF={{{prof_out}}};")
     out.append(f"VULN={vuln}; RES={res_out}; IMM=; COND_IMM={cimm_out};")
@@ -337,7 +343,11 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
         out.append(f"FEATS={feats_out};")
     if temporary_effects:
         out.append(f"TEMP_FX=[{','.join(temporary_effects)}];")
+    focus = character.get('concentration')
+    if isinstance(focus, dict) and focus.get('name'):
+        out.append(f"CONC={focus['name']}({','.join(focus.get('targets') or []) or 'self'}; engine saves on damage, one spell at a time);")
     out.append(f"EQUIP={equip_out};")
+    out.append(f"AMMO={ammo_out};")
     out.append(f"ATK={atk_out};")
     out.append(f"SPELLCAST={spellcast_out};")
     out.append(f"SPELLS={spells_out};")
@@ -348,11 +358,10 @@ def format_flatlist(character: Dict[str, Any], keep_paren_info: bool=False) -> s
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--char', required=True, help='Path to character JSON')
-    ap.add_argument('--keep-paren-info', action='store_true', help='Keep parenthetical info in EQUIP item names')
     args = ap.parse_args()
     with open(args.char, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    print(format_flatlist(data, keep_paren_info=args.keep_paren_info))
+    print(format_flatlist(data))
 
 if __name__ == '__main__':
     main()

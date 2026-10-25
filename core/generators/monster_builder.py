@@ -63,6 +63,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from core.ai import api_client
 from jsonschema import validate, ValidationError
+from core.combat.attacks import typed_multiattack_issue
 import config
 from utils.module_path_manager import ModulePathManager
 from utils.enhanced_logger import debug, info, warning, error, set_script_name
@@ -72,6 +73,13 @@ from utils.single_target_generation import (
     single_target_generation,
 )
 from utils.capture.multi_model_capture import capture_and_fanout, register_callsite
+from utils.schema_feedback import (
+    informed_retry_messages,
+    issue_paths_for_log,
+    json_correction,
+    schema_correction,
+    validation_issues,
+)
 register_callsite("T034", "core/generators/monster_builder.py", 231)
 
 # Set script name for logging
@@ -164,6 +172,16 @@ SPELLCASTING MONSTERS:
 - Calculate spell attack bonus as: proficiency bonus + ability modifier
 - Choose appropriate spells for the monster's theme and CR
 
+ACTIONS AND SPECIAL ABILITIES - write each entry the way the SRD stat block states it:
+- kind "attack": an attack roll. attackBonus is the to-hit bonus, damageDice the dice (for example "1d8"), damageBonus the flat bonus, damageType the type. When the hit also forces a saving throw (a venomous bite: "the target must make a DC 11 Constitution saving throw, taking 2d8 poison damage on a failed save, or half as much on a successful one"), put that save in "rider": {ability, dc, halfOnSave, onFail: {damageDice, damageBonus, damageType, conditions, roundsRemaining, repeatAtEndOfTurn}}. The attack's own dice stay in damageDice; the rider's dice go in rider.onFail.damageDice.
+- kind "save": no attack roll; the target makes a saving throw. Put the save in "save": {ability (lowercase: strength, dexterity, constitution, intelligence, wisdom, charisma), dc, halfOnSave, onFail: {damageDice, damageBonus, damageType, conditions, roundsRemaining, repeatAtEndOfTurn}}. onFail.conditions lists SRD condition names in lowercase (restrained, poisoned, paralyzed, prone, frightened, blinded, stunned...); an empty list when the ability only deals damage. roundsRemaining is the duration in rounds, or null when the condition lasts until escaped or cured; repeatAtEndOfTurn is true when the target repeats the save at the end of each of its turns. For a kind "save" entry write attackBonus 0, damageDice "0d0", damageBonus 0 and damageType "none" (the mechanics live in save). Example, Giant Spider Web: {"name": "Web", "kind": "save", "attackBonus": 0, "damageDice": "0d0", "damageBonus": 0, "damageType": "none", "recharge": {"min": 5, "max": 6}, "save": {"ability": "dexterity", "dc": 13, "halfOnSave": false, "onFail": {"damageDice": "", "damageBonus": 0, "damageType": "", "conditions": ["restrained"], "roundsRemaining": null, "repeatAtEndOfTurn": false}}, "description": "Ranged 30/60 ft. The target is restrained by webbing until it escapes (DC 12 Strength check) or the webbing is destroyed (AC 10, 5 hit points)."}
+- kind "trait": a passive feature with no roll (Web Sense, Spider Climb, Pack Tactics, Keen Smell): attackBonus 0, damageDice "0d0", damageBonus 0, damageType "none", and the rule text in "description". Traits go in specialAbilities; attack and save abilities that the creature uses on its turn go in actions.
+- "recharge": {min, max} on an action that recharges on a d6 (Recharge 5-6 is {"min": 5, "max": 6}); omit it otherwise.
+- "description": the SRD sentence for every entry (range, area, escape DC, what happens). Never put rule text in damageType; never leave a saving throw described only in prose.
+- Multiattack: a single entry named "Multiattack" with attackBonus 0, damageDice "0d0", damageBonus 0, damageType "none" and the description stating the attacks it makes; the component attacks are their own entries. Also write the top-level "multiattackSequence": the swings one Attack action makes, in order, one {"name", "count"} per component attack, each name exactly one of this monster's own attack entries (for example [{"name": "Claw", "count": 2}, {"name": "Bite", "count": 1}]). Combat plays exactly this list; it never reads the description. Omit multiattackSequence when the monster has no Multiattack.
+
+`skills` and `senses` are objects mapping a skill or sense name to its number; write {} when the creature has none. `savingThrows`, `damageVulnerabilities`, `damageResistances`, `damageImmunities` and `conditionImmunities` are arrays of strings.
+
 Ensure your new monster JSON adheres to the provided schema template. Do not include any additional properties or nested 'type' and 'value' fields. For non-spellcasters, omit the spellcasting property entirely. Return only the JSON content without any markdown formatting."""
 
     # Build context-aware user prompt
@@ -226,11 +244,14 @@ Schema: {json.dumps(schema)}"""
     last_ai_response = None
     last_parsed_data = None
 
+    # A failed attempt is retried with its own reply and the validation
+    # error, rebuilt from the first request each time (#886).
+    attempt_messages = prompt
     for attempt in range(_max_retries + 1):
         try:
             response = capture_and_fanout("T034", api_client.create_completion,
                 _request_provider=MODEL_PROVIDER,
-                messages=prompt,
+                messages=attempt_messages,
                 model=monster_config["model"],
                 temperature=0.7,
                 **_extra)
@@ -249,26 +270,35 @@ Schema: {json.dumps(schema)}"""
                     monster_data = monster_data["properties"]
                 # Remove nested 'value' fields if they exist
                 monster_data = remove_nested_values(monster_data)
+                monster_data = empty_lists_as_maps(monster_data)
                 last_parsed_data = monster_data
                 validate(instance=monster_data, schema=schema)
+                require_stated_abilities(monster_data)
+                require_typed_multiattack(monster_data)
                 return monster_data
             except json.JSONDecodeError as e:
                 last_json_err = e
                 last_validation_err = None
                 warning(
                     f"Monster build attempt {attempt + 1}/{_max_retries + 1} "
-                    f"returned invalid JSON: {str(e)}",
+                    f"returned invalid JSON at line {e.lineno} column {e.colno}",
                     category="monster_creation",
                 )
+                attempt_messages = informed_retry_messages(
+                    prompt, ai_response, json_correction(e))
                 continue
             except ValidationError as e:
                 last_json_err = None
                 last_validation_err = e
+                issues = validation_issues(last_parsed_data, schema, e)
                 warning(
                     f"Monster build attempt {attempt + 1}/{_max_retries + 1} "
-                    f"failed schema validation: {str(e)}",
+                    f"failed schema validation at {issue_paths_for_log(issues)} "
+                    f"({len(issues)} issue(s))",
                     category="monster_creation",
                 )
+                attempt_messages = informed_retry_messages(
+                    prompt, ai_response, schema_correction(last_parsed_data, schema, e))
                 continue
         except Exception as e:
             # Network / API failures are not retried here -- preserve the
@@ -286,6 +316,68 @@ Schema: {json.dumps(schema)}"""
         print(f"{YELLOW}Processed monster data:{RESET}\n{json.dumps(last_parsed_data, indent=2)}")
 
     return None
+
+def require_stated_abilities(monster_data):
+    """MS-a: an ability declared as a saving throw carries its save.
+
+    The schema keeps every new field optional so older stat blocks still
+    load; this is the one typed check the schema cannot express without
+    conditional keywords that the provider converters do not carry. A
+    ``kind: "save"`` entry without a ``save`` object, or a ``save`` object
+    on an entry of another kind, is a ValidationError so the retry loop
+    asks the model again. An entry with a ``save`` and no ``kind`` is
+    normalized to ``kind: "save"``.
+    """
+    for family in ("actions", "specialAbilities"):
+        entries = monster_data.get(family)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("kind")
+            has_save = isinstance(entry.get("save"), dict)
+            if kind == "save" and not has_save:
+                raise ValidationError(
+                    "%s entry %r is kind 'save' but carries no save object"
+                    % (family, entry.get("name"))
+                )
+            if has_save and kind is None:
+                entry["kind"] = "save"
+            elif has_save and kind != "save":
+                raise ValidationError(
+                    "%s entry %r carries a save object but kind %r (a save on a hit belongs in rider)"
+                    % (family, entry.get("name"), kind)
+                )
+
+
+def require_typed_multiattack(monster_data):
+    """MA-2: a Multiattack carries its typed swings.
+
+    Combat plays exactly the swings in ``multiattackSequence``; the Multiattack
+    entry's description is for the DM and is never parsed. The rule is
+    combat's own (core/combat/attacks.typed_multiattack_issue); a block it
+    names is a ValidationError so the retry loop asks the model again.
+    """
+    issue = typed_multiattack_issue(monster_data)
+    if issue:
+        raise ValidationError(issue, path=["multiattackSequence"])
+
+
+# mon_schema types these as objects (a skill or sense name -> its number).
+# An empty list states the same typed fact as {}: the creature has none.
+# It is reconciled to {} before validation (#886); a non-empty list is
+# still a schema failure and goes through the informed retry.
+_MAP_FIELDS = ("skills", "senses")
+
+
+def empty_lists_as_maps(monster_data):
+    if isinstance(monster_data, dict):
+        for field in _MAP_FIELDS:
+            if monster_data.get(field) == []:
+                monster_data[field] = {}
+    return monster_data
+
 
 def remove_nested_values(data):
     if isinstance(data, dict):
@@ -312,10 +404,12 @@ def _active_module_path_manager():
         return ModulePathManager()
 
 
-def build_monster_file(monster_name, schema, party_level=1, path_manager=None):
-    """Generate and save one monster as a deduplicated target transaction."""
+def build_monster_file(monster_name, schema, party_level=1, path_manager=None, key=None):
+    """Generate and save one monster as a deduplicated target transaction.
+    key (#293/typed-monster-key) names the stat block's file; the name is
+    only what the generator is asked to create."""
     path_manager = path_manager or _active_module_path_manager()
-    target_path = path_manager.get_monster_path(monster_name)
+    target_path = path_manager.get_monster_path(key or monster_name)
 
     with single_target_generation(target_path) as transaction:
         candidates = [transaction.resolved_target, target_path]
@@ -352,6 +446,9 @@ def main():
                         help="Average party level for CR scaling. If "
                              "omitted, falls back to reading "
                              "party_tracker.json.")
+    parser.add_argument("--key", default=None,
+                        help="The monster key the stat block is saved under "
+                             "(#293/typed-monster-key); default: the name.")
     args = parser.parse_args()
 
     monster_name_arg = args.monster_name
@@ -372,10 +469,12 @@ def main():
             from utils.encoding_utils import safe_json_load
             party_tracker = safe_json_load("party_tracker.json")
             if party_tracker and party_tracker.get("partyMembers"):
+                path_manager = ModulePathManager(
+                    party_tracker.get("module", "").replace(" ", "_") or None)
                 levels = []
                 for character_name in party_tracker["partyMembers"]:
                     character_data = safe_json_load(
-                        f"characters/{character_name}.json")
+                        path_manager.get_character_path(character_name))
                     if character_data:
                         levels.append(character_data.get("level", 1))
                 if levels:
@@ -393,7 +492,7 @@ def main():
         return
 
     generated_monster_data = build_monster_file(
-        monster_name_arg, schema_data, party_level
+        monster_name_arg, schema_data, party_level, key=args.key
     )
     if generated_monster_data:
         info(f"SUCCESS: Monster creation ({monster_name_arg}) - PASS", category="monster_creation")

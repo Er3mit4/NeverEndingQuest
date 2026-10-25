@@ -42,8 +42,8 @@ GO_ON_TOKEN = "go on"
 COMBAT_DOWN_SINK_LINE = (
     "You are down and cannot act. Your companions and the enemies take this "
     "round on their own. Anything you send now is you at the table, speaking "
-    "to your companions - not {name} acting or speaking. Send '{token}' (or an "
-    "empty line) to let the round run. Save and Load work as always."
+    "to your companions - not {name} acting or speaking. Send '{token}' to let "
+    "the round run. Save and Load work as always."
 )
 MAIN_DOWN_SINK_LINE = (
     "You are down and cannot act. Anything you send now is you at the table, "
@@ -51,8 +51,9 @@ MAIN_DOWN_SINK_LINE = (
     "companions will tend to you as they see fit, or as you ask. Save and "
     "Load work as always."
 )
-# Banner suffixes: appended after the [time][HP][XP] prefix the headless and
-# web clients parse; the prefix bytes are never changed.
+# Banner suffixes: appended after the [date][time][HP][XP] prefix the headless
+# and web clients parse (the main prompt's [date] is #642's; the combat prompt
+# has none); the suffixes never change the prefix bytes.
 COMBAT_DOWN_BANNER = "{name} is down - table talk, or '{token}':"
 MAIN_DOWN_BANNER = "{name} is down - table talk:"
 TPK_BANNER_CONTROLS = "Your party has fallen - Load, Reset, or Quit:"
@@ -61,9 +62,9 @@ TPK_BANNER_TERMINAL = (
     "the launcher:"
 )
 TPK_PAUSE_TEXT = (
-    "Your whole party has fallen. No further turns were taken and nothing was "
-    "saved after your party fell. This fight cannot go on from here. Load a "
-    "save to return to an earlier moment, or Reset the campaign."
+    "Your whole party has fallen. No further turns were taken. This fight "
+    "cannot go on from here. Load a save to return to an earlier moment, or "
+    "Reset the campaign."
 )
 TABLE_TALK_PREFIX = (
     "Table talk from the player (the character is unconscious and cannot act; "
@@ -88,7 +89,7 @@ Table talk: everything the player types while their character is at 0 HP is the 
 
 Aftermath: if this is the aftermath after the last enemy falls and the character is still down, narrate the party turning to them, but the character stays unconscious in this beat; waking happens only through a real action on the next turn.
 
-Recovery must be a real committed action, never a narrated claim: a heal, a potion administered by an ally, or a feature in combat; Medicine to stabilize, a potion, or rest out of combat, and rest only when the scene allows it. A withdrawal is legitimate, but the fight closes only when the enemies are resolved; never narrate an escape that did not close the encounter. Surrender is not offered. Level-up waits until the character is conscious."""
+Recovery must be a real committed action, never a narrated claim: a heal, a potion administered by an ally, or a feature in combat; out of combat, an ally tending a party member at exactly 0 HP up to 1 HP with no check (an updateCharacterInfo change, never above 1 HP this way), a potion, or rest, and rest only when the scene allows it. A withdrawal is legitimate, but the fight closes only when the enemies are resolved; never narrate an escape that did not close the encounter. Surrender is not offered. Level-up waits until the character is conscious."""
 
 
 def is_go_on(text):

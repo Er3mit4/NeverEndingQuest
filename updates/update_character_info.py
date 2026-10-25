@@ -36,14 +36,14 @@
 # ================
 # - temporaryEffects: Complete array replacement (not merged)
 # - Equipment: Smart merging by item_name
-# - Ammunition: Additive updates (+20 arrows, -10 bolts)
-# - Currency: Always return final values after transactions
+# - Ammunition: engine-owned stock (core/nql/ammunition); T079 returns quantityDelta per row, never totals
+# - Currency: engine-owned (core/nql/currency); T079 returns currencyDelta (signed per coin), never totals
 # 
 # COMMON ISSUES & SOLUTIONS:
 # =========================
 # 1. "Invalid format specifier" - Check debug log for malformed AI response
 # 2. Effects not clearing - Verify temporaryEffects is in complete_replacement_arrays
-# 3. Currency not updating - Ensure all denominations (gold/silver/copper) returned
+# 3. Currency not updating - T079 must return currencyDelta; a 'currency' totals object is refused
 # 4. Equipment not merging - Check item_name matches exactly
 # 
 # This module provides secure, validated character data updates using AI to
@@ -107,7 +107,11 @@ from jsonschema import validate, ValidationError
 import config
 from core.ai import api_client
 from utils.capture.multi_model_capture import capture_and_fanout, register_callsite
-from utils.capture.live_provider_call import LiveProviderSuperseded
+from utils.capture.live_provider_call import (
+    LiveProviderCompletedError,
+    LiveProviderSuperseded,
+)
+from utils.transient_filesystem import ReadOnlySaveStop
 register_callsite("T079", "updates/update_character_info.py", 1692)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Dict, Any, Optional
@@ -125,6 +129,7 @@ import re
 from utils.module_path_manager import ModulePathManager
 from utils.file_operations import safe_write_json, safe_read_json
 from utils.encoding_utils import safe_json_load
+from utils.status_words import status_word_refusal
 from core.validation.character_validator import AICharacterValidator, armor_contract_errors
 from core.validation.character_effects_validator import AICharacterEffectsValidator
 from utils.enhanced_logger import debug, info, warning, error, set_script_name
@@ -176,95 +181,205 @@ def normalize_character_name(character_name):
     
     # Remove leading/trailing underscores
     name = name.strip('_')
-    
-    return name
+    if name:
+        return name
+    # No ASCII letter or digit (#894): the name's own letters, never the
+    # empty stem (characters/.json).
+    from utils.encoding_utils import unicode_name_stem
+    return unicode_name_stem(character_name)
 
-def find_character_file_fuzzy(character_name):
-    """Find a character file using fuzzy matching
-    
-    This function attempts to find a character file that matches the given name,
-    even if the file name doesn't exactly match the character name.
-    
+def reserved_character_ids():
+    """The engine character ids the game's own worlds use (#949): no character
+    may resolve to one of them."""
+    from core.nql.attacks import ATTACKER, TARGET
+    from core.nql.saves import SOURCE
+    from utils.roster_conversion import ACTOR
+    return (ATTACKER, TARGET, SOURCE, ACTOR)
+
+
+def name_refusal(character_name, status_words=True):
+    """Why a new character cannot take this name, or None (#949). A name with
+    no letter or digit gives the empty file stem (characters/.json); a name
+    whose engine id is a reserved one would share it (travel leaves a member
+    with the roster actor's id out of the party). With status_words, a name
+    carrying a status word is refused too (#1119)."""
+    name = str(character_name or "")
+    if not normalize_character_name(name):
+        return f"the name {name!r} has no letter or digit, so it cannot name a character file"
+    from core.nql.genesis import character_id
+    cid = character_id({"name": name})
+    if cid in reserved_character_ids():
+        return f"the name {name!r} gives the engine id {cid}, which the rules engine reserves for itself"
+    if status_words:
+        return status_word_refusal(name)
+    return None
+
+
+def _is_backup_sheet_file(filename):
+    return filename.endswith(".bak") or filename.endswith("_BU.json") or "backup" in filename
+
+def _legacy_sheet_id(sheet):
+    """The file id of a sheet saved before #894 as characters/.json: its name's
+    stem, which ModulePathManager maps back to that file; None when it would
+    not (#1082)."""
+    name = sheet.get("name") if isinstance(sheet, dict) else None
+    stem = normalize_character_name(name) if isinstance(name, str) else ""
+    if (not stem or stem.isascii() or normalize_character_name(stem) != stem
+            or os.path.exists(os.path.join("characters", f"{stem}.json"))):
+        return None
+    return stem
+
+def _lookup_stops():
+    from core.combat.invocation import InvocationSupersededError
+    from utils.capture.live_provider_call import LiveProviderSuperseded
+    from utils.transient_filesystem import ReadOnlySaveStop
+    return (LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop)
+
+
+def _read_sheet_waiting(path, wait):
+    """A sheet's bytes; while the read is busy, wait() and read again."""
+    from utils.transient_filesystem import (
+        ReadOnlySaveStop, is_transient_filesystem_error, read_bytes_preserving_errors,
+    )
+
+    while True:
+        try:
+            return read_bytes_preserving_errors(path)
+        except ReadOnlySaveStop:
+            raise
+        except OSError as error:
+            if not is_transient_filesystem_error(error):
+                raise
+        wait()
+
+
+def _sheet_candidates(wait):
+    """The sheet files a name lookup reads. Without ``wait``, glob plus the
+    legacy characters/.json, as since #1082; with ``wait``, the same names
+    through scandir_names, so a busy listing waits instead of listing nothing."""
+    import glob
+
+    if wait is None:
+        char_files = glob.glob(os.path.join("characters", "*.json"))
+    else:
+        from utils.transient_filesystem import scandir_names
+        names, _ = scandir_names("characters", wait, pattern="*.json")
+        char_files = [os.path.join("characters", name) for name in names]
+    # glob never matches a dotfile; a sheet saved before #894 is characters/.json (#1082)
+    if os.path.isfile(os.path.join("characters", ".json")):
+        char_files.append(os.path.join("characters", ".json"))
+    return char_files
+
+
+def find_character_file_fuzzy(character_name, *, wait=None):
+    """Find the character file for a name, exactly (#855, family 2 Part B).
+
+    The name is kept for its callers; it no longer matches loosely. In order:
+    - characters/<normalized name>.json;
+    - the one non-backup sheet in characters/ whose own "name" is this name
+      (case ignored, "_" read as a space), for a sheet whose file id differs
+      from its name, such as "Ranger Thane" in corrupted_ranger_thane.json;
+    - for a name ending in "_<n>" (n >= 2), the name combat_builder gives a
+      second copy of an NPC in one encounter, the same two steps on the name
+      before the suffix.
+    A near name ("Kira", "Captain Bryn") returns None: it is never resolved to
+    another character's file. An unreadable sheet is skipped with a warning,
+    so one bad file cannot make a lookup fail.
+    With ``wait``, a busy sheet or listing waits and a stop propagates; other
+    unreadable sheets are still skipped.
+
     Args:
         character_name (str): The character name to search for
-        
+
     Returns:
         str: The matched filename (without .json extension) or None if no match found
-        
-    Examples:
-        - "Ranger Thane" might match "corrupted_ranger_thane.json"
-        - "Scout Kira" would match "scout_kira.json"
     """
-    import glob
-    import os
-    from difflib import SequenceMatcher
-    from utils.enhanced_logger import debug
-    
-    # First try exact match with normalized name
-    normalized_name = normalize_character_name(character_name)
-    
-    # Use the unified characters directory
-    character_dir = "characters"
-    character_files = glob.glob(os.path.join(character_dir, "*.json"))
-    
-    # Try exact match first
-    exact_match_file = os.path.join(character_dir, f"{normalized_name}.json")
-    if os.path.exists(exact_match_file):
-        # Suppress routine exact match logging - this is expected behavior
-        # debug(f"FUZZY_MATCH: Exact match found for '{character_name}' -> '{normalized_name}'", category="character_updates")
-        return normalized_name
-    
-    # Prepare for fuzzy matching
-    input_lower = character_name.lower()
-    input_words = set(input_lower.split())
-    input_normalized = input_lower.replace("_", " ")
-    
-    best_match = None
-    best_score = 0.0
-    
-    for char_file in character_files:
-        filename = os.path.splitext(os.path.basename(char_file))[0]
-        
-        # Skip player character files (they should match exactly)
-        if filename in ['eirik_hearthwise', 'wizard_player']:
-            continue
-            
-        # Check various matching strategies
-        file_lower = filename.lower()
-        file_words = set(file_lower.replace("_", " ").split())
-        
-        # Strategy 1: Word subset matching
-        if input_words.issubset(file_words) or file_words.issubset(input_words):
-            score = len(input_words.intersection(file_words)) / max(len(input_words), len(file_words))
-            if score > best_score:
-                best_score = score
-                best_match = filename
-                # debug(f"FUZZY_MATCH: Word subset match '{character_name}' -> '{filename}' (score: {score:.2f})", category="character_updates")
-        
-        # Strategy 2: Normalized partial match
-        if input_normalized in file_lower.replace("_", " "):
-            score = len(input_normalized) / len(file_lower)
-            if score > best_score:
-                best_score = score
-                best_match = filename
-                # debug(f"FUZZY_MATCH: Partial match '{character_name}' -> '{filename}' (score: {score:.2f})", category="character_updates")
-        
-        # Strategy 3: Sequence matching
-        sequence_score = SequenceMatcher(None, input_lower, file_lower).ratio()
-        if sequence_score > best_score:
-            best_score = sequence_score
-            best_match = filename
-            # debug(f"FUZZY_MATCH: Sequence match '{character_name}' -> '{filename}' (score: {sequence_score:.2f})", category="character_updates")
-    
-    # Return match if score is high enough
-    # Note: Threshold increased from 0.5 to 0.65 to prevent false matches like "Scout Elen" -> "Scout Kira"
-    # while still allowing valid matches like "Ranger Thane" -> "corrupted_ranger_thane" (0.667)
-    if best_match and best_score >= 0.65:
-        # debug(f"FUZZY_MATCH: Best match for '{character_name}' is '{best_match}' (score: {best_score:.2f})", category="character_updates")
-        return best_match
-    else:
-        # debug(f"FUZZY_MATCH: No suitable match found for '{character_name}' (best score: {best_score:.2f})", category="character_updates")
+    if not isinstance(character_name, str) or not character_name.strip():
         return None
+
+    def key(name):
+        return " ".join(str(name or "").replace("_", " ").lower().split())
+
+    def resolve(name):
+        normalized_name = normalize_character_name(name)
+        if normalized_name and os.path.exists(os.path.join("characters", f"{normalized_name}.json")):
+            return normalized_name
+        wanted = key(name)
+        matches = []
+        char_files = _sheet_candidates(wait)
+        for char_file in sorted(char_files):
+            filename = os.path.basename(char_file)
+            if _is_backup_sheet_file(filename):
+                continue
+            try:
+                if wait is None:
+                    with open(char_file, "rb") as f:
+                        raw = f.read()
+                else:
+                    raw = _read_sheet_waiting(char_file, wait)
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    # safe_json_load's retry, without its sanitizing: the
+                    # stored name is compared as written (#938).
+                    text = raw.decode("utf-8", errors="replace")
+                sheet = json.loads(text)
+            except Exception as e:
+                if wait is not None and isinstance(e, _lookup_stops()):
+                    raise
+                warning(f"CHARACTER_LOOKUP: skipped unreadable sheet {char_file} ({type(e).__name__})", category="character_updates")
+                continue
+            if isinstance(sheet, dict) and isinstance(sheet.get("name"), str) and key(sheet["name"]) == wanted:
+                if filename == ".json":
+                    legacy_id = _legacy_sheet_id(sheet)
+                    if legacy_id:
+                        matches.append(legacy_id)
+                    continue
+                matches.append(os.path.splitext(filename)[0])
+        return matches[0] if len(matches) == 1 else None
+
+    found = resolve(character_name)
+    if found:
+        return found
+    duplicate = re.match(r"^(.+)_([2-9]|[1-9][0-9]+)$", character_name.strip())
+    if duplicate:
+        return resolve(duplicate.group(1))
+    return None
+
+def resolve_npc_sheet_id(npc_name, encounter=None, creature=None):
+    """The file id of an encounter NPC's sheet (#855, family 2 Part B).
+
+    A typed-agentic encounter records each NPC's sheet as the sourceRef of its
+    scene participant, found by the creature's combatantId, so the name is not
+    read. Otherwise (an older encounter, or no encounter) the name is resolved
+    exactly by find_character_file_fuzzy. Never raises.
+    """
+    try:
+        combatant_id = creature.get("combatantId") if isinstance(creature, dict) else None
+        scene = encounter.get("sceneFacts") if isinstance(encounter, dict) else None
+        participants = scene.get("participants") if isinstance(scene, dict) else None
+        if combatant_id and isinstance(participants, list):
+            for participant in participants:
+                if isinstance(participant, dict) and participant.get("combatantId") == combatant_id:
+                    source_ref = participant.get("sourceRef")
+                    if participant.get("sourceKind") == "character" and isinstance(source_ref, str):
+                        filename = os.path.basename(source_ref.replace("\\", "/"))
+                        if filename == ".json":
+                            # characters/.json (#1082): its id is its name's stem, not ".json"
+                            legacy = os.path.join("characters", ".json")
+                            if os.path.isfile(legacy):
+                                with open(legacy, "r", encoding="utf-8", errors="replace") as f:
+                                    legacy_id = _legacy_sheet_id(json.load(f))
+                                if legacy_id:
+                                    return legacy_id
+                            break
+                        if (filename.endswith(".json") and not _is_backup_sheet_file(filename)
+                                and os.path.exists(os.path.join("characters", filename))):
+                            return os.path.splitext(filename)[0]
+                    break
+    except Exception as e:
+        warning(f"CHARACTER_LOOKUP: encounter sheet reference unreadable ({type(e).__name__})", category="character_updates")
+    return find_character_file_fuzzy(npc_name)
 
 def detect_character_role(character_name):
     """Detect character role from existing data or file location"""
@@ -299,77 +414,26 @@ def detect_character_role(character_name):
 
 def fuzzy_match_character_name(input_name, party_tracker_data):
     """
-    Try to find a character using fuzzy matching logic.
-    Returns the correct character name if found, None otherwise.
-    """
-    input_lower = input_name.lower().strip()
-    
-    # Check party members (exact match first)
-    for member in party_tracker_data.get("partyMembers", []):
-        if member.lower() == input_lower:
-            return member
-    
-    # Check party NPCs (exact match first)
-    for npc in party_tracker_data.get("partyNPCs", []):
-        npc_name = npc.get("name", "")
-        if npc_name.lower() == input_lower:
-            return npc_name
-    
-    # Try partial matches for party NPCs (e.g., "kira" matches "Scout Kira")
-    for npc in party_tracker_data.get("partyNPCs", []):
-        npc_name = npc.get("name", "")
-        npc_lower = npc_name.lower()
-        # Check if input is contained in the NPC name
-        if input_lower in npc_lower:
-            # debug(f"FUZZY_MATCH: Matched '{input_name}' to '{npc_name}' via partial match", category="character_updates")
-            return npc_name
-        # Check if any word in NPC name matches input
-        npc_words = npc_lower.split()
-        if input_lower in npc_words:
-            # debug(f"FUZZY_MATCH: Matched '{input_name}' to '{npc_name}' via word match", category="character_updates")
-            return npc_name
-        
-        # Check if normalized input matches part of normalized NPC name
-        # This handles cases like "ranger_thane" matching "Corrupted Ranger Thane"
-        input_normalized = input_lower.replace("_", " ")
-        if input_normalized in npc_lower:
-            # debug(f"FUZZY_MATCH: Matched '{input_name}' to '{npc_name}' via normalized partial match", category="character_updates")
-            return npc_name
-        
-        # Check each word in the normalized input against the NPC name
-        input_words = input_normalized.split()
-        for word in input_words:
-            if word in npc_lower and len(word) > 2:  # Skip very short words
-                # debug(f"FUZZY_MATCH: Matched '{input_name}' to '{npc_name}' via word '{word}'", category="character_updates")
-                return npc_name
-    
-    # Try checking character files in the module
-    try:
-        current_module = party_tracker_data.get("module", "").replace(" ", "_")
-        path_manager = ModulePathManager(current_module)
-        import glob
-        import os
-        
-        # Get all character files
-        character_files = glob.glob(os.path.join(path_manager.module_dir, "characters", "*.json"))
-        
-        for char_file in character_files:
-            try:
-                char_data = safe_read_json(char_file)
-                if char_data and "name" in char_data:
-                    char_name = char_data["name"]
-                    if char_name.lower() == input_lower:
-                        return char_name
-                    # Check partial match
-                    if input_lower in char_name.lower():
-                        # debug(f"FUZZY_MATCH: Matched '{input_name}' to '{char_name}' via file search", category="character_updates")
-                        return char_name
-            except:
-                continue
-    except Exception as e:
-        # debug(f"FUZZY_MATCH: Error searching character files: {str(e)}", category="character_updates")
-        pass
+    Resolve a name the model gave to a party character's exact name.
 
+    Only an exact match counts: case is ignored and "_" reads as a space, so
+    "scout_kira" is "Scout Kira". A near name ("Kira", "Scout Elen") is never
+    resolved to another character; it returns None and the caller reports that
+    no sheet was found (#855, family 2).
+    """
+    def key(name):
+        return " ".join(str(name or "").replace("_", " ").lower().split())
+
+    wanted = key(input_name)
+    if not wanted:
+        return None
+    for member in party_tracker_data.get("partyMembers", []) or []:
+        if isinstance(member, str) and key(member) == wanted:
+            return member
+    for npc in party_tracker_data.get("partyNPCs", []) or []:
+        npc_name = npc.get("name", "") if isinstance(npc, dict) else ""
+        if npc_name and key(npc_name) == wanted:
+            return npc_name
     return None
 
 def get_character_path(character_name, character_role=None):
@@ -444,22 +508,25 @@ def format_schema_for_prompt(schema, character_role):
     schema_info += """
 CRITICAL - Valid item_type values (MUST use one of these EXACTLY):
 - "weapon" - swords, bows, daggers, melee and ranged weapons
-- "armor" - armor pieces, shields, cloaks, boots, gloves, protective wear
+- "armor" - body armor and shields only (armor_category and ac_base required); cloaks, boots, gloves and other worn magic items are "miscellaneous" with an item_subtype
 - "ammunition" - arrows, bolts, sling bullets, thrown weapon ammo
 - "consumable" - potions, scrolls, food, rations, anything consumed when used
 - "equipment" - tools, torches, rope, containers, utility items
 - "miscellaneous" - rings, amulets, wands, truly miscellaneous items only
 
 NEVER use: "wondrous item", "magic item", "magical" or any other value!
+Every equipment entry carries all four of item_name, item_type, description and quantity (the schema refuses an entry missing any of them).
+Valid item_subtype values (when given): scroll, potion, wand, ring, amulet, cloak, boots, gloves, helmet, rod, staff, food, other.
+A "charges" object ({"current": N, "max": M}) is owned by the rules engine: keep an existing item's charges exactly as they are on the sheet (the expendCharges action spends them; never lower or raise them here). Give charges only to a NEW charged item (current = max unless the narration states a used count).
 
 NOTE: Enhanced categorization system fixes GitHub issue #45 (inconsistent item storage)
 
 Enhanced Item Type Mappings:
 - Arrows/Bolts/Bullets -> item_type: "ammunition"
 - Travel Ration/Food -> item_type: "consumable", item_subtype: "food"
-- Torch/Rope/Tools -> item_type: "equipment", item_subtype: "tool"
+- Torch/Rope/Tools -> item_type: "equipment", item_subtype: "other"
 - Studded Leather Armor -> item_type: "armor", description: "Light armor. AC 12 + Dex modifier."
-- Cloak of Elvenkind -> item_type: "armor", item_subtype: "cloak"
+- Cloak of Elvenkind -> item_type: "miscellaneous", item_subtype: "cloak"
 - Ring of Protection -> item_type: "miscellaneous", item_subtype: "ring"
 - Wand of Magic Missiles -> item_type: "miscellaneous", item_subtype: "wand"
 - Potion of Healing -> item_type: "consumable", item_subtype: "potion"
@@ -468,19 +535,34 @@ Enhanced Item Type Mappings:
     
     if character_role == 'player':
         schema_info += """
-Equipment Array Example:
+Equipment Array Example (a NEW item: quantity = how many were acquired):
 [{"item_name": "Sword", "item_type": "weapon", "description": "Sharp blade", "quantity": 1}]
 
-Currency Example: 
-{"gold": 50, "silver": 10, "copper": 25}
+Equipment Stock Change Example (an item ALREADY on the sheet: signed change, never the new count):
+[{"item_name": "Travel Ration", "quantityDelta": 3}]   or   [{"item_name": "Torch", "quantityDelta": -1}]
 
-Ammunition Example:
+Currency Delta Example (signed change per coin, never totals):
+{"currencyDelta": {"gold": -50, "silver": 10}}
+
+Pool Delta Examples (signed change, never a resulting count):
+{"hpDelta": -7}
+{"spellSlotDelta": {"level2": -1}}
+{"featureUseDelta": {"Channel Divinity (2/rest)": -1}}
+{"tempHpGrant": 10}
+
+Ammunition Stock Change Example (a row ALREADY on the sheet: signed change, never the new count):
+[{"name": "Crossbow bolt", "quantityDelta": -3}]
+
+Ammunition Example (a NEW row only: quantity = how many were acquired):
 [{"name": "Arrows", "quantity": 20, "description": "Standard arrows"}]
 """
     else:
         schema_info += """
-Equipment Array Example:
+Equipment Array Example (a NEW item: quantity = how many were acquired):
 [{"item_name": "Chain Mail", "item_type": "armor", "description": "Heavy armor", "quantity": 1}]
+
+Equipment Stock Change Example (an item ALREADY on the sheet: signed change, never the new count):
+[{"item_name": "Travel Ration", "quantityDelta": -1}]
 
 AttacksAndSpellcasting vs Actions:
 - Use attacksAndSpellcasting for standard attack format
@@ -563,11 +645,35 @@ def deep_merge_dict(base_dict, update_dict):
         else:
             # Replace or add the value
             result[key] = copy.deepcopy(value)
+            if key == 'equipment' and isinstance(value, list):
+                for entry in result[key]:
+                    _drop_module_id(entry)
     
     return result
 
+# #1135: the stored row index a delta entry was bound to (_bind_equipment_rows).
+# It rides on the entry and the merged row until the stock fold, then is dropped.
+_BOUND_ROW = '_bound_row'
+
+
+def _drop_module_id(entry, target=None):
+    """P3a: a delta entry never carries a module item id into a sheet, and never
+    changes the id of a ``target`` row that holds one; the drop is logged."""
+    from core.nql.item_catalog import MODULE_ID_PREFIX
+
+    if not isinstance(entry, dict) or 'catalog_id' not in entry:
+        return entry
+    held = isinstance(target, dict) and str(target.get('catalog_id') or '').startswith(MODULE_ID_PREFIX)
+    if held or str(entry.get('catalog_id') or '').startswith(MODULE_ID_PREFIX):
+        entry.pop('catalog_id')
+        info(f"MODULE ITEMS: dropped a delta-written catalog_id on {entry.get('item_name')!r}; "
+             "module item ids are the host's", category="character_updates")
+    return entry
+
+
 def merge_equipment_arrays(base_equipment, update_equipment):
-    """Merge equipment arrays by item name, preserving existing items and removing zero-quantity items"""
+    """Merge equipment arrays by item name, preserving existing items and removing zero-quantity items.
+    An entry bound to a stored row (#1135) merges into that row, not the last of its name."""
     result = copy.deepcopy(base_equipment)
     
     # Create a mapping of item names to indices in the base equipment
@@ -583,13 +689,16 @@ def merge_equipment_arrays(base_equipment, update_equipment):
         if not update_item_name:
             continue
             
-        if update_item_name in item_name_to_index:
+        bound = update_item.get(_BOUND_ROW)
+        if type(bound) is int and 0 <= bound < len(result):
+            result[bound] = deep_merge_dict(result[bound], _drop_module_id(copy.deepcopy(update_item), result[bound]))
+        elif update_item_name in item_name_to_index:
             # Update existing item by merging dictionaries
             index = item_name_to_index[update_item_name]
-            result[index] = deep_merge_dict(result[index], update_item)
+            result[index] = deep_merge_dict(result[index], _drop_module_id(copy.deepcopy(update_item), result[index]))
         else:
             # Add new item if it doesn't exist
-            result.append(copy.deepcopy(update_item))
+            result.append(_drop_module_id(copy.deepcopy(update_item)))
     
     # Remove items with zero or negative quantity or marked with _remove flag
     result = [item for item in result if item.get('quantity', 1) > 0 and not item.get('_remove', False)]
@@ -621,6 +730,10 @@ def merge_ammunition_arrays(base_ammunition, update_ammunition):
         
         # Check if this ammunition already exists (case-insensitive)
         if update_name_lower in ammo_lookup:
+            if update_ammo.get('_remove'):
+                # AM-b: a model-authored quantity 0 removes the row entirely.
+                del ammo_lookup[update_name_lower]
+                continue
             # Add to existing ammunition quantity (supports negative for removals)
             ammo_lookup[update_name_lower]['quantity'] += update_quantity
             # If the update includes a description and the base doesn't have one, add it
@@ -637,10 +750,12 @@ def merge_ammunition_arrays(base_ammunition, update_ammunition):
                 }
                 ammo_lookup[update_name_lower] = new_ammo
     
-    # Convert back to array and filter out zero/negative quantities
+    # Convert back to array. AM-b: an empty quiver stays on the sheet at 0 (the
+    # engine stock keeps its id and any recovery count); only a negative row,
+    # which no engine answer produces, is dropped.
     result = []
     for ammo in ammo_lookup.values():
-        if ammo.get('quantity', 0) > 0:
+        if ammo.get('quantity', 0) >= 0:
             # Ensure description field exists for schema compliance
             if 'description' not in ammo:
                 ammo['description'] = f"Standard {ammo.get('name', 'ammunition').lower()}."
@@ -914,6 +1029,19 @@ def create_character_backup(character_path, backup_reason="update"):
         error(f"FAILURE: Failed to create backup", exception=e, category="file_operations")
         return None
 
+
+# The file name create_character_backup builds beside a sheet:
+# <stem>.backup_<reason>_<YYYYmmdd_HHMMSS>.json, for any reason a caller passes.
+# A sheet's own stem never holds a "." (normalize_character_name), so no
+# character's sheet matches.
+_CHARACTER_BACKUP_FILE = re.compile(r".+\.backup_.+_\d{8}_\d{6}\.json")
+
+
+def is_character_backup_file(filename):
+    """A timestamped copy create_character_backup wrote, never a sheet (#1263)."""
+    return _CHARACTER_BACKUP_FILE.fullmatch(str(filename or "")) is not None
+
+
 def cleanup_old_backups(character_path, max_backups=5):
     """
     Clean up old backup files, keeping only the most recent ones
@@ -1072,24 +1200,534 @@ def repair_character_data(character_data):
     return character_data
 
 
+# Engine-owned pools a model reports as signed changes (core/nql/currency and
+# core/nql/resources). The value is the sheet field the engine writes for it.
+ENGINE_DELTA_FIELDS = {
+    'currencyDelta': 'currency',
+    'hpDelta': 'hitPoints',
+    'spellSlotDelta': 'spellcasting',
+    'featureUseDelta': 'classFeatures',
+    'tempHpGrant': 'temporaryHitPoints',
+}
+ENGINE_DELTA_KEYS = tuple(ENGINE_DELTA_FIELDS)
+
+
+def _engine_owned_total(character_data, updates):
+    """The reason a model-authored delta states a pool total instead of a change, or None.
+
+    Hit points, spell slot counts and feature use counts are engine resources:
+    the model reports the change and the engine produces the value. A stated
+    total is refused so the next attempt states the change. Only counts are
+    refused; maximums, new pools and usage:null corrections pass unchanged.
+    """
+    if 'hitPoints' in updates:
+        return "hitPoints totals are not accepted; report the change as hpDelta (signed whole number)"
+    if 'temporaryHitPoints' in updates:
+        return ("temporaryHitPoints totals are not accepted; report a grant as tempHpGrant (positive whole "
+                "number); damage drains them automatically")
+    slots = updates.get('spellcasting', {}).get('spellSlots') if isinstance(updates.get('spellcasting'), dict) else None
+    if isinstance(slots, dict):
+        for key, pool in slots.items():
+            if isinstance(pool, dict) and 'current' in pool:
+                return ("spell slot totals are not accepted; report the change as spellSlotDelta "
+                        "{levelN: signed whole number}")
+    # Class features and feats (#891, #937) hold use pools alike.
+    for key in ('classFeatures', 'feats'):
+        stored = {f.get('name'): f.get('usage') for f in character_data.get(key) or [] if isinstance(f, dict)}
+        for feature in updates.get(key) or [] if isinstance(updates.get(key), list) else []:
+            if not isinstance(feature, dict) or not isinstance(feature.get('usage'), dict):
+                continue
+            before = stored.get(feature.get('name'))
+            if isinstance(before, dict) and 'current' in feature['usage'] and \
+                    feature['usage'].get('current') != before.get('current'):
+                return ("feature use totals are not accepted; report the change as featureUseDelta "
+                        "{\"<exact feature name>\": signed whole number}")
+    return None
+
+
+def _stored_item_name(character_data, name):
+    """The stored equipment name for a delta entry: exact, then unique case-insensitive."""
+    names = [e.get('item_name') for e in character_data.get('equipment') or []
+             if isinstance(e, dict) and e.get('item_name')]
+    if name in names:
+        return name, None
+    folded = [n for n in names if str(n).strip().lower() == str(name).strip().lower()]
+    if len(folded) == 1:
+        return folded[0], None
+    if folded:
+        return None, f"{name!r} matches several equipment entries; name it exactly as on the sheet"
+    return None, None
+
+
+def _rows_by_nql_id(character_data):
+    """Stored equipment row index by the row's engine id (#1135)."""
+    return {e['nql_id']: i for i, e in enumerate(character_data.get('equipment') or [])
+            if isinstance(e, dict) and isinstance(e.get('nql_id'), str)}
+
+
+def _several_rows_reason(name, rows):
+    return (f"{len(rows)} equipment rows are named {name!r}; add that row's nql_id exactly as on the sheet "
+            "(or equipped true for the worn one, false for the carried one) to say which")
+
+
+def _bind_equipment_rows(character_data, updates):
+    """Bind equipment delta entries to stored rows by typed fields (#1135).
+
+    Returns ({entry position: stored row index}, refusal or None). An entry
+    with an ``nql_id`` binds to the row holding that id under its name, and
+    only that row; an id the sheet does not hold there is refused, never
+    minted. An entry without one whose ``item_name`` several rows share binds
+    by ``equipped``: a flag change to a row whose flag differs (the largest
+    stack first), a ``quantityDelta`` to a row with that flag. On a shared
+    name ``equipped`` beside ``quantityDelta`` only selects the row. A
+    shared-name entry nothing selects is refused so the next attempt names
+    the row; ``quantity`` 0 removes every row of the name.
+    """
+    bound = {}
+    entries = updates.get('equipment')
+    if not isinstance(entries, list):
+        return bound, None
+    stored = [e if isinstance(e, dict) else {} for e in character_data.get('equipment') or []]
+    by_id = _rows_by_nql_id(character_data)
+    removals = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not entry.get('item_name'):
+            continue
+        name = _stored_item_name(character_data, entry['item_name'])[0] or entry['item_name']
+        rows = [i for i, e in enumerate(stored) if e.get('item_name') == name]
+        if 'nql_id' in entry:
+            index = by_id.get(entry['nql_id'])
+            if index is None or index not in rows:
+                return bound, (f"nql_id {entry['nql_id']!r} is not on the sheet as {name!r}; copy the row's "
+                               "nql_id exactly as on the sheet, or leave nql_id out for a new item")
+            bound[position] = index
+            if len(rows) > 1 and 'quantityDelta' in entry:
+                entry.pop('equipped', None)
+            continue
+        if len(rows) < 2:
+            continue
+        if entry.get('quantity') == 0 and type(entry.get('quantity')) is int:
+            bound[position] = rows[0]
+            removals.extend((name, index) for index in rows[1:])
+            continue
+        flag = entry.get('equipped')
+        if 'quantityDelta' in entry:
+            if type(flag) is not bool:
+                return bound, _several_rows_reason(name, rows)
+            picked = [i for i in rows if (stored[i].get('equipped') is True) == flag]
+            entry.pop('equipped')
+        elif type(flag) is bool:
+            picked = [i for i in rows if (stored[i].get('equipped') is True) != flag] or \
+                [i for i in rows if (stored[i].get('equipped') is True) == flag]
+        else:
+            return bound, _several_rows_reason(name, rows)
+        if not picked:
+            return bound, (f"no {name!r} row is {'worn' if flag else 'carried'}; add that row's nql_id exactly "
+                           "as on the sheet to say which")
+        stock = {i: stored[i].get('quantity', 1) if type(stored[i].get('quantity')) is int else 1 for i in picked}
+        bound[position] = max(picked, key=lambda i: (stock[i], -i)) if flag is True else picked[0]
+    for name, index in removals:
+        bound[len(entries)] = index
+        entries.append({'item_name': name, 'quantity': 0})
+    return bound, None
+
+
+def _bound_stock_rows(sheet, pending, bound):
+    """The merged row each pending stock change applies to, with its delta
+    (#1135): the row a bound entry merged into, else the first of its name."""
+    rows = sheet.get('equipment') or []
+    marked = {e[_BOUND_ROW]: e for e in rows if isinstance(e, dict) and type(e.get(_BOUND_ROW)) is int}
+    out = []
+    for key, delta in pending.items():
+        name, index = key if isinstance(key, tuple) else (key, None)
+        row = marked.get(index) if index in bound.values() else None
+        if row is None:
+            row = next((e for e in rows if isinstance(e, dict) and e.get('item_name') == name), None)
+        if row is not None:
+            out.append((row, delta))
+    return out
+
+
+def _split_equipment_quantity_deltas(character_data, updates, model_authored, bound=None):
+    """Pull ``quantityDelta`` out of equipment entries before the merge.
+
+    Stock is engine-owned (core/nql/equipment): the model reports how many
+    of an item were gained or lost, never the resulting stack. Returns
+    (pending {stored name, or (stored name, row index) for an entry bound to
+    a row (#1135): signed delta}, error or None). An entry for an item
+    not yet on the sheet with a positive delta becomes a new item of that many.
+    A model-authored ``quantity`` on an existing item other than 0 (remove all)
+    is refused so the next attempt states the change.
+    """
+    pending = {}
+    bound = bound or {}
+    entries = updates.get('equipment')
+    if not isinstance(entries, list):
+        return pending, None
+    rows = character_data.get('equipment') or []
+    stock = {e.get('item_name'): e.get('quantity', 1) for e in rows
+             if isinstance(e, dict) and e.get('item_name')}
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not entry.get('item_name'):
+            continue
+        stored, ambiguous = _stored_item_name(character_data, entry['item_name'])
+        if ambiguous:
+            return pending, ambiguous
+        if 'quantityDelta' in entry:
+            delta = entry.pop('quantityDelta')
+            if type(delta) is bool or type(delta) is not int:
+                return pending, f"quantityDelta for {entry['item_name']!r} must be a signed whole number"
+            if 'quantity' in entry:
+                return pending, (f"{entry['item_name']!r} has both quantity and quantityDelta; for an item "
+                                 "already on the sheet send only quantityDelta")
+            if stored is None:
+                if delta <= 0:
+                    return pending, (f"{entry['item_name']!r} is not on the sheet, so it cannot lose stock; "
+                                     "use the exact item_name from the sheet")
+                entry['quantity'] = delta          # a new item: the number acquired
+                continue
+            entry['item_name'] = stored
+            key = (stored, bound[position]) if position in bound else stored
+            if delta:
+                pending[key] = pending.get(key, 0) + delta
+        elif stored is not None and 'quantity' in entry:
+            held = rows[bound[position]].get('quantity', 1) if position in bound else stock.get(stored)
+            if entry['quantity'] == 0:
+                entry['item_name'] = stored        # remove all: unambiguous
+            elif entry['quantity'] == held:
+                entry.pop('quantity')              # unchanged count restated: no stock change
+                entry['item_name'] = stored
+            elif model_authored:
+                return pending, (f"equipment quantity totals are not accepted for items already on the sheet "
+                                 f"({entry['item_name']!r}); report the change as quantityDelta (signed whole "
+                                 "number), or quantity 0 to remove it entirely")
+    return pending, None
+
+
+def _stored_ammunition_name(character_data, name):
+    """The stored ammunition row name for a delta entry: exact, then unique
+    case-insensitive, then the one row holding the same catalog ammunition
+    (Arrows for a row named Arrow, #358). The stored row keeps its name."""
+    names = [r.get('name') for r in character_data.get('ammunition') or []
+             if isinstance(r, dict) and r.get('name')]
+    if name in names:
+        return name, None
+    folded = [n for n in names if str(n).strip().lower() == str(name).strip().lower()]
+    if len(folded) == 1:
+        return folded[0], None
+    if folded:
+        return None, f"{name!r} matches several ammunition rows; name it exactly as on the sheet"
+    from core.nql import item_catalog
+    wanted = item_catalog.ammunition_entry({"name": name})
+    if wanted is not None:
+        same = [r.get('name') for r in character_data.get('ammunition') or []
+                if isinstance(r, dict) and r.get('name')
+                and (item_catalog.ammunition_entry(r) or {}).get('id') == wanted.get('id')]
+        if len(same) == 1:
+            return same[0], None
+        if same:
+            return None, f"{name!r} matches several ammunition rows {same}; name it exactly as on the sheet"
+    return None, None
+
+
+def _split_ammunition_quantity_deltas(character_data, updates, model_authored):
+    """Pull ``quantityDelta`` out of ammunition rows before the merge (AM-b).
+
+    Ammunition stock is engine-owned (core/nql/ammunition): the model reports
+    how many were fired, bought, found or sold, never the resulting count.
+    Returns (pending {stored name: signed delta}, error or None). A row not yet
+    on the sheet with a positive delta becomes a new row of that many. A
+    model-authored ``quantity`` on an existing row other than 0 (remove the
+    row) is refused so the next attempt states the change. Non-model input
+    (level-up, repair tools) keeps the legacy additive merge untouched.
+    """
+    pending = {}
+    rows = updates.get('ammunition')
+    if not isinstance(rows, list):
+        return pending, None
+    for entry in rows:
+        if not isinstance(entry, dict) or not entry.get('name'):
+            continue
+        stored, ambiguous = _stored_ammunition_name(character_data, entry['name'])
+        if ambiguous:
+            return pending, ambiguous
+        if 'quantityDelta' in entry:
+            delta = entry.pop('quantityDelta')
+            if type(delta) is bool or type(delta) is not int:
+                return pending, f"quantityDelta for ammunition {entry['name']!r} must be a signed whole number"
+            if 'quantity' in entry:
+                return pending, (f"ammunition {entry['name']!r} has both quantity and quantityDelta; for a row "
+                                 "already on the sheet send only quantityDelta")
+            if stored is None:
+                if delta <= 0:
+                    names = [r.get('name') for r in character_data.get('ammunition') or []
+                             if isinstance(r, dict) and r.get('name')]
+                    return pending, (f"ammunition {entry['name']!r} is not on the sheet, so it cannot be spent; "
+                                     f"the sheet's rows are {names}; use the exact name")
+                entry['quantity'] = delta          # a new row: the number acquired
+                continue
+            entry['name'] = stored
+            if delta:
+                pending[stored] = pending.get(stored, 0) + delta
+        elif stored is not None and 'quantity' in entry and model_authored:
+            if entry['quantity'] == 0:
+                entry['name'] = stored
+                entry['_remove'] = True            # remove the row entirely: unambiguous
+            else:
+                return pending, (f"ammunition quantity totals are not accepted for rows already on the sheet "
+                                 f"({entry['name']!r}); report the change as quantityDelta (signed whole "
+                                 "number), or quantity 0 to remove the row entirely")
+        elif stored is None and model_authored and type(entry.get('quantity')) is int \
+                and entry['quantity'] <= 0:
+            # #358: a removal under a name the sheet does not list changed nothing
+            # and was reported as done; it is refused so the change is said again.
+            names = [r.get('name') for r in character_data.get('ammunition') or []
+                     if isinstance(r, dict) and r.get('name')]
+            return pending, (f"ammunition {entry['name']!r} is not on the sheet, so it cannot be spent or "
+                             f"removed; the sheet's rows are {names}; use the exact name with quantityDelta")
+    return pending, None
+
+
+def _engine_ammunition_stock(character_data, pending, character_name):
+    """AM-b: each pending ammunition change through the engine on the before sheet.
+
+    Returns ({stored name: engine quantity}, refusal reason or None). A short
+    stock (E_QUANTITY) is the refusal; an unavailable engine keeps today's
+    addition with a warning so play never stops.
+    """
+    from core.nql import ammunition as nql_ammunition
+
+    stock = {}
+    for name, delta in pending.items():
+        if delta < 0:
+            outcome = nql_ammunition.spend(character_data, name, -delta, recoverable=False)
+        else:
+            outcome = nql_ammunition.add(character_data, name, delta)
+        if outcome.ok:
+            stock[name] = int(outcome.quantity or 0)
+            info(f"AM: {character_name} {name} {delta:+d} -> {stock[name]} [engine]", category="character_updates")
+            continue
+        if (outcome.fault or {}).get('code') == 'E_QUANTITY':
+            return stock, outcome.reason
+        row = nql_ammunition.row_of(character_data, name)
+        before = row.get('quantity', 0) if isinstance(row, dict) and type(row.get('quantity')) is int else 0
+        stock[name] = max(0, before + delta)
+        warning(f"AM: {character_name} {name} {delta:+d} -> {stock[name]} by arithmetic; engine unavailable ({outcome.reason})",
+                category="character_updates")
+    return stock, None
+
+
+def _copy_engine_pools(engine_sheet, target):
+    """Write the engine's pool values (hit points, slot and use counts) onto the merged sheet."""
+    if 'hitPoints' in engine_sheet:
+        target['hitPoints'] = engine_sheet['hitPoints']
+    if 'temporaryHitPoints' in engine_sheet:
+        target['temporaryHitPoints'] = engine_sheet['temporaryHitPoints']
+    engine_slots = (engine_sheet.get('spellcasting') or {}).get('spellSlots') \
+        if isinstance(engine_sheet.get('spellcasting'), dict) else None
+    target_slots = (target.get('spellcasting') or {}).get('spellSlots') \
+        if isinstance(target.get('spellcasting'), dict) else None
+    if isinstance(engine_slots, dict) and isinstance(target_slots, dict):
+        for key, pool in engine_slots.items():
+            if isinstance(pool, dict) and isinstance(target_slots.get(key), dict):
+                target_slots[key]['current'] = pool['current']
+    # Class features and feats (#891): a feat spend is kept too (#937).
+    for key in ('classFeatures', 'feats'):
+        engine_uses = {f['name']: f['usage']['current'] for f in engine_sheet.get(key) or []
+                       if isinstance(f, dict) and isinstance(f.get('usage'), dict) and f.get('name')}
+        for feature in target.get(key) or []:
+            if isinstance(feature, dict) and isinstance(feature.get('usage'), dict) and feature.get('name') in engine_uses:
+                feature['usage']['current'] = engine_uses[feature['name']]
+
+
 def prepare_character_delta(character_data, updates, character_role, schema,
-                            character_name, managed_effect_operation=None):
+                            character_name, managed_effect_operation=None,
+                            model_authored=False):
     """Shared provider-free stored-value preparation (#323 D-323-10).
 
     Ordinary T079 input joins after effective-to-base normalization. Typed
     level-up input joins in its stored frame. No model calls or persistence;
     callers retain their different pre/postcommit review obligations.
+    ``model_authored`` marks T079 output: pool totals are then refused in
+    favour of the signed delta keys (level-up keeps its typed totals).
     """
     updates = fix_injury_types(fix_item_types(copy.deepcopy(updates)))
+    if model_authored:
+        total_reason = _engine_owned_total(character_data, updates)
+        if total_reason:
+            return updates, character_data, {
+                'critical_warnings': [], 'removed_fields': [], 'schema_valid': False,
+                'error_message': total_reason,
+            }
+    if model_authored:
+        # Derived totals are the engine's (core/nql/stats): a value the model
+        # wrote for one is dropped and the engine's stands.
+        from core.nql import stats as nql_stats
+
+        dropped_totals = nql_stats.drop_model_totals(character_data, updates)
+        if dropped_totals:
+            info(f"STATS: {character_name}: dropped model-written totals {dropped_totals}; the engine derives them",
+                 category="character_updates")
+        # Unconscious at 0 hit points and alive on healing are the engine's
+        # (C1): a status the model wrote for them is dropped the same way.
+        dropped_states = nql_stats.drop_model_states(updates)
+        if dropped_states:
+            info(f"STATES: {character_name}: dropped model-written {dropped_states}; the engine sets unconscious and alive from hit points",
+                 category="character_updates")
+    bound, bind_reason = _bind_equipment_rows(character_data, updates)
+    if bind_reason:
+        return updates, character_data, {
+            'critical_warnings': [], 'removed_fields': [], 'schema_valid': False,
+            'error_message': bind_reason,
+        }
+    stock_deltas, stock_reason = _split_equipment_quantity_deltas(character_data, updates, model_authored, bound)
+    for position, index in bound.items():
+        updates['equipment'][position][_BOUND_ROW] = index
+    if stock_reason:
+        return updates, character_data, {
+            'critical_warnings': [], 'removed_fields': [], 'schema_valid': False,
+            'error_message': stock_reason,
+        }
+    # Ammunition stock is engine-owned (core/nql/ammunition, AM-b): the signed
+    # change per row goes through the engine on the before sheet and the
+    # engine's quantity replaces the merged one. A short stock is refused and
+    # the DM is told; the row is never silently emptied or dropped.
+    ammo_deltas, ammo_reason = _split_ammunition_quantity_deltas(character_data, updates, model_authored)
+    if ammo_reason:
+        return updates, character_data, {
+            'critical_warnings': [], 'removed_fields': [], 'schema_valid': False,
+            'error_message': ammo_reason,
+        }
+    ammo_stock = {}
+    if ammo_deltas:
+        ammo_stock, ammo_refusal = _engine_ammunition_stock(character_data, ammo_deltas, character_name)
+        if ammo_refusal:
+            return updates, character_data, {
+                'critical_warnings': [], 'removed_fields': [], 'schema_valid': False,
+                'error_message': f"the ammunition change was refused by the rules engine: {ammo_refusal}",
+                'engine_refusal': ammo_refusal,
+            }
     if 'hitPoints' in updates and updates['hitPoints'] < 0:
         updates['hitPoints'] = 0
     if ('experience_points' in updates and
             updates['experience_points'] < character_data.get('experience_points', 0)):
         del updates['experience_points']
+    # Coins are engine-owned (core/nql/currency): the model reports a signed
+    # change per coin type and the engine produces the balance, refusing a
+    # payment the sheet cannot cover. A totals object is refused so the next
+    # attempt states the change instead of a balance.
+    currency_delta = updates.pop('currencyDelta', None)
+    if 'currency' in updates:
+        return updates, character_data, {
+            'critical_warnings': [], 'removed_fields': [], 'schema_valid': False,
+            'error_message': ("currency totals are not accepted; report the change as "
+                              "currencyDelta {gold, silver, copper} signed whole numbers"),
+        }
+    if currency_delta is not None:
+        from core.nql import currency as nql_currency
+
+        outcome = nql_currency.apply_delta(character_data, currency_delta)
+        if not outcome.ok:
+            return updates, character_data, {
+                'critical_warnings': [], 'removed_fields': [], 'schema_valid': False,
+                'error_message': f"the currency change was refused by the rules engine: {outcome.reason}",
+                'engine_refusal': outcome.reason,
+            }
+        updates['currency'] = dict(outcome.sheets[0]['currency'])
+        for gap in outcome.gaps:
+            debug(f"[Currency Engine] {character_name}: {gap}", category="character_updates")
+    # Hit points, spell slots and feature uses are engine-owned pools
+    # (core/nql/resources): signed changes go through the engine, which clamps
+    # healing at the effective maximum, drops a character to zero, and refuses
+    # a spend the pool cannot cover. The engine's values replace the merged ones.
+    resource_updates = {k: updates.pop(k) for k in ('hpDelta', 'spellSlotDelta', 'featureUseDelta', 'tempHpGrant')
+                        if k in updates}
+    engine_pools = None
+    if resource_updates:
+        from core.effects.effective import effective_sheet
+        from core.nql import resources as nql_resources
+
+        effective_max = effective_sheet(character_data).get('maxHitPoints')
+        outcome = nql_resources.apply_deltas(
+            character_data, resource_updates,
+            max_hp=effective_max if type(effective_max) is int else None)
+        if not outcome.ok:
+            return updates, character_data, {
+                'critical_warnings': [], 'removed_fields': [], 'schema_valid': False,
+                'error_message': f"the change was refused by the rules engine: {outcome.reason}",
+                'engine_refusal': outcome.reason,
+            }
+        engine_pools = outcome.sheet
+        for gap in outcome.gaps:
+            debug(f"[Resource Engine] {character_name}: {gap}", category="character_updates")
+        # CN: the Constitution save the engine made for the caster's concentration
+        # reaches the next DM note (CHECK RESULTS) like a scored check.
+        for line in outcome.concentration_lines:
+            from core.managers import checks_state
+            checks_state.add_result(line)
+            info(f"CONCENTRATION: {line}", category="character_updates")
+        concentration_ended = outcome.concentration_ended
+    else:
+        concentration_ended = None
+    # P3a (D-P3A-2): acquisition receipts are the host's; a delta never writes them.
+    if isinstance(updates, dict) and 'acquisitions' in updates:
+        updates.pop('acquisitions')
+        info(f"ACQUISITIONS: {character_name}: dropped a delta-written acquisitions list; receipts are the host's",
+             category="character_updates")
     updated_data = deep_merge_dict(character_data, updates)
-    if managed_effect_operation:
-        from core.effects.lifecycle import apply_effect_ops
-        updated_data = apply_effect_ops(updated_data, [managed_effect_operation])
+    # Item charges (H1): the engine owns an existing row's charges object; a
+    # delta that rewrote it is reverted to the stored object (value comparison
+    # of the sheet's own typed field, matched by item_name).
+    stored_charges = {entry.get('item_name'): copy.deepcopy(entry.get('charges'))
+                      for entry in character_data.get('equipment') or []
+                      if isinstance(entry, dict) and isinstance(entry.get('charges'), dict)}
+    for entry in updated_data.get('equipment') or []:
+        if isinstance(entry, dict) and entry.get('item_name') in stored_charges \
+                and entry.get('charges') != stored_charges[entry['item_name']]:
+            info(f"CHARGES: {character_name}: {entry['item_name']} charges {entry.get('charges')} reverted to "
+                 f"{stored_charges[entry['item_name']]} (engine-owned; use expendCharges)", category="character_updates")
+            entry['charges'] = stored_charges[entry['item_name']]
+    for row in updated_data.get('ammunition') or []:
+        if isinstance(row, dict) and row.get('name') in ammo_stock:
+            row['quantity'] = ammo_stock[row['name']]
+    if engine_pools is not None:
+        _copy_engine_pools(engine_pools, updated_data)
+        # The engine's unconscious/alive verdict for this hit point change
+        # (core/nql/stats) rides with the pools; the model's other condition
+        # edits in the same delta stay.
+        from core.nql import stats as nql_stats
+
+        carried = nql_stats.carry_states(engine_pools, updated_data)
+        if carried:
+            info(f"STATES: {character_name}: " + "; ".join(carried), category="character_updates")
+    # CN: the engine ended the concentration (failed save, knocked out), or the
+    # delta put the caster in an incapacitating state: the spell ends everywhere.
+    from core.nql import stats as nql_stats
+    focus = nql_stats.concentration_of(updated_data)
+    if focus:
+        why = concentration_ended or nql_stats.concentration_blocked(updated_data)
+        if why:
+            from core.managers.concentration_runtime import clear_record, end_group
+            clear_record(updated_data, focus["group"])
+            end_group(focus["group"], {"minimum": "knocked unconscious"}.get(why, why), skip_caster=character_name)
+    if stock_deltas:
+        # The requested change reaches the engine unclamped: a stack that
+        # would go below zero stays in the merged sheet so the engine sees
+        # the exact consume and refuses it (never silently emptied).
+        stock_rows = _bound_stock_rows(updated_data, stock_deltas, bound)
+        for entry, delta in stock_rows:
+            base = entry.get('quantity', 1) if type(entry.get('quantity')) is int else 1
+            entry['quantity'] = base + delta
+    for entry in (updated_data.get('equipment') or []) + (updates.get('equipment') or []):
+        if isinstance(entry, dict):
+            entry.pop(_BOUND_ROW, None)
+    # Temporary effects: the classifier's add/remove operation, and any live
+    # effect the engine does not hold yet (a sheet written before E12), go
+    # through the lifecycle so the engine's armor class and maximum hit
+    # points are the stored values. No operation and nothing pending makes
+    # no engine call.
+    from core.effects.lifecycle import apply_effect_ops
+    updated_data = apply_effect_ops(updated_data, _effect_operations(managed_effect_operation))
     if 'hitPoints' in updated_data and updated_data['hitPoints'] < 0:
         updated_data['hitPoints'] = 0
     critical_warnings = validate_critical_fields_preserved(character_data, updated_data, character_name)
@@ -1097,13 +1735,52 @@ def prepare_character_delta(character_data, updates, character_role, schema,
               'schema_valid': False, 'error_message': None}
     if critical_warnings:
         return updates, updated_data, checks
+    if isinstance(updates.get('equipment'), list):
+        # Equipment is engine-owned (core/nql): the merged delta becomes equip,
+        # unequip, consume and create operations on the sheet's world. A refusal
+        # is reported like a schema failure so the model can correct its delta.
+        from core.nql import equipment as nql_equipment
+
+        outcome = nql_equipment.reconcile(character_data, updated_data, reserved=nql_equipment.genesis.held_ids_on_disk())
+        if not outcome.ok:
+            checks.update(error_message=(
+                "the equipment change was refused by the rules engine: "
+                f"{outcome.reason}. Operations attempted: {' '.join(outcome.operations)}"))
+            if (outcome.fault or {}).get('code') in ('E_QUANTITY', 'E_EQUIPMENT'):
+                # Not enough stock, or no free hand or slot: a restated delta
+                # cannot fix it, the DM must (#1135).
+                checks['engine_refusal'] = outcome.reason
+            return updates, updated_data, checks
+        updated_data['equipment'] = outcome.equipment
+        for gap in outcome.gaps:
+            debug(f"[Equipment Engine] {character_name}: {gap}", category="character_updates")
     updated_data = normalize_status_and_condition(updated_data, character_role)
     updated_data, removed_fields = purge_invalid_fields(updated_data, schema, character_name)
+    if model_authored:
+        # A change of facts (level, abilities, proficiencies, expertise, feats,
+        # casting ability) with no other engine request in this delta: one
+        # genesis+status request stores the engine's totals.
+        from core.nql import stats as nql_stats
+
+        if nql_stats.facts_changed(character_data, updated_data):
+            problem = nql_stats.refresh(updated_data)
+            if problem:
+                warning(f"STATS: {character_name}: totals not refreshed ({problem}); stored values kept until the next engine touch",
+                        category="character_updates")
     is_valid, error_msg = validate_character_data(updated_data, schema, character_name)
     checks.update(schema_valid=is_valid, error_message=error_msg, removed_fields=removed_fields)
     if is_valid:
         updated_data = repair_character_data(updated_data)
     return updates, updated_data, checks
+
+
+class EngineRefusedChange(Exception):
+    """The rules engine refused the requested change and the model could not
+    restate it (E6): the update did not happen and the caller reports why."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
 
 
 class CharacterSnapshotChanged(ValueError):
@@ -1139,148 +1816,180 @@ def commit_character_sheet(character_path, updated_data, *, commit_guard=None, e
 
 
 def _is_meaningful_character_delta(updates, schema):
-    """Return whether T079 produced at least one recognized field update."""
-    if not isinstance(updates, dict) or not updates:
+    """Return whether T079 produced a usable delta: {} (the typed "no change"
+    answer, confirmed by the caller) or at least one recognized field update."""
+    if not isinstance(updates, dict):
         return False
+    if not updates:
+        return True
     properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
     return isinstance(properties, dict) and any(
-        field in properties for field in updates
+        field in properties or field in ENGINE_DELTA_KEYS for field in updates
     )
 
 
-def infer_requested_character_update_fields(changes):
-    """Infer only explicit, mechanically coupled T079 update categories.
+# The sheet fields an updateCharacterInfo action may declare in its typed
+# "affects" list (#855). The DM names every field its change touches; the
+# update must then return all of them, so a coupled change (a potion drunk
+# and the healing it gave) is never applied in part. Death saves are not a
+# field here: this game has no death saves.
+CHARACTER_UPDATE_AFFECTS = (
+    "currency",
+    "equipment",
+    "hitPoints",
+    "condition",
+    "spellcasting",
+    "attacksAndSpellcasting",
+)
 
-    This is deliberately narrower than general natural-language intent parsing.
-    It recognizes high-risk phrases where accepting only one part of the model's
-    delta would leave a character sheet internally inconsistent. Ambiguous
-    narration is left to the model and the existing schema validators.
+
+def character_update_affects_error(affects):
+    """The correction for a malformed "affects" parameter, or None when valid.
+
+    An absent list is valid: the update then requires no particular field.
     """
-    if not isinstance(changes, str) or not changes.strip():
+    if affects is None:
+        return None
+    allowed = ", ".join(CHARACTER_UPDATE_AFFECTS)
+    if not isinstance(affects, list) or not all(
+        isinstance(name, str) for name in affects
+    ):
+        return (
+            "updateCharacterInfo \"affects\" must be a list of sheet field names "
+            f"from: {allowed}"
+        )
+    unknown = [name for name in affects if name not in CHARACTER_UPDATE_AFFECTS]
+    if unknown:
+        return (
+            "updateCharacterInfo \"affects\" names unknown fields "
+            f"{', '.join(unknown)}; use only: {allowed}"
+        )
+    return None
+
+
+def requested_character_update_fields(affects):
+    """The top-level fields an update must return, from its declared "affects".
+
+    Nothing is inferred from the change's wording (#855): an absent list
+    requires nothing, as an update with no coupled fields always has.
+    """
+    if not isinstance(affects, list):
         return set()
-
-    text = re.sub(r"\s+", " ", changes.strip().lower())
-    required = set()
-
-    currency_amount = re.search(
-        r"\b\d+\s*(?:gp|gold|sp|silver|cp|copper|g|s|c)\b",
-        text,
-    )
-    explicit_trade = re.search(r"\btrade(?:d|s)?\b.{0,100}\bfor\b", text)
-    negated_trade = re.search(
-        r"\b(?:do|does|did)\s+not\s+trade\b|"
-        r"\b(?:don't|doesn't|didn't)\s+trade\b",
-        text,
-    )
-    if explicit_trade and currency_amount and not negated_trade:
-        required.update(("currency", "equipment"))
-
-    hp_transition = re.search(r"\bhp\s*(?:\d+\s*)?->\s*\d+\b", text)
-    if hp_transition:
-        required.add("hitPoints")
-
-    potion_consumption = re.search(
-        r"\b(?:use[ds]?|drank|drink|consum(?:e|ed|es))\s+"
-        r"(?:\d+\s+|an?\s+)?(?:healing\s+)?potion\b",
-        text,
-    )
-    if potion_consumption:
-        required.add("equipment")
-
-    ammunition_spend = re.search(
-        r"\b(?:fire[ds]?|shot|shoots?|spen[dt]|use[ds]?|expends?)\s+\d+\s+"
-        r"(?:arrows?|bolts?|bullets?|darts?|needles?)\b",
-        text,
-    )
-    if ammunition_spend:
-        required.add("ammunition")
-
-    shield_destroyed = (
-        re.search(
-            r"\bshield\s+(?:(?:was|is)\s+|has\s+been\s+)?"
-            r"(?:destroyed|broken|dissolved|removed|lost)\b",
-            text,
-        )
-        or re.search(
-            r"\b(?:destroyed|broken|dissolved|removed|lost)\s+(?:the\s+)?shield\b",
-            text,
-        )
-    )
-    if shield_destroyed:
-        required.update(("equipment", "armorClass", "equipment_effects"))
-
-    weapon_swap = re.search(
-        r"\b(?:swapped?|replaced|exchanged)\b.{0,100}\b"
-        r"(?:weapon|(?:short|long|great)?sword|dagger|bow|axe|mace|staff|spear|crossbow)\b",
-        text,
-    )
-    if weapon_swap:
-        required.update(("equipment", "attacksAndSpellcasting"))
-
-    poison_applied = re.search(
-        r"(?:^|[.;]\s*)poisoned\b|\b(?:became|now|is|was)\s+poisoned\b",
-        text,
-    )
-    if poison_applied:
-        required.update(("condition", "condition_affected"))
-
-    if hp_transition and re.search(r"\bunconscious\b", text):
-        required.update(("status", "condition", "condition_affected"))
-
-    death_save_change = re.search(
-        r"\b(?:first|second|third|\d+(?:st|nd|rd|th)?)\s+death\s+save\s+"
-        r"(?:failed|succeeded|success|failure)\b",
-        text,
-    )
-    if death_save_change:
-        required.add("deathSaves")
-
-    spell_slot_change = (
-        "spell slot" in text
-        and (
-            re.search(r"\bspell slot\b.{0,80}\bcurrent\s+\d+\s*->\s*\d+\b", text)
-            or re.search(
-                r"\b(?:cast|casts|expended|expends|used|uses)\b.{0,100}\bspell slot\b",
-                text,
-            )
-        )
-    )
-    if spell_slot_change:
-        required.add("spellcasting")
-
+    required = {name for name in affects if name in CHARACTER_UPDATE_AFFECTS}
+    if "condition" in required:
+        required.add("condition_affected")
     return required
 
 
-def validate_requested_character_update_completeness(changes, updates):
-    """Return ``(is_complete, missing_fields)`` for explicit T079 requests."""
-    required = infer_requested_character_update_fields(changes)
+def validate_requested_character_update_completeness(affects, updates, casting_resource=None):
+    """Return ``(is_complete, missing_fields)`` for a declared T079 request."""
+    required = requested_character_update_fields(affects)
     present = set(updates) if isinstance(updates, dict) else set()
+    for delta_key, owned_field in ENGINE_DELTA_FIELDS.items():
+        if delta_key in present:
+            present.add(owned_field)
+    if isinstance(casting_resource, dict) and casting_resource.get("kind") == "feature" and "featureUseDelta" in present:
+        present.add("spellcasting")
     missing = sorted(required - present)
     return not missing, missing
 
 
-def build_requested_character_delta_gemini_schema(changes, character_schema):
-    """Build a strict Gemini schema for the fields this update must return."""
+# Engine-owned pools are reported as signed changes and their totals are
+# refused (_engine_owned_total), so the Gemini schema offers the delta keys and
+# never the totals. featureUseDelta is keyed by feature name, which a Gemini
+# schema cannot express, so it is not offered here.
+_GEMINI_REFUSED_TOTALS = ("hitPoints", "temporaryHitPoints", "currency")
+_GEMINI_DELTA_SCHEMAS = {
+    "hpDelta": {"type": "integer"},
+    "tempHpGrant": {"type": "integer"},
+    "currencyDelta": {
+        "type": "object",
+        "properties": {
+            coin: {"type": "integer"} for coin in ("gold", "silver", "copper")
+        },
+    },
+    "spellSlotDelta": {
+        "type": "object",
+        "properties": {
+            f"level{level}": {"type": "integer"} for level in range(1, 10)
+        },
+    },
+    "effectChange": {"type": "boolean"},
+}
+# D-COST-8 (#193): effectChange as T078's {operation, effect, remove} object. The engine checks the
+# strict contract (effects_agent._check_contract); this only shapes Gemini's output.
+_GEMINI_EFFECT_OBJECT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "operation": {"type": "string", "enum": ["none", "add", "remove"]},
+        "effect": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}, "description": {"type": "string"}, "source": {"type": "string"},
+                "modifiers": {"type": "array", "items": {"type": "object", "properties": {
+                    "stat": {"type": "string"}, "value": {"type": "integer"}, "die": {"type": "string"},
+                    "set": {"type": "object", "properties": {  # #1322: Mage Armor's base + ability
+                        "base": {"type": "integer"}, "plusAbility": {"type": "string", "nullable": True}}},
+                    "atLeast": {"type": "integer"},  # #1434: Barkskin's armor class floor
+                    "affectsMax": {"type": "boolean"}}}},
+                "conditions": {"type": "array", "items": {"type": "string"}},
+                "incapacitates": {"type": "boolean"}, "durationKind": {"type": "string"},
+                "durationValue": {"type": "integer"}, "restKind": {"type": "string"},
+                "concentration": {"type": "boolean"}, "caster": {"type": "string"},
+                "onApply": {"type": "array", "items": {"type": "object", "properties": {
+                    "stat": {"type": "string"}, "delta": {"type": "integer"}}}},
+                "onRemove": {"type": "array", "items": {"type": "object", "properties": {
+                    "stat": {"type": "string"}, "delta": {"type": "integer"}}}},
+            },
+        },
+        "remove": {"type": "object", "properties": {"effectId": {"type": "string"}, "name": {"type": "string"}}},
+    },
+    "required": ["operation", "effect", "remove"],
+}
+# A declared field the update must return, as the key the engine accepts.
+_GEMINI_REQUIRED_KEY = {"hitPoints": "hpDelta", "currency": "currencyDelta"}
+
+
+def build_requested_character_delta_gemini_schema(affects, character_schema):
+    """Build a Gemini schema that requires the declared fields.
+
+    Every other sheet field, the delta keys and effectChange stay available,
+    so a change that also touches an undeclared field is never cut short.
+    """
     from model_config import convert_to_gemini_schema
 
-    required_fields = sorted(infer_requested_character_update_fields(changes))
+    requested = sorted(requested_character_update_fields(affects))
+    if not requested:
+        return None
     properties = character_schema.get("properties", {})
     missing_schema_fields = [
-        field for field in required_fields if field not in properties
+        field for field in requested if field not in properties
     ]
     if missing_schema_fields:
         raise ValueError(
             "T079 requested fields are missing from character schema: "
             + ", ".join(missing_schema_fields)
         )
-    if not required_fields:
-        return None
-
+    delta_properties = {
+        field: copy.deepcopy(value)
+        for field, value in properties.items()
+        if field not in _GEMINI_REFUSED_TOTALS
+    }
+    delta_properties.update(copy.deepcopy(_GEMINI_DELTA_SCHEMAS))
+    from core.managers.effects_runtime import _classifier_mode
+    if _classifier_mode() == "merged":
+        delta_properties["effectChange"] = copy.deepcopy(_GEMINI_EFFECT_OBJECT_SCHEMA)
+    # A declared spellcasting change may or may not be a slot: spellcasting
+    # and spellSlotDelta are both offered and the completeness gate requires
+    # one of them.
+    required_fields = sorted(
+        _GEMINI_REQUIRED_KEY.get(field, field)
+        for field in requested
+        if field != "spellcasting"
+    )
     delta_schema = {
         "type": "object",
-        "properties": {
-            field: copy.deepcopy(properties[field]) for field in required_fields
-        },
+        "properties": delta_properties,
         "required": required_fields,
     }
     return convert_to_gemini_schema(delta_schema, preserve_required=True)
@@ -1317,6 +2026,15 @@ def _get_character_update_lock(character_name, character_role=None):
         return lock
 
 
+def _effect_operations(operation):
+    """A managed effect operation as a list: one dict, a list of dicts, or none."""
+    if isinstance(operation, dict):
+        return [operation]
+    if isinstance(operation, list):
+        return [item for item in operation if isinstance(item, dict)]
+    return []
+
+
 def _translate_declarative_effect_delta(character_data, updates, operation):
     """Translate player-visible T079 values back to durable base storage.
 
@@ -1328,30 +2046,35 @@ def _translate_declarative_effect_delta(character_data, updates, operation):
     from core.effects.effective import storage_delta_from_effective
     from core.effects.lifecycle import apply_effect_ops
 
-    operation = copy.deepcopy(operation) if isinstance(operation, dict) else None
+    # One classification may carry several operations (a removal that ends
+    # every record of one name); each contributes its effect and hp changes.
+    operations = copy.deepcopy(_effect_operations(operation))
     resource_operations = []
-    managed_effect = None
-    if operation and operation.get("op") == "add":
-        managed_effect = operation.get("effect") or {}
-        resource_operations = managed_effect.get("onApply", []) or []
-    elif operation and operation.get("op") == "remove":
-        effect_id = operation.get("effectId")
-        name = operation.get("name")
-        for effect in character_data.get("temporaryEffects", []) or []:
-            if not isinstance(effect, dict):
-                continue
-            if (effect_id and effect.get("effectId") == effect_id) or (
-                not effect_id and name and effect.get("name") == name
-            ):
-                managed_effect = effect
-                resource_operations.extend(effect.get("onRemove", []) or [])
+    managed_effects = []
+    for item in operations:
+        if item.get("op") == "add":
+            managed_effect = item.get("effect") or {}
+            managed_effects.append(managed_effect)
+            resource_operations.extend(managed_effect.get("onApply", []) or [])
+        elif item.get("op") == "remove":
+            effect_id = item.get("effectId")
+            name = item.get("name")
+            for effect in character_data.get("temporaryEffects", []) or []:
+                if not isinstance(effect, dict):
+                    continue
+                if (effect_id and effect.get("effectId") == effect_id) or (
+                    not effect_id and name and effect.get("name") == name
+                ):
+                    managed_effects.append(effect)
+                    resource_operations.extend(effect.get("onRemove", []) or [])
 
-    preview = apply_effect_ops(character_data, [operation]) if operation else character_data
+    preview = apply_effect_ops(character_data, operations) if operations else character_data
     translated = storage_delta_from_effective(preview, updates)
     from core.effects.model import canonical_stat
 
     stripped_effect_fields = []
-    for modifier in (managed_effect or {}).get("modifiers", []) or []:
+    managed_modifiers = [m for e in managed_effects for m in (e.get("modifiers", []) or [])]
+    for modifier in managed_modifiers:
         stat = canonical_stat(modifier.get("stat")) if isinstance(modifier, dict) else None
         if stat and stat.startswith("abilities."):
             ability = stat.split(".", 1)[1]
@@ -1370,6 +2093,11 @@ def _translate_declarative_effect_delta(character_data, updates, operation):
             if stat in translated:
                 stripped_effect_fields.append("%s=%r" % (stat, translated.get(stat)))
                 translated.pop(stat, None)
+            if stat == "hitPoints" and "hpDelta" in translated:
+                # The engine-owned change is the effect's; a model copy of the
+                # same visible change would apply it twice.
+                stripped_effect_fields.append("hpDelta=%r" % translated.get("hpDelta"))
+                translated.pop("hpDelta", None)
     for resource in resource_operations:
         if not isinstance(resource, dict):
             continue
@@ -1381,6 +2109,9 @@ def _translate_declarative_effect_delta(character_data, updates, operation):
             # deterministic operation by returning the pre-effect value.
             stripped_effect_fields.append("%s=%r" % (stat, translated.get(stat)))
             translated.pop(stat, None)
+        if stat == "hitPoints" and "hpDelta" in translated:
+            stripped_effect_fields.append("hpDelta=%r" % translated.get("hpDelta"))
+            translated.pop("hpDelta", None)
     if stripped_effect_fields:
         debug(
             "EFFECTS: Removed T079 copies of engine-owned values: %s"
@@ -1388,6 +2119,36 @@ def _translate_declarative_effect_delta(character_data, updates, operation):
             category="effects_tracking",
         )
     return translated
+
+
+def resolve_character_target(character_name, character_role=None):
+    """The (name, role) update_character_info reads and writes for a typed
+    characterName (#900 party-name match, then normalization); #1329's
+    draft precheck reads the same sheet."""
+    # An exact party-name match (#900) when the character's file is not found
+    party_tracker_data = safe_json_load("party_tracker.json")
+    
+    # First try with the original name
+    character_path = get_character_path(character_name, character_role)
+    if not os.path.exists(character_path):
+        # The party's exact name for it (#900)
+        party_name = fuzzy_match_character_name(character_name, party_tracker_data)
+        if party_name and party_name != character_name:
+            info(f"CHARACTER_LOOKUP: Resolved '{character_name}' to party name '{party_name}'", category="character_updates")
+            character_name = party_name
+        else:
+            # Still try normalization as a fallback
+            normalized_name = normalize_character_name(character_name)
+            if normalized_name != character_name:
+                debug(f"STATE_CHANGE: Normalized character name from '{character_name}' to '{normalized_name}'", category="character_updates")
+                character_name = normalized_name
+    
+    # Auto-detect character role if not provided
+    if character_role is None:
+        character_role = detect_character_role(character_name)
+        debug(f"STATE_CHANGE: Detected character role: {character_role}", category="character_updates")
+    
+    return character_name, character_role
 
 
 def update_character_info(
@@ -1398,6 +2159,8 @@ def update_character_info(
     action_context=None,
     *,
     commit_guard=None,
+    affects=None,
+    casting_resource=None,
 ):
     """Run one complete character update transaction under a per-file lock."""
     lock = _get_character_update_lock(character_name, character_role)
@@ -1428,6 +2191,8 @@ def update_character_info(
                     action_context=action_context,
                     structural_reissue=commit_guard is not None,
                     commit_guard=commit_guard,
+                    affects=affects,
+                    casting_resource=casting_resource,
                 )
             return _update_character_info_unlocked(
                 character_name,
@@ -1437,6 +2202,8 @@ def update_character_info(
                 action_context=action_context,
                 structural_reissue=commit_guard is not None,
                 commit_guard=commit_guard,
+                affects=affects,
+                casting_resource=casting_resource,
             )
 
 
@@ -1450,6 +2217,8 @@ def _update_character_info_unlocked(
     action_context=None,
     *,
     commit_guard=None,
+    affects=None,
+    casting_resource=None,
 ):
     """
     Unified function to update character information for both players and NPCs
@@ -1468,30 +2237,17 @@ def _update_character_info_unlocked(
             pass
     debug(f"STATE_CHANGE: Updating character info for: {character_name}", category="character_updates")
     
-    # Try fuzzy matching first if the character isn't found
+    payment = None
+    if casting_resource is not None:
+        from core.nql.resources import casting_resource_delta
+        try:
+            payment = casting_resource_delta(casting_resource)
+        except ValueError as exc:
+            raise EngineRefusedChange(str(exc)) from exc
+
     original_name = character_name
-    party_tracker_data = safe_json_load("party_tracker.json")
-    
-    # First try with the original name
-    character_path = get_character_path(character_name, character_role)
-    if not os.path.exists(character_path):
-        # Try fuzzy matching
-        fuzzy_matched_name = fuzzy_match_character_name(character_name, party_tracker_data)
-        if fuzzy_matched_name and fuzzy_matched_name != character_name:
-            info(f"FUZZY_MATCH: Resolved '{character_name}' to '{fuzzy_matched_name}'", category="character_updates")
-            character_name = fuzzy_matched_name
-        else:
-            # Still try normalization as a fallback
-            normalized_name = normalize_character_name(character_name)
-            if normalized_name != character_name:
-                debug(f"STATE_CHANGE: Normalized character name from '{character_name}' to '{normalized_name}'", category="character_updates")
-                character_name = normalized_name
-    
-    # Auto-detect character role if not provided
-    if character_role is None:
-        character_role = detect_character_role(character_name)
-        debug(f"STATE_CHANGE: Detected character role: {character_role}", category="character_updates")
-    
+    character_name, character_role = resolve_character_target(character_name, character_role)
+
     # Load schema and character data
     schema = load_schema()
     character_path = get_character_path(character_name, character_role)
@@ -1515,6 +2271,13 @@ def _update_character_info_unlocked(
     except Exception as e:
         error(f"FAILURE: Error loading character data", exception=e, category="file_operations")
         return False
+
+    if payment is not None:
+        # #1329: a castingResource naming its spell must be able to pay for it.
+        try:
+            casting_resource_delta(casting_resource, character_data)
+        except ValueError as exc:
+            raise EngineRefusedChange(str(exc)) from exc
     
     # A sheet whose armor projection is already outside the frozen schema would
     # be refused by the whole-sheet gate below on every ordinary update that
@@ -1595,7 +2358,28 @@ def _update_character_info_unlocked(
     - NEVER return temporaryEffects.
     - Read the supplied effective values as the character's current player-visible values.
     - If the requested change adds or removes a temporary effect, return any other
-      one-time costs or permanent changes only. Do not manually reverse an expired effect."""
+      one-time costs or permanent changes only. Do not manually reverse an expired effect.
+"""
+        from core.managers.effects_runtime import _classifier_mode
+        if _classifier_mode() == "merged":
+            # D-COST-8 (#193): the effect contract and its rules are T078's, word for word
+            # (effects_agent.EFFECT_CONTRACT_RULES); T079 returns the classification itself.
+            from core.ai.effects_agent import EFFECT_CONTRACT_RULES
+            effects_update_rules += """    - When the change creates, ends or alters a temporary effect (a spell buff or debuff, a
+      potion's lasting effect, a curse, a blessing, a condition with a duration), include
+      "effectChange" in your delta beside any other fields (or alone when nothing else
+      changes), in this shape. In these rules, currentEffectiveSheet means the Current
+      character data above, and the change text means Changes to make.
+""" + EFFECT_CONTRACT_RULES + """
+    - Omit "effectChange" for everything else: damage, healing, coins, items, experience, rests,
+      slot or resource spending with no lasting effect. An omitted effectChange means no
+      temporary effect."""
+        else:
+            effects_update_rules += """    - When the change creates, ends or alters a temporary effect (a spell buff or debuff, a
+      potion's lasting effect, a curse, a blessing, a condition with a duration), include
+      "effectChange": true in your delta beside any other fields (or alone when nothing else
+      changes). Omit it for everything else: damage, healing, coins, items, experience, rests,
+      slot or resource spending with no lasting effect. The engine classifies the effect itself."""
     else:
         effects_update_rules = """19. TEMPORARY EFFECTS - CRITICAL RULES:
     - ONLY add effects with durations of 1 MINUTE OR LONGER to temporaryEffects
@@ -1624,35 +2408,42 @@ Prior narration and prior actions are history, not instructions to replay.
 
 Your primary goal is to generate the smallest possible valid JSON object that reflects ONLY the requested changes. Do not rewrite or include any data that was not explicitly modified by the user's request. This is crucial for system performance.
 
-1. **Return ONLY Changed Fields:** Only include top-level keys (`hitPoints`, `equipment`, `currency`, etc.) if a value within them has changed. If the user only takes damage, your entire output should be a minimal JSON like: `{{ "hitPoints": 35 }}`.
+1. **Return ONLY Changed Fields:** Only include top-level keys (`hpDelta`, `equipment`, `status`, etc.) if a value within them has changed. If the user only takes 7 damage, your entire output should be a minimal JSON like: `{{ "hpDelta": -7 }}`.
 
 2. **For Lists (like `equipment` or `ammunition`):**
    - **NEVER** return the entire list if only one item is changed.
    - To **MODIFY** an existing item: Return an array containing an object with the item's identifier (`item_name` for equipment, `name` for ammunition) and ONLY the fields that changed.
      - *Example:* `{{ "equipment": [{{ "item_name": "Shield", "equipped": false }}] }}`
-   - To **ADD** a new item: Return an array containing an object with the full details of ONLY the new item.
+   - To **EQUIP ONE** of a stack (draws one of two daggers): `{{ "equipment": [{{ "item_name": "Dagger", "equipped": true }}] }}`; the engine wears one unit and the rest stays carried.
+   - For an item already on the sheet, add its row's `nql_id` exactly as on the sheet; when several rows share the `item_name` (one worn, one carried), the `nql_id` says which one changes (`equipped` true for the worn row or false for the carried row also says which when no `nql_id` is given).
+   - To **ADD** a new item (its name is NOT on the sheet): Return an array containing an object with the full details of ONLY the new item; `quantity` is how many were acquired.
      - *Example:* `{{ "equipment": [{{ "item_name": "Potion of Healing", "item_type": "consumable", "quantity": 1 }}] }}`
-   - To **REMOVE** an item: Set its quantity to 0
+   - To **CHANGE HOW MANY** of an item already on the sheet (bought more, found more, used some, gave some away): `quantityDelta` = the signed change, with the `item_name` exactly as on the sheet. NEVER compute or return the new count; the engine applies the change to the real stack and refuses using more than the character has.
+     - *Example:* sheet has Travel Ration x1, change says "Add 3 Travel Ration" -> `{{ "equipment": [{{ "item_name": "Travel Ration", "quantityDelta": 3 }}] }}` (NOT quantity 3, NOT quantity 4)
+     - *Example:* "Uses 1 torch" -> `{{ "equipment": [{{ "item_name": "Torch", "quantityDelta": -1 }}] }}`
+   - To **REMOVE** an item entirely: Set its quantity to 0 (or quantityDelta minus the whole stack)
      - *Example:* `{{ "equipment": [{{ "item_name": "Shield", "quantity": 0 }}] }}`
+   - `quantity` on an item already on the sheet is refused unless it is 0. Stock changes are always `quantityDelta`, the same way coins are currencyDelta and hit points are hpDelta.
+   - When the change names a number, send exactly that number as the delta, even if the sheet holds fewer. NEVER clamp it or turn it into quantity 0: the engine refuses using more than the character has and the DM is told. `quantity: 0` is only for a change that removes the item entirely without naming a number ("sold the shield", "lost all the arrows").
+     - *Example:* sheet has Gemstones x5, change says "Remove 9 Gemstones" -> `{{ "equipment": [{{ "item_name": "Gemstones", "quantityDelta": -9 }}] }}` (NOT quantity 0, NOT quantityDelta -5)
 
 3. **For Nested Objects (like `currency` or `spellcasting.spellSlots`):**
    - Only return the specific key-value pairs that were modified.
-   - *Example (Spending Gold):* `{{ "currency": {{ "gold": 125 }} }}` (Do NOT include silver and copper if they are unchanged).
-   - *Example (Using a Spell Slot):* `{{ "spellcasting": {{ "spellSlots": {{ "level1": {{ "current": 3 }} }} }} }}` (Do NOT include other spell slot levels).
+   - *Example (Spending Gold):* `{{ "currencyDelta": {{ "gold": -12 }} }}` (signed change per coin type; never a total, never a `currency` object; omit unchanged coins).
+   - *Example (Using a Spell Slot):* `{{ "spellSlotDelta": {{ "level1": -1 }} }}` (signed change per slot level; never a `current` count, never a `spellcasting` object for a cast).
 
 4. **For Complex Updates Affecting Multiple Systems:**
    - When an action affects multiple character aspects, you MUST include ALL affected fields in your minimal JSON response.
-   - Equipment removal/damage affecting AC: Always include the updated `armorClass`.
    - Weapon changes: Always include updated `attacksAndSpellcasting` array entries for the affected weapons.
-   - Shield/armor changes: Include `armorClass` and any affected `equipment_effects`.
-   - Status changes: Always synchronize `status`, `condition`, and `condition_affected`.
+   - Armor class: do NOT include `armorClass` or `equipment_effects`. The rules engine computes both from the equipped items' typed fields (`armor_category`, `ac_base`, `ac_bonus`, `dex_limit`) after your delta is applied. Give new armor those fields instead.
+   - Item typing: `item_type` "armor" is only for body armor and shields, and such an entry MUST carry `armor_category` and `ac_base` (plus `dex_limit` for medium armor). An amulet, ring, cloak, robe, bracer or charm that gives no armor base is "miscellaneous" with an `item_subtype`; a magic item that adds to AC states that in its `effects` list, not by being typed armor.
+   - Hit dice: never write `hitDice`. The rest action spends them and a long rest restores them; the rules engine keeps the count.
+   - Status: never write `status` for hit point reasons. The rules engine sets "unconscious" when hit points reach 0 and "alive" when they rise above 0; `dead` is the DM's call.
 
    - **Example - Shield is destroyed:**
      ```json
      {{
-       "equipment": [{{ "item_name": "Shield", "quantity": 0, "equipped": false }}],
-       "armorClass": 15,
-       "equipment_effects": [{{ "name": "Shield AC Bonus", "value": 0 }}]
+       "equipment": [{{ "item_name": "Shield", "quantity": 0, "equipped": false }}]
      }}
      ```
    - **Example - Swapping from a Mace to a Longsword:**
@@ -1669,10 +2460,9 @@ Your primary goal is to generate the smallest possible valid JSON object that re
      ```
 
 5. **For Conditions and Status Effects:**
-   - When applying conditions (poisoned, frightened, paralyzed, etc.), update BOTH arrays:
-     - Add the condition name to the `condition_affected` array (e.g., ["poisoned"])
-     - Update the `condition` field with the condition name (e.g., "poisoned")
-   - For multiple conditions, `condition` should contain the most severe, while `condition_affected` lists all
+   - Conditions are facts you state: when a condition is gained or ends (poisoned, frightened, grappled, paralyzed, etc.), return the complete `condition_affected` list as it should now be, and `condition` naming the most severe entry ("none" when the list is empty). The rules engine holds each one and applies its numbers (speed, roll penalties).
+   - The engine adds and removes "unconscious" itself from hit points: never add it because damage reached 0 and never remove it because of healing.
+   - Exhaustion is a level, not a list entry: "gains a level of exhaustion" / "loses a level" -> return `exhaustion` as the new whole number (0-6) computed from the current sheet value. The engine lists it in `condition_affected`, applies the speed and d20 penalties, and removes one level at every Long Rest by itself (never do that from a rest note).
    - **Example - Applying poisoned condition:**
      ```json
      {{
@@ -1681,32 +2471,40 @@ Your primary goal is to generate the smallest possible valid JSON object that re
      }}
      ```
 
-6. **Standard Ammunition Names (ALWAYS use these exact names):**
-   - "Arrows" (plural) - for bow ammunition
-   - "Crossbow bolts" (plural) - for crossbow ammunition
-   - "Sling bullets" (plural) - for sling ammunition
+6. **Standard Ammunition Names (for a NEW row only; a row already on the sheet keeps its own name exactly as listed):**
+   - "Arrows" - for bow ammunition
+   - "Bolts" - for crossbow ammunition
+   - "Bullets, Sling" - for sling ammunition
    - "Darts" (plural) - for thrown darts
-   - "Blowgun needles" (plural) - for blowgun ammunition
-   - Always use plural form for consistency
+   - "Needles" - for blowgun ammunition
+   - Use these exact names: they are the SRD catalog names a purchase uses, so found and bought ammunition stay one row
 
 **CRITICAL EDGE CASES:**
-- When equipment that affects AC (shields, armor, rings of protection) is added, removed, equipped, or unequipped, you **MUST** calculate and return the new total `armorClass`.
+- When equipment that affects AC is added, removed, equipped, or unequipped, return only the `equipment` change; the rules engine recomputes `armorClass` and `equipment_effects`. The engine refuses illegal states (two shields, three held weapons); if told a change was refused, propose a legal one.
 - When a weapon is changed, you **MUST** update the relevant entry in the `attacksAndSpellcasting` array.
 - When a temporary effect is added or removed, you **MUST** return the **complete** `temporaryEffects` array, containing only the effects that should remain active. This is the one exception to the delta-only rule for lists.
-- Down/unconscious (house rule, NO death saves): at 0 HP set `hitPoints` to 0 and `status` to "unconscious"; never write death saves; a character at 0 dies only if the whole party falls; a heal, potion, Medicine, or rest that restores them sets `hitPoints` above 0 and `status` to "alive"
-- Conditions: Always update BOTH `condition` and `condition_affected` when applying conditions
+- Down/unconscious (house rule, NO death saves): damage that reaches 0 is an `hpDelta` and nothing else; the engine stops at 0 and marks the character unconscious; never write death saves; a character at 0 dies only if the whole party falls; a heal, potion, Medicine, or rest that restores them is a positive `hpDelta` and nothing else (the engine wakes them)
+- Conditions: state the complete `condition_affected` list and the most severe `condition` whenever a condition (other than unconscious) is gained or ends
 
 **Your adherence to these delta-only rules is paramount. Generate the most minimal, targeted JSON possible while ensuring ALL logically affected fields are included.**
 
 **CRITICAL: The examples above are for learning purposes only. Do NOT include example JSON in your response. Only return the specific updates needed for the requested changes.**
 
-**HEALING AND DAMAGE CALCULATIONS:**
-- When a character "regains X hit points" or "is healed for X hit points": ADD X to their current hitPoints value (capped at maxHitPoints)
-- When a character "takes X damage" or "loses X hit points": SUBTRACT X from their current hitPoints value (minimum 0)
-- NEVER return the current HP value when healing is mentioned - always calculate the new value
-- Example: If character has 22 HP and "regains 13 hit points", return {{"hitPoints": 35}} NOT {{"hitPoints": 22}}
-- Example: If character has 31 HP out of 40 max and "regains 13 hit points", return {{"hitPoints": 40}} (capped at max)
-- Always respect maxHitPoints as the upper limit for healing
+**HIT POINTS, SPELL SLOTS AND FEATURE USES ARE ENGINE-OWNED (report the change, never the count):**
+- Hit points: return {{"hpDelta": <signed int>}}. "takes 7 damage" / "loses 7 hit points" -> -7; "regains 13 hit points" / "healed for 13" -> 13.
+  NEVER return `hitPoints`: the engine applies the change to the real sheet, stops healing at the maximum and stops damage at 0.
+  A note that only states a resulting total ("now at 12 HP") with no amount is a balance statement: return {{}} and let it be corrected rather than guessing.
+- Spell slots: return {{"spellSlotDelta": {{"levelN": -1}}}} per leveled spell cast (cantrips: nothing). NEVER return a slot `current`;
+  the engine refuses a cast with no slot left and you are told. A cast the note pays with a feat's free use ("Uses Magic Initiate
+  (Cleric) to cast Bless") spends no slot: return {{"featureUseDelta": {{"<exact stored feat name>": -1}}}} and no spellSlotDelta.
+- Feature uses: return {{"featureUseDelta": {{"<exact stored feature or feat name>": -1}}}} for the resource-owning feature or feat (a shared option spends
+  its parent's pool). NEVER return `usage.current`; the engine refuses a use beyond the pool and you are told.
+- Refills ("regains one use", "recovers two 1st-level slots") are positive amounts; the engine stops at each maximum.
+- Temporary hit points: "gains 10 temporary hit points" -> {{"tempHpGrant": 10}} (positive only). NEVER return
+  `temporaryHitPoints`. Damage drains temporary hit points before hit points automatically: report the damage taken
+  as hpDelta and nothing else; never subtract temporary hit points yourself. A long rest clears them.
+- Only the pools the note names, only the amounts it states. A cast note with no healing amount ("Expends one 1st-level
+  spell slot to cast Cure Wounds") is the slot change only; never infer a heal from a spell's name or an earlier wound.
 
 {schema_info}
 
@@ -1775,36 +2573,33 @@ CRITICAL INSTRUCTIONS:
 5. Maintain data integrity and consistency
 6. IMPORTANT: When updating nested objects like 'spellcasting', include ALL existing subfields to prevent data loss
 7. NEVER return partial nested objects that would delete existing important data
-8. If updating spell slots, always include ability, spellSaveDC, spellAttackBonus, and spells fields
+8. Spell slot counts never appear inside 'spellcasting'; a cast or a refill is spellSlotDelta. Edit 'spellcasting' only for spells known/prepared or a change of casting ability, and then include ability, spellSaveDC, spellAttackBonus, and spells fields as they are (the DC and bonus are derived by the rules engine; any value you write for them is replaced)
 9. SPELL SLOT RULE: Cantrips (0-level spells) do NOT consume spell slots. Only deduct spell slots for leveled spells (1st-9th level).
-10. HIT DICE RULE: IGNORE all references to hit dice, Hit Dice, HD, or hit dice restoration. Do NOT add hitDice, hitDiceRestored, or maxHitDice fields. The system does not track hit dice.
-11. REST HEALING: For long rests, simply restore hitPoints to maxHitPoints and restore spell slots. For short rests, restore some hitPoints based on the description. Do not implement hit dice mechanics.
+10. HIT DICE RULE: The rules engine keeps hit dice: the rest action spends them and a long rest restores them. A note about hit dice spent or restored changes nothing you return; never write `hitDice`, `hitDiceRestored` or `maxHitDice`.
+11. REST HEALING: Rests are applied by the rest action, not by you. A rest note reaching you carries only an extra narrated amount ("Regains 9 hit points"): return it as a positive hpDelta. Never refill slots or pools from a rest note; the engine already did. Do not implement hit dice mechanics.
 12. CURRENCY MANAGEMENT - CRITICAL RULES:
-    a) ALWAYS return the FINAL currency values after ANY transaction
-    b) NEVER return just the change amount or partial currency objects
-    c) Include ALL currency types (gold, silver, copper) even if unchanged
-    
-    TRANSACTION TYPES:
-    - SPENDING/PAYING: Subtract from current amount
-      Example: Has 367 gold, pays 100 gold -> Return {{"currency": {{"gold": 267, "silver": 61, "copper": 14}}}}
-    - RECEIVING/FINDING: Add to current amount  
-      Example: Has 267 gold, finds 50 gold -> Return {{"currency": {{"gold": 317, "silver": 61, "copper": 14}}}}
-    - TRADING/EXCHANGING: Update all affected denominations
-      Example: Trades 100 silver for 10 gold -> Calculate and return new totals
-    
-    CRITICAL: Look at the current currency values in the character data and calculate the FINAL amount after the transaction. Do NOT return the amount found/paid, return the TOTAL after adding/subtracting.
-13. STATUS-CONDITION SYNCHRONIZATION: Always maintain consistency between status, condition, and hitPoints fields:
-    - When status changes to "alive" and hitPoints > 0, automatically set condition to "none" and clear condition_affected array
-    - When hitPoints > 0 and status is "alive", condition cannot be "unconscious"
-    - When status is "unconscious", condition must be "unconscious" and condition_affected must include "unconscious"
-    - When healing an unconscious character above 0 HP, clear unconscious from both condition and condition_affected fields
+    a) Coins are owned by the rules engine. Report the CHANGE, never the balance: return
+       {{"currencyDelta": {{"gold": <signed int>, "silver": <signed int>, "copper": <signed int>}}}}
+       with only the coin types that change. Negative = paid or given away, positive = received or found.
+    b) NEVER return a "currency" object and never compute a final total; the engine applies the delta to
+       the sheet's real balance and refuses a payment the character cannot cover.
+    c) A payment in a coin the character lacks is two signed entries the DM stated (e.g. change a gold
+       piece: {{"currencyDelta": {{"gold": -1, "silver": 8}}}} for a 2 silver fee). Do not invent a conversion
+       the request did not describe.
+    d) A verb governs every coin listed after it: "Remove 1 silver and 10 copper" is silver -1 AND copper -10;
+       a coin is positive only when its own verb says add/receive/find/take back. "Pay 1 silver, take 8 copper
+       in change" is silver -1, copper +8. Never flip a sign to make a transaction "balance".
+    e) Examples: pays 100 gold -> {{"currencyDelta": {{"gold": -100}}}}; finds 50 gold and 20 silver ->
+       {{"currencyDelta": {{"gold": 50, "silver": 20}}}}; "kept 38 gold" is a balance statement, not a change:
+       return {{}} and let the request be corrected rather than guessing a delta.
+13. STATUS AND HIT POINTS: `status` unconscious/alive follows hit points and is written by the rules engine, never by you. Report the `hpDelta` only. Conditions you state (poisoned, grappled...) stay until you remove them from `condition_affected`; a rest or the passing of time removes nothing by itself.
 14. RESOURCE TRACKING RULES:
-    - "spell slot" or "expends [level] spell slot" -> Update spellSlots only
+    - "spell slot" or "expends [level] spell slot" -> spellSlotDelta only
     - For an ability, read its actual cost and identify the exact resource-owning feature in the current sheet. A shared option spends its parent's classFeatures[].usage, not an independent option counter.
-    - If ability description mentions "expending a spell slot" -> ONLY update spellSlots
+    - If ability description mentions "expending a spell slot" -> ONLY spellSlotDelta
 15. CLASS FEATURE USAGE TRACKING:
     When updating ability uses (not spell slots):
-    a) Match the exact stored resource-owning feature name. Preserve genuine independent pools and shared pools with complete current/max/refreshOn objects.
+    a) Spend or refill with featureUseDelta on the exact stored resource-owning feature name. A classFeatures usage object is only for a structural correction (a missing real pool, or usage:null); never for a count.
     b) Omitted usage preserves the saved value. Explicit usage:null is saved as no independent use pool, NOT free/unlimited use or a deletion operator. Emit it only when the requested rules-grounded correction explicitly calls for removing that obsolete independent counter; never clear a real pool by default.
     c) An option with usage:null describes its exact parent and cost. Spend that parent's counter. Do not create an option counter or rename an entry to evade the merge. Add a missing real independent pool only when the requested change and actual rules establish it, never from an old label alone.
     d) refreshOn is a trigger tag, not recovery amount or exclusivity. Preserve the description's actual partial/full recovery rules; use longRest for an applicable full reset. Do not refill resources during level-up or spend spell slots unless the actual cost requires them.
@@ -1812,32 +2607,35 @@ CRITICAL INSTRUCTIONS:
 16. RESOURCE UPDATE EXAMPLES:
     Current: Pool has usage {{"current": 1, "max": 2, "refreshOn": "longRest"}}; Option has usage:null and description "Spend one use of Pool."
     Input: "Uses Option, spending one use of Pool"
-    Update: {{"classFeatures": [{{"name": "Pool", "usage": {{"current": 0, "max": 2, "refreshOn": "longRest"}}}}]}}
+    Update: {{"featureUseDelta": {{"Pool": -1}}}}
     
     Input: "Expends one 1st-level spell slot"  
-    Update: {{"spellcasting": {{"spellSlots": {{"level1": {{"current": [reduced by 1]}}}}}}}}
+    Update: {{"spellSlotDelta": {{"level1": -1}}}}
     
     Input: "Uses Divine Smite by expending a 2nd-level spell slot"
-    Update: {{"spellcasting": {{"spellSlots": {{"level2": {{"current": [reduced by 1]}}}}}}}}
+    Update: {{"spellSlotDelta": {{"level2": -1}}}}
     Note: Do NOT update any Divine Smite usage counter - only the spell slot
-17. AMMUNITION MANAGEMENT - CRITICAL:
-    - When ADDING ammunition: Return the quantity to ADD as a positive number
-      Example: "Added 20 arrows" -> {{"ammunition": [{{"name": "arrows", "quantity": 20}}]}}
-    - When REMOVING/SELLING ammunition: Return the quantity to REMOVE as a NEGATIVE number
-      Example: "Removed 100 crossbow bolts" -> {{"ammunition": [{{"name": "crossbow bolts", "quantity": -100}}]}}
-      Example: "Sold 50 arrows" -> {{"ammunition": [{{"name": "arrows", "quantity": -50}}]}}
-    - NEVER return the final quantity after removal - return the CHANGE amount
-    - The system will automatically calculate the final quantity
-18. LEVEL UP RESTRICTION - CRITICAL:
-    - NEVER modify experience_points during level up operations
-    - Level up should ONLY change: level, maxHitPoints, hitPoints, classFeatures, etc.
-    - The experience_points field must NOT be included in level up changes
-    - XP is managed separately and should never be altered during level advancement
-    - IMPORTANT: This restriction ONLY applies to level up operations. You MUST update experience_points when explicitly requested (e.g., "Add 50 experience points", "Award XP")
+17. AMMUNITION IS THE ENGINE'S - CRITICAL:
+    - A row ALREADY on the sheet changes only by quantityDelta: the signed number fired, bought, found, sold or lost. NEVER the resulting count.
+      Example: sheet has Crossbow bolt x60, "Fired 3 crossbow bolts at the mark and recovered 2" -> {{"ammunition": [{{"name": "Crossbow bolt", "quantityDelta": -1}}]}}
+      Example: "Bought 20 crossbow bolts" -> {{"ammunition": [{{"name": "Crossbow bolt", "quantityDelta": 20}}]}}
+      Example: "Sold 100 crossbow bolts" -> {{"ammunition": [{{"name": "Crossbow bolt", "quantityDelta": -100}}]}} (send the number named even if the sheet holds fewer; the engine refuses and the DM is told)
+    - name is the row's name EXACTLY as the sheet lists it (singular or plural as written), never a standard name
+    - quantity on an existing row is refused, except quantity 0 to remove the row entirely ("lost all the bolts")
+    - A NEW kind of ammunition (no such row on the sheet) is created with quantity = how many were acquired, plus a description
+    - Never write recoverable: the rules engine keeps that count
+18. EXPERIENCE POINTS ARE THE ENGINE'S - CRITICAL:
+    - NEVER write experience_points, exp_required_for_next_level or levelUpsPending: XP is awarded through the awardExperience action and the rules engine adds it; any value you write for these fields is dropped
+    - A change text that mentions XP ("Awarded 50 experience points") changes nothing here: return the other requested fields only (or {{}} when there are none)
+    - Level up changes level, maxHitPoints, hitPoints, classFeatures, etc. and never XP
+19. DERIVED TOTALS ARE THE ENGINE'S: proficiencyBonus, initiative, senses.passivePerception, every skill bonus, spellSaveDC and spellAttackBonus are computed by the rules engine from level, ability scores, proficiencies, expertise and feats. Never write them; a value you write is dropped. State the fact instead: a new skill proficiency is the skill added to 'skills' (any number), a new saving throw proficiency is the ability added to 'savingThrows', expertise is the skill added to 'expertise', a feat is added to 'feats', an ability score change is the new score in 'abilities'.
+20. CONCENTRATION IS THE ENGINE'S: never write `concentration` (the caster's record is code-written) and never end a spell because its caster was hit; the engine makes the Constitution save when the damage you report lands and ends the spell everywhere on a failure. Report the hpDelta only.
 {effects_update_rules}
 
 EQUIPMENT UPDATE EXAMPLES:
 CORRECT (updating one item): {{"equipment": [{{"item_name": "Jeweled dagger", "description": "updated description", "magical": true}}]}}
+CORRECT (more of an item already carried): {{"equipment": [{{"item_name": "Travel Ration", "quantityDelta": 3}}]}}
+WRONG (states a count for an item already carried): {{"equipment": [{{"item_name": "Travel Ration", "quantity": 4}}]}}
 WRONG (would delete all other items): {{"equipment": [...]}} with multiple items
 
 DANGEROUS EXAMPLE (DO NOT DO):
@@ -1847,8 +2645,12 @@ SAFE EXAMPLE:
 {{"spellcasting": {{"ability": "wisdom", "spellSaveDC": 13, "spellAttackBonus": 5, "spells": {{...}}, "spellSlots": {{...}}}}}} // This preserves all data
 
 CONDITION MANAGEMENT EXAMPLES:
-CORRECT (healing unconscious character): {{"hitPoints": 12, "status": "alive", "condition": "none", "condition_affected": []}}
-WRONG (inconsistent state): {{"hitPoints": 12, "status": "alive", "condition": "unconscious"}} // Condition contradicts status!
+CORRECT (healing an unconscious character): {{"hpDelta": 12}} // the engine wakes them
+WRONG: {{"hpDelta": 12, "status": "alive", "condition": "none", "condition_affected": []}} // status is the engine's
+CORRECT (grappled by a bandit while already poisoned): {{"condition": "grappled", "condition_affected": ["grappled", "poisoned"]}}
+CORRECT (the bandit lets go): {{"condition": "poisoned", "condition_affected": ["poisoned"]}}
+CORRECT (a forced march, current exhaustion 1): {{"exhaustion": 2}}
+WRONG: {{"condition_affected": ["exhaustion"]}} // exhaustion is the number, the engine lists it
 
 RESOURCE TRACKING EXAMPLES:
 
@@ -1861,36 +2663,31 @@ Pool remains at 1/2 because it is omitted. Option's explicit null persists and p
 Example 2 - Regular Spell:
 Changes: "Casts Cure Wounds, expending one 1st-level spell slot"
 Current spellSlots: {{"level1": {{"current": 3, "max": 3}}}}
-Update: {{"spellcasting": {{"spellSlots": {{"level1": {{"current": 2, "max": 3}}}}}}}}
+Update: {{"spellSlotDelta": {{"level1": -1}}}}
 
 Example 3 - Ability Using Spell Slots:
 Changes: "Uses Divine Smite by expending a 2nd-level spell slot for extra damage"
 Current spellSlots: {{"level2": {{"current": 2, "max": 2}}}}
-Update: {{"spellcasting": {{"spellSlots": {{"level2": {{"current": 1, "max": 2}}}}}}}}
-Note: Divine Smite is an ability that costs spell slots - update ONLY the spell slots, not any ability usage
+Update: {{"spellSlotDelta": {{"level2": -1}}}}
+Note: Divine Smite is an ability that costs spell slots - only the slot delta, no featureUseDelta
 
-AMMUNITION EXAMPLES:
-Example 1 - Adding ammunition:
-Changes: "Added 25 crossbow bolts to inventory"
-Update: {{"ammunition": [{{"name": "crossbow bolts", "quantity": 25}}]}}
+AMMUNITION EXAMPLES (rows already on the sheet: quantityDelta with the sheet's own row name):
+Example 1 - Buying more:
+Changes: "Added 25 crossbow bolts to inventory" (sheet row: Crossbow bolt x60)
+Update: {{"ammunition": [{{"name": "Crossbow bolt", "quantityDelta": 25}}]}}
 
-Example 2 - Removing/Selling ammunition:  
-Changes: "Sold 100 crossbow bolts to Trader Sila"
-Update: {{"ammunition": [{{"name": "crossbow bolts", "quantity": -100}}]}}
+Example 2 - Selling or firing:
+Changes: "Sold 100 crossbow bolts to Trader Sila" (sheet row: Crossbow bolt x60)
+Update: {{"ammunition": [{{"name": "Crossbow bolt", "quantityDelta": -100}}]}}  (not clamped: the engine refuses a short stock)
 
-Example 3 - Multiple ammunition changes:
-Changes: "Bought 30 arrows, sold 50 crossbow bolts"
-Update: {{"ammunition": [{{"name": "arrows", "quantity": 30}}, {{"name": "crossbow bolts", "quantity": -50}}]}}
+Example 3 - A new kind plus a change to an existing row:
+Changes: "Bought 30 arrows, sold 50 crossbow bolts" (sheet rows: Crossbow bolt x60, no arrows)
+Update: {{"ammunition": [{{"name": "Arrows", "quantity": 30, "description": "Standard arrows"}}, {{"name": "Crossbow bolt", "quantityDelta": -50}}]}}
 
-EXPERIENCE POINTS EXAMPLES:
-Example 1 - Adding XP:
-Changes: "Add 50 experience points" or "Awarded 50 experience points for successfully concluding a combat encounter"
-Current experience_points: 2675
-Update: {{"experience_points": 2725}}
-
-Example 2 - Setting XP:
-Changes: "Set experience points to 1000"
-Update: {{"experience_points": 1000}}
+EXPERIENCE POINTS EXAMPLE (engine-owned, never written here):
+Changes: "Awarded 50 experience points for the ambush"
+Update: {{}}
+(XP reaches the sheet through the awardExperience action and the rules engine; this field is dropped if written.)
 
 Character Role: {character_role}
 """
@@ -1905,6 +2702,12 @@ Character Role: {character_role}
         {"role": "user", "content": f"Changes to make: {changes}"}
     ]
     
+    if payment is not None:
+        messages.insert(-1, {"role": "user", "content":
+            "Typed castingResource: " + json.dumps(casting_resource) +
+            ". The host owns this payment; return the spell effect and other changes, "
+            "never resource totals. The host supplies exactly one selected payment delta."})
+
     # Add conversation history for context (last 10 messages)
     if history:
         recent_history = history[-10:]
@@ -1918,7 +2721,11 @@ Character Role: {character_role}
             "content": f"Accepted action context (current_index identifies this step, not a commit receipt):\n{json.dumps(action_context, indent=2)}",
         })
     
-    max_attempts = 3
+    # #432 (D-432-1): only unusable answers count toward the bound. A provider
+    # refusal and a supersession leave the loop at once; a confirmation
+    # request for a {} answer is not a failure.
+    bounded_failure_limit = 3
+    bounded_failure_count = 0
     attempt = 1
     
     # T079 MIGRATION NOTE: Gemini requires response_schema forcing on this callsite.
@@ -1932,7 +2739,7 @@ Character Role: {character_role}
             config.CHAR_UPDATE_GEMINI_FLASHLITE_LOW
         )
         requested_delta_schema = build_requested_character_delta_gemini_schema(
-            changes,
+            affects,
             schema,
         )
         if requested_delta_schema is not None:
@@ -1968,12 +2775,33 @@ Character Role: {character_role}
     primary_committed = False
     validation_success = None
     last_update_error = None
-    while structural_reissue or attempt <= max_attempts:
+    # The engine-owned effect operation is itself the change, so an empty
+    # delta beside it needs no confirmation.
+    # A callable operation is a lazy T078 classifier (core/managers/effects_runtime):
+    # it is resolved on each parsed T079 delta below and runs the classifier only
+    # when the delta carries "effectChange" (D-COST-6: never on a plain {}).
+    lazy_classifier = managed_effect_operation if callable(managed_effect_operation) else None
+    if lazy_classifier is not None:
+        managed_effect_operation = None
+    engine_owned_change = declarative_effects and managed_effect_operation
+    # A {} answer is the typed "no change" and is accepted at once (D-COST-6;
+    # it was re-asked for confirmation since #432).
+    # An engine refusal that the model then abandons with {} (or that outlasts
+    # the attempt bound) is reported to the caller as a refusal, not accepted
+    # as "no change".
+    last_engine_refusal = None
+    # A required travel proposal (structural_reissue) gets the same bounded
+    # tries; its caller then drops it and the travel goes on (#855).
+    while bounded_failure_count < bounded_failure_limit:
         try:
             if commit_guard is not None:
                 with commit_guard():
                     pass
-            debug(f"STATE_CHANGE: Attempt {attempt} of {max_attempts}", category="character_updates")
+            debug(
+                f"STATE_CHANGE: Attempt {attempt} (bounded failures "
+                f"{bounded_failure_count} of {bounded_failure_limit})",
+                category="character_updates",
+            )
 
             response = capture_and_fanout("T079", api_client.create_completion,
                 _request_provider=MODEL_PROVIDER,
@@ -1990,7 +2818,7 @@ Character Role: {character_role}
                     pass
             
             raw_response = response.choices[0].message.content.strip()
-            
+
             # Log the raw LLM response for debugging ammunition issues
             if "ammunition" in changes.lower() or "bolt" in changes.lower() or "arrow" in changes.lower():
                 debug(f"LLM_RESPONSE for ammunition update: {raw_response[:500]}...", category="character_updates")
@@ -2065,12 +2893,39 @@ Character Role: {character_role}
                 clean_response = clean_response[: -len("```")]
             clean_response = clean_response.strip()
             updates = json.loads(clean_response)
+            effect_flag = None
+            if isinstance(updates, dict):
+                effect_flag = updates.pop("effectChange", None)
+            if lazy_classifier is not None and isinstance(updates, dict):
+                from core.ai.effects_agent import CONTRACT_CORRECTION, EffectsAgentContractError
+                try:
+                    managed_effect_operation = lazy_classifier(updates, effect_flag)
+                except EffectsAgentContractError as contract_error:
+                    # D-COST-8 (#193): T079's effectChange object failed T078's contract; the same
+                    # correction T078 gave, inside T079's bounded loop.
+                    bounded_failure_count += 1
+                    last_update_error = contract_error
+                    messages[-1]["content"] += (
+                        "\n\n" + CONTRACT_CORRECTION % contract_error + " Return the complete delta again.")
+                    attempt += 1
+                    continue
+                engine_owned_change = declarative_effects and managed_effect_operation
             if not _is_meaningful_character_delta(updates, schema) and not (
-                declarative_effects and managed_effect_operation
+                engine_owned_change or payment is not None
             ):
                 raise ValueError(
                     "T079 returned an empty or unrecognized character delta"
                 )
+            if updates == {}:
+                if last_engine_refusal:
+                    raise EngineRefusedChange(last_engine_refusal)
+                if not engine_owned_change:
+                    # D-COST-6 (#193): the first {} is the typed "no change" answer; it is no
+                    # longer re-asked for confirmation.
+                    info(
+                        f"T079 reported no mechanical change for {character_name}",
+                        category="character_updates",
+                    )
 
             if declarative_effects:
                 # T079 is never an effects authority after cutover, even when a
@@ -2090,9 +2945,16 @@ Character Role: {character_role}
                     managed_effect_operation if declarative_effects else None,
                 )
 
+            if payment is not None:
+                # The accepted typed choice owns payment, never the updater's prose interpretation.
+                updates.pop("spellSlotDelta", None)
+                updates.pop("featureUseDelta", None)
+                updates.update(payment)
+
             is_complete, missing_fields = validate_requested_character_update_completeness(
-                changes,
+                affects,
                 updates,
+                casting_resource=casting_resource,
             )
             if not is_complete:
                 missing_list = ", ".join(missing_fields)
@@ -2112,12 +2974,7 @@ Character Role: {character_role}
                     "requested_fields_complete": False,
                     "missing_requested_fields": missing_fields,
                 }
-                if attempt == max_attempts and not structural_reissue:
-                    error(
-                        "FAILURE: Max attempts reached with an incomplete character delta.",
-                        category="character_updates",
-                    )
-                    return False
+                bounded_failure_count += 1
                 attempt += 1
                 continue
             
@@ -2144,58 +3001,8 @@ Character Role: {character_role}
             #     print(f"[DEBUG] Ammunition updates: {updates['ammunition']}")
             
             
-            # Currency reduction validation
-            if 'currency' in updates:
-                current_currency = character_data.get('currency', {})
-                new_currency = updates.get('currency', {})
-                needs_verification = False
-                reduction_details = []
-                
-                for coin_type in ['gold', 'silver', 'copper']:
-                    current_val = current_currency.get(coin_type, 0)
-                    new_val = new_currency.get(coin_type, current_val)
-                    
-                    if new_val < current_val:
-                        needs_verification = True
-                        reduction_amount = current_val - new_val
-                        reduction_details.append(f"{coin_type}: {current_val} -> {new_val} (-{reduction_amount})")
-                
-                if needs_verification:
-                    print(f"DEBUG: [Currency Update] Currency reduction detected for {character_name}: {', '.join(reduction_details)}")
-                    warning(f"CURRENCY REDUCTION: {character_name} - {', '.join(reduction_details)}", category="character_updates")
-                    
-                    # Create verification prompt
-                    verification_prompt = f"""CURRENCY REDUCTION VERIFICATION REQUIRED:
-
-Character: {character_name}
-Detected reductions: {', '.join(reduction_details)}
-Original request: {changes}
-
-IMPORTANT: Currency should ONLY be reduced in these cases:
-- Making a purchase or trade
-- Giving money away intentionally
-- Losing money (theft, gambling, penalties)
-- Explicit command to remove currency
-
-Currency should NOT be reduced when:
-- Finding coins in containers/coffers
-- Receiving rewards or payment
-- Looting enemies or discovering treasure
-- Opening chests with coins inside
-
-Based on the context, is this currency reduction correct?
-If this was FINDING coins, you should ADD to existing currency, not replace it.
-
-Please provide the CORRECT currency values:
-- Current gold: {current_currency.get('gold', 0)}, silver: {current_currency.get('silver', 0)}, copper: {current_currency.get('copper', 0)}
-- If adding found coins, return the sum of current + found amounts"""
-                    
-                    # Currency validation: Allow the transaction but monitor it
-                    info(f"CURRENCY TRANSACTION: Allowing currency change for {character_name}", category="character_updates")
-                    info(f"CURRENCY TRANSACTION: Details - {', '.join(reduction_details)}", category="character_updates")
-                    
-                    # The improved prompting should prevent calculation errors
-                    # We allow the transaction to proceed per the agentic approach
+            # Currency is engine-owned: prepare_character_delta applies a
+            # currencyDelta through core/nql/currency and refuses totals.
             
             # Debug HP changes BEFORE merge
             if 'hitPoints' in updates:
@@ -2204,6 +3011,7 @@ Please provide the CORRECT currency values:
             updates, updated_data, preparation_checks = prepare_character_delta(
                 character_data, updates, character_role, schema, character_name,
                 managed_effect_operation if declarative_effects else None,
+                model_authored=True,
             )
             
             # Debug HP changes AFTER merge
@@ -2239,9 +3047,7 @@ Please provide the CORRECT currency values:
                 safe_write_json("debug/debug_critical_field_loss.json", debug_info)
                 debug("FILE_OP: Debug info saved to debug/debug_critical_field_loss.json", category="file_operations")
                 
-                if attempt == max_attempts and not structural_reissue:
-                    error("FAILURE: Max attempts reached. Update failed to preserve critical data.", category="character_validation")
-                    return False
+                bounded_failure_count += 1
                 attempt += 1
                 continue
             
@@ -2255,6 +3061,7 @@ Please provide the CORRECT currency values:
             # print(f"[DEBUG] About to validate character data against schema")
             is_valid = preparation_checks['schema_valid']
             error_msg = preparation_checks['error_message']
+            last_engine_refusal = preparation_checks.get('engine_refusal') if not is_valid else None
             # print(f"[DEBUG] Schema validation completed. Valid: {is_valid}, Error: {error_msg}")
             
             # Update debug data with validation results
@@ -2266,9 +3073,14 @@ Please provide the CORRECT currency values:
             
             if not is_valid:
                 error(f"VALIDATION: Validation failed: {error_msg}", category="character_validation")
-                if attempt == max_attempts and not structural_reissue:
-                    error("FAILURE: Max attempts reached. Reverting changes.", category="character_updates")
-                    return False
+                if last_engine_refusal:
+                    # The engine refused the amount the change stated (not
+                    # enough coins, stock, slots or uses). T079 must not
+                    # reinterpret the amount: a retry that sees the refusal
+                    # clamps it to what the sheet holds (observed live). The
+                    # DM decides what happens instead; nothing was written.
+                    raise EngineRefusedChange(last_engine_refusal)
+                bounded_failure_count += 1
                 
                 # Add validation error feedback to the prompt for next attempt
                 if "item_subtype" in error_msg and "is not one of" in error_msg:
@@ -2403,7 +3215,7 @@ Please provide the CORRECT currency values:
                         # Use smart validation that checks cache first
                         validation_result = (
                             validator.validate_and_correct_character_smart_with_result(
-                                char_data
+                                char_data, before=persisted_character_data
                             )
                         )
                         validated_data = validation_result.data
@@ -2486,6 +3298,7 @@ Please provide the CORRECT currency values:
                     pass
                 return True
             error(f"FAILURE: JSON decode error (attempt {attempt})", exception=e, category="ai_processing")
+            bounded_failure_count += 1
             debug(f"AI_CALL: Raw response: {raw_response}", category="ai_processing")
             # print(f"\n[DEBUG ERROR] JSON decode error for {character_name}")
             # print(f"Raw response that failed to parse: {raw_response}")
@@ -2502,8 +3315,19 @@ Please provide the CORRECT currency values:
                 f.write(f"Clean response attempt:\n{clean_response if 'clean_response' in locals() else 'Not extracted'}\n")
             debug(f"JSON parse error details saved to: {debug_error_file}", category="character_updates")
             
+        except (EngineRefusedChange, ReadOnlySaveStop):
+            raise
         except Exception as e:
-            if commit_guard is not None and isinstance(e, LiveProviderSuperseded):
+            if isinstance(e, LiveProviderCompletedError):
+                # A deterministic provider refusal cannot heal by reissuing the
+                # same request (#240); hand it to the caller with its envelope.
+                error(
+                    f"FAILURE: T079 provider refused {character_name} "
+                    f"(deterministic, {e.http_status})",
+                    category="character_updates",
+                )
+                raise
+            if isinstance(e, LiveProviderSuperseded):
                 raise
             last_update_error = e
             if commit_guard is not None and primary_committed:
@@ -2511,6 +3335,7 @@ Please provide the CORRECT currency values:
                     pass
                 return True
             error(f"FAILURE: Error during update (attempt {attempt})", exception=e, category="character_updates")
+            bounded_failure_count += 1
             
             # Update debug data with exception details
             if 'debug_data' in locals():
@@ -2549,12 +3374,12 @@ Please provide the CORRECT currency values:
             #     print(f"AI response received: {raw_response[:500]}...")
             # print(f"Stack trace will be in logs\n")
         
-        if structural_reissue or attempt < max_attempts:
-            attempt += 1
-            time.sleep(1)
-        else:
-            break
+        attempt += 1
+        time.sleep(1)
     
+    if last_engine_refusal:
+        raise EngineRefusedChange(last_engine_refusal)
+
     # Log failure state
     if 'debug_data' in locals():
         debug_data["final_outcome"] = "failure"
@@ -2566,7 +3391,11 @@ Please provide the CORRECT currency values:
         safe_write_json(debug_log_file, debug_log)
         debug(f"Debug log updated: {debug_log_file}", category="character_updates")
     
-    error(f"FAILURE: Failed to update character {character_name} after {max_attempts} attempts", category="character_updates")
+    error(
+        f"FAILURE: T079 answers stayed invalid for {character_name} "
+        f"({bounded_failure_count} bounded failures)",
+        category="character_updates",
+    )
     error(f"FAILURE: Last validation error was: {error_msg if 'error_msg' in locals() else 'Unknown error'}", category="character_updates")
     return False
 

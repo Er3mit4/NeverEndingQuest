@@ -47,7 +47,6 @@ from utils.capture.multi_model_capture import capture_and_fanout, register_calls
 from model_config import convert_to_gemini_schema
 register_callsite("T022", "core/generators/area_generator.py", 223)
 register_callsite("T023", "core/generators/area_generator.py", 527)
-register_callsite("T024", "core/generators/area_generator.py", 694)
 
 # issue #128: small Gemini response_schema for the area name/description call (T023).
 # Source of truth for these fields is the code's own expected output
@@ -72,18 +71,6 @@ def _useful_text(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("expected a non-empty string")
     return value.strip()
-
-
-def _validate_area_description(value: Any) -> str:
-    """Validate T024's standalone prose contract."""
-    text = _useful_text(value)
-    if len(text) <= 10:
-        raise ValueError("area description is too short")
-    if "```" in text or text.startswith(("{", "[")):
-        raise ValueError("area description must be plain prose")
-    if text.lower().startswith(("description:", "area description:")):
-        raise ValueError("area description must not include a label")
-    return text
 
 
 def _validate_thematic_names(value: Any, expected_count: int) -> List[str]:
@@ -136,6 +123,8 @@ class AreaConfig:
     danger_level: str = "medium"  # low, medium, high, extreme
     recommended_level: int = 1
     num_locations: int = None  # If specified, override size-based calculation
+    climate: str = ""  # model-authored, from the module's worldMap region
+    terrain: str = ""  # model-authored, from the module's worldMap region
 
 class MapLayoutGenerator:
     """Generates map layouts for areas"""
@@ -649,8 +638,8 @@ Use only standard ASCII characters -- no smart quotes, no em-dashes, no Unicode 
             "areaDescription": area_description,  # Use the generated description
             "dangerLevel": config.danger_level,
             "recommendedLevel": config.recommended_level,
-            "climate": self.determine_climate(config.area_type),
-            "terrain": self.determine_terrain(config.area_type),
+            "climate": config.climate,
+            "terrain": config.terrain,
             "map": map_data,
             "locations": locations,
             "randomEncounters": self.generate_encounter_table(config),
@@ -659,88 +648,6 @@ Use only standard ASCII characters -- no smart quotes, no em-dashes, no Unicode 
         }
         
         return area_data
-    
-    def generate_area_description(self, area_name: str, config: AreaConfig) -> str:
-        """Generate a thematic area description using AI"""        
-        prompt = f"""Generate a unique, atmospheric description for a 5th edition area named "{area_name}".
-
-Area Details:
-- Type: {config.area_type}
-- Size: {config.size}
-- Complexity: {config.complexity}
-- Danger Level: {config.danger_level}
-- Recommended Level: {config.recommended_level}
-
-Requirements:
-- Write 1-2 sentences that capture the area's atmosphere and character
-- Make it unique and evocative, not generic
-- Include sensory details appropriate to the area type
-- Avoid using the exact phrase "where civilization meets the frontier"
-- Match the danger level and complexity in the description
-
-Return ONLY the area description text, no additional formatting or labels.
-Use only standard ASCII characters -- no smart quotes, no em-dashes, no Unicode symbols."""
-
-        try:
-            from model_config import MODEL_PROVIDER
-            if MODEL_PROVIDER == "openai":
-                main_cfg = app_config.DM_MAIN_GPT52_NONE
-            elif MODEL_PROVIDER == "gemini":
-                main_cfg = app_config.DM_MAIN_GEMINI_PRO_LOW
-            elif MODEL_PROVIDER == "lmstudio":
-                main_cfg = app_config.DM_MAIN_LMSTUDIO
-            else:  # legacy
-                main_cfg = app_config.DM_MAIN_LEGACY
-
-            response = capture_and_fanout("T024", api_client.create_completion,
-                _request_provider=MODEL_PROVIDER,
-                messages=[
-                    {"role": "system", "content": "You are an expert fantasy world builder. Create unique, atmospheric descriptions for 5th edition of the world's most popular roleplaying game areas that avoid cliches and generic phrases."},
-                    {"role": "user", "content": prompt}
-                ],
-                model=main_cfg["model"],
-                temperature=0.8,
-                response_format=None,
-                **{k: v for k, v in main_cfg.items() if k != "model"})
-            
-            return _validate_area_description(
-                response.choices[0].message.content
-            )
-                
-        except Exception as e:
-            print(f"DEBUG: [Area Generator] Warning: Failed to generate area description via AI: {e}")
-            # Fallback to basic description without hardcoded templates
-            area_adjectives = {
-                "dungeon": ["ancient", "forgotten", "mysterious", "treacherous"],
-                "wilderness": ["untamed", "wild", "dangerous", "pristine"], 
-                "town": ["bustling", "quiet", "prosperous", "troubled"],
-                "mixed": ["unique", "varied", "complex", "intriguing"]
-            }
-            
-            adjective = area_adjectives.get(config.area_type, ["mysterious"])[0]
-            article = "an" if adjective[:1].lower() in "aeiou" else "a"
-            return f"{area_name} is {article} {adjective} {config.area_type} area with {config.complexity} challenges suitable for level {config.recommended_level} adventurers."
-    
-    def determine_climate(self, area_type: str) -> str:
-        """Determine appropriate climate for area type"""
-        climates = {
-            "dungeon": "controlled - cool and damp",
-            "wilderness": random.choice(["temperate", "tropical", "arctic", "desert"]),
-            "town": "temperate",
-            "mixed": "varied"
-        }
-        return climates.get(area_type, "temperate")
-    
-    def determine_terrain(self, area_type: str) -> str:
-        """Determine appropriate terrain for area type"""
-        terrains = {
-            "dungeon": "stone corridors and chambers",
-            "wilderness": random.choice(["forest", "mountains", "plains", "swamp", "coast"]),
-            "town": "urban streets and buildings",
-            "mixed": "varied terrain"
-        }
-        return terrains.get(area_type, "varied")
-    
     
     def generate_encounter_table(self, config: AreaConfig) -> List[Dict[str, Any]]:
         """Generate a random encounter table for the area"""
@@ -871,13 +778,17 @@ def main():
     complexity = input("Complexity (simple/moderate/complex): ").strip() or "moderate"
     danger_level = input("Danger level (low/medium/high/extreme): ").strip() or "medium"
     recommended_level = int(input("Recommended character level (1-20): ").strip() or "1")
+    climate = input("Climate: ").strip() or "varied"
+    terrain = input("Terrain: ").strip() or "varied terrain"
     
     config = AreaConfig(
         area_type=area_type,
         size=size,
         complexity=complexity,
         danger_level=danger_level,
-        recommended_level=recommended_level
+        recommended_level=recommended_level,
+        climate=climate,
+        terrain=terrain,
     )
     
     # Mock module context

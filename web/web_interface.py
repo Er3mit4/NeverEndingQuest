@@ -95,7 +95,7 @@ install_debug_interceptor()
 # Import the main game module and reset logic
 import main as dm_main
 import utils.reset_campaign as reset_campaign
-from core.managers.status_manager import set_status_callback, set_compression_callback
+from core.managers.status_manager import set_status_callback, set_detail_callback, set_compression_callback, wait_payload
 from utils.enhanced_logger import debug, info, warning, error, set_script_name
 
 # Import toolkit components for API support
@@ -177,6 +177,16 @@ app.config['SECRET_KEY'] = os.environ.get("NEQ_FLASK_SECRET_KEY") or secrets.tok
 app.config.update(PLAYER_UI='react', TOOLKIT_ONLY=False)
 # Same-origin is the safe default. Explicit cross-origin support is not needed
 # for the bundled UI, which is served by this Flask application.
+# Long-polling batches every packet the client queued between polls into ONE
+# POST (always the case before a WebSocket upgrade). The React client's
+# connect burst (location, party, initiative, ui snapshot, player data, plot,
+# storage, map) sits near Engine.IO's default decode cap of 16 packets per
+# payload; when a tab poller or reconnect adds a few more, the server rejects
+# the WHOLE batch ("Too many packets in payload") and every request in it is
+# lost. Raise the cap well above any burst the client produces.
+import engineio.payload
+engineio.payload.Payload.max_decode_packets = SOCKET_MAX_DECODE_PACKETS = 96
+
 socketio = SocketIO(app, cors_allowed_origins=None)
 
 
@@ -222,6 +232,7 @@ from web.shared_state import (
     SAFE_ACTION_FAILURE_MESSAGE,
     message_cache_lock,
     module_progress_queue,
+    set_message_log_reset_listener,
     set_player_output_sink,
 )
 
@@ -302,6 +313,9 @@ def _web_save_manager():
 
 def _begin_web_restore(manager, message, previous_clean=True):
     global _restore_manager
+    # A Load or a Reset starts the session cost line over (#1388).
+    from utils.session_spend import reset_session
+    reset_session()
     with _ui_operation_lock:
         _restore_manager = manager
         _ui_operations['restore'] = {
@@ -318,6 +332,24 @@ def _apply_web_restore(manager, save_folder, previous_clean):
         # An exception outside the manager's verified outcome cannot prove a
         # clean directory. Keep the same control surface and original root.
         return RestoreOutcome('recovery_required', f'Load could not verify a clean state: {exc}')
+
+
+def _pause_web_gameplay(message):
+    """Hold the page on Load / Reset / Exit when the game cannot go on (#806).
+
+    The state a failed Load leaves: input, Start, the status line and a
+    reconnecting tab all show the pause, and Load and Reset work with no game
+    thread. Nothing is restored and the process keeps running.
+    """
+    payload = {
+        'message': message + ' Gameplay is paused. Choose Load, Reset, or Exit.',
+        'restore_outcome': 'recovery_required',
+        'can_resume': False,
+        'restart_required': False,
+    }
+    with _ui_operation_lock:
+        _ui_operations['restore'] = payload
+    emit_status_update(payload['message'], False)
 
 
 def _finish_web_restore(manager, outcome):
@@ -589,19 +621,19 @@ def _message_cache_matches(message):
                 atomic_writer.release_lock(MESSAGE_CACHE_FILE)
     return False
 
-def add_to_message_cache(message, *, commit_guard=None):
-    """Add a message once; stable IDs deduplicate replayable safe output."""
+def _cache_message(message, *, commit_guard=None):
+    """Cache a message once: "added", "duplicate", "paused", "rejected" or "failed" (#710)."""
     if not isinstance(message, dict):
-        return False
+        return "rejected"
     message_id = message.get("message_id")
     if message_id is not None and (
         not isinstance(message_id, str) or not message_id.strip()
     ):
-        return False
+        return "rejected"
     cacheable = message.get('type') in ['narration', 'user-input']
     cacheable = cacheable or message_id is not None
     if not cacheable:
-        return False
+        return "rejected"
     if message_id is None:
         # Cache/live/reconnect delivery must carry one identity. Mutating the
         # payload is intentional: the same ID is persisted and emitted live.
@@ -611,7 +643,7 @@ def add_to_message_cache(message, *, commit_guard=None):
         from utils.file_operations import atomic_writer, safe_write_json
 
         if _web_gameplay_paused():
-            return False
+            return "paused"
 
         acquired = False
         try:
@@ -624,7 +656,7 @@ def add_to_message_cache(message, *, commit_guard=None):
                 with open(MESSAGE_CACHE_FILE, 'r', encoding='utf-8') as handle:
                     durable = json.load(handle)
                 if not isinstance(durable, list):
-                    return False
+                    return "failed"
                 base = durable[-MESSAGE_CACHE_SIZE:]
             else:
                 base = []
@@ -636,39 +668,61 @@ def add_to_message_cache(message, *, commit_guard=None):
                 with commit_guard() if commit_guard is not None else nullcontext():
                     message_cache.clear()
                     message_cache.extend(base)
-                return False
+                return "duplicate"
             candidate = (base + [dict(message)])[-MESSAGE_CACHE_SIZE:]
+            # The cache is not game state: a read-only cache fails this write
+            # instead of stopping the game, and it still runs after a save
+            # stop, so the stop line reaches the browser (issue #654).
             if not safe_write_json(
                 MESSAGE_CACHE_FILE,
                 candidate,
                 create_backup=False,
                 acquire_lock=False,
                 commit_guard=commit_guard,
+                on_read_only="fail",
             ):
-                return False
+                return "failed"
             with commit_guard() if commit_guard is not None else nullcontext():
                 message_cache.clear()
                 message_cache.extend(candidate)
         except LiveProviderSuperseded:
             raise
         except Exception:
-            return False
+            return "failed"
         finally:
             if acquired:
                 atomic_writer.release_lock(MESSAGE_CACHE_FILE)
-    return True
+    return "added"
+
+
+def add_to_message_cache(message, *, commit_guard=None):
+    """Add a message once; stable IDs deduplicate replayable safe output."""
+    return _cache_message(message, commit_guard=commit_guard) == "added"
 
 
 def _queue_safe_player_output(message, *, commit_guard=None):
     """Route normalized player output through the existing web game queue."""
     try:
         payload = dict(message)
-        if not add_to_message_cache(payload, commit_guard=commit_guard):
+        if payload.get("type") == "input_suggestion":
+            # #882: offered live once; never cached, so a reload never replays it.
+            status = "paused" if _web_gameplay_paused() else "live"
+        else:
+            status = _cache_message(payload, commit_guard=commit_guard)
+        if status == "duplicate":
             # Stable-ID replay is successful when the exact message already
             # exists in the durable cache; do not enqueue a duplicate.
             matches = _message_cache_matches(payload)
             with commit_guard() if commit_guard is not None else nullcontext():
                 return matches
+        if status in ("paused", "rejected"):
+            return False
+        if status == "failed":
+            # The cache only replays output after a reload; a failed write must
+            # not hide the card. Show it once, live, as delivered (#710).
+            warning(f"MESSAGE_CACHE: cache write failed; {payload.get('message_id')} "
+                    "delivered live only, not replayable after reload",
+                    category='web_interface')
         with commit_guard() if commit_guard is not None else nullcontext():
             game_output_queue.put_nowait(payload)
         return True
@@ -711,8 +765,9 @@ def log_web_audit(event_name, **fields):
     debug(message, category="web_interface")
 
 # Status callback function
-def emit_status_update(status_message, is_processing):
-    """Emit status updates to the frontend"""
+def emit_status_update(status_message, is_processing, wait=None):
+    """Emit status updates to the frontend. ``wait`` is the typed record of
+    the model call that owns a processing status (#1271)."""
     restore = _web_restore_state()
     recovery_required = restore.get('can_resume') is False
     if restore.get('pending') and not is_processing:
@@ -720,14 +775,36 @@ def emit_status_update(status_message, is_processing):
         is_processing = True
     if recovery_required and not is_processing:
         status_message = restore.get('message', 'Gameplay is paused. Choose Load, Reset, or Exit.')
-    socketio.emit('status_update', {
+    payload = {
         'message': status_message,
         'is_processing': is_processing,
         'recovery_required': recovery_required,
-    })
+    }
+    if wait is not None and is_processing:
+        payload['wait'] = wait_payload(wait)
+    socketio.emit('status_update', payload)
 
-# Set the status callback
-set_status_callback(emit_status_update)
+def emit_status_detail(detail):
+    """#1271: one status publication (message, is_processing, wait, seq), sent
+    whole so a message never travels with another publication's wait. It runs
+    inside the status lock, which is not reentrant: never call back into the
+    status manager from here."""
+    message, is_processing, wait, _seq = detail
+    emit_status_update(message, is_processing, wait)
+
+# Set the status callback: the web hears whole publications only.
+set_status_callback(None)
+set_detail_callback(emit_status_detail)
+
+def clear_message_log():
+    """#1285: setup reset another adventure's save (Reset removed the cache
+    file); its lines must not stay above the new game, here or in a browser."""
+    with message_cache_lock:
+        message_cache.clear()
+        save_message_cache()
+    socketio.emit('message_log_cleared', {})
+
+set_message_log_reset_listener(clear_message_log)
 
 # Set the compression callback
 def emit_compression_event(event_type, data):
@@ -740,11 +817,14 @@ def emit_compression_event(event_type, data):
 
 set_compression_callback(emit_compression_event)
 
-def emit_welcome_progress(message):
+def emit_welcome_progress(message, kind=None):
     """#214 D-214-4=A: background startup-welcome liveness. A SEPARATE
     presentational channel - never status_update{is_processing}, so it can
-    never lock the command input."""
-    socketio.emit('welcome_progress', {'message': message})
+    never lock the command input. ``kind`` (#1422 F4) is additive."""
+    payload = {'message': message}
+    if kind is not None:
+        payload['kind'] = kind
+    socketio.emit('welcome_progress', payload)
 
 try:
     from core.managers.status_manager import status_manager as _status_manager_instance
@@ -894,6 +974,7 @@ class WebOutputCapture:
                             "startup_module_selection",
                             "startup_interview",
                             "startup_review",
+                            "startup_configuration_required",
                             "startup_location",
                             "startup_character_commit",
                             "startup_party_commit",
@@ -1159,6 +1240,18 @@ class WebInput:
                     run_input_poll_hook()
                 except Exception:
                     pass
+                # A welcome handback may publish busy while this read is parked.
+                # Reopen only after its synchronous game-thread work has finished,
+                # and only if lifecycle controls have not stopped gameplay.
+                service_live_input_boundary()
+                if _web_gameplay_paused():
+                    raise LiveProviderSuperseded('An accepted lifecycle control stopped gameplay')
+                try:
+                    from core.managers.status_manager import status_manager, status_ready
+                    if status_manager.is_processing():
+                        status_ready(at_input_boundary=True)
+                except Exception:
+                    pass
                 continue
             except (BrokenPipeError, OSError, IOError, EOFError):
                 # Genuine end-of-input: return '' so input() raises EOFError and
@@ -1196,8 +1289,9 @@ def serve_video(filename):
     """Serve video files from the media directory"""
     import os
     from flask import send_file
-    video_path = os.path.join(os.path.dirname(__file__), 'static', 'media', 'videos', filename)
-    if os.path.exists(video_path):
+    from web.media_paths import resolve_file_within
+    video_path = resolve_file_within(os.path.join(os.path.dirname(__file__), 'static', 'media', 'videos'), filename)
+    if video_path is not None:
         return send_file(video_path, mimetype='video/mp4')
     return "Video not found", 404
 
@@ -1218,8 +1312,9 @@ def serve_icon(filename):
     # Ensure the filename ends with .png for security
     if not filename.endswith('.png'):
         return "Not found", 404
-    icon_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'icons', filename)
-    if os.path.exists(icon_path):
+    from web.media_paths import resolve_file_within
+    icon_path = resolve_file_within(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'icons'), filename)
+    if icon_path is not None:
         return send_file(icon_path, mimetype='image/png')
     return "Not found", 404
 
@@ -1231,8 +1326,9 @@ def serve_portrait(filename):
     # Ensure the filename ends with .png for security
     if not filename.endswith('.png'):
         return "Not found", 404
-    portrait_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'portraits', filename)
-    if os.path.exists(portrait_path):
+    from web.media_paths import resolve_file_within
+    portrait_path = resolve_file_within(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'portraits'), filename)
+    if portrait_path is not None:
         return send_file(portrait_path, mimetype='image/png')
     return "Not found", 404
 
@@ -1250,48 +1346,26 @@ def serve_module_media(media_type, filename):
     import mimetypes
     from flask import send_file
     from utils.file_operations import safe_read_json
-    
-    # Validate media type
-    if media_type not in ['monsters', 'npcs', 'environment']:
-        return "Invalid media type", 404
-    
+    from web.media_paths import resolve_media_path
+
     # Determine current module from party tracker
     current_module = None
     party_data = safe_read_json('party_tracker.json')
     if party_data:
         # Check both 'module' and 'module_name' fields for compatibility
         current_module = party_data.get('module') or party_data.get('module_name')
-    
-    # Priority 1: Check current module's media folder first
-    if current_module:
-        module_media_path = os.path.join('modules', current_module, 'media', media_type, filename)
-        if os.path.exists(module_media_path):
-            mimetype, _ = mimetypes.guess_type(module_media_path)
-            info(f"Serving {media_type}/{filename} from current module: {current_module}")
-            return send_file(os.path.abspath(module_media_path), mimetype=mimetype)
-    
-    # Priority 2: Check ALL other modules for the media file
-    modules_dir = 'modules'
-    if os.path.exists(modules_dir):
-        for module_name in os.listdir(modules_dir):
-            # Skip non-directories and the current module
-            module_path = os.path.join(modules_dir, module_name)
-            if os.path.isdir(module_path) and module_name != current_module:
-                module_media_path = os.path.join(module_path, 'media', media_type, filename)
-                if os.path.exists(module_media_path):
-                    mimetype, _ = mimetypes.guess_type(module_media_path)
-                    info(f"Serving {media_type}/{filename} from module: {module_name}")
-                    return send_file(os.path.abspath(module_media_path), mimetype=mimetype)
-    
-    # Priority 3: Fall back to static media folder
-    static_media_path = os.path.join(os.path.dirname(__file__), 'static', 'media', media_type, filename)
-    if os.path.exists(static_media_path):
-        mimetype, _ = mimetypes.guess_type(static_media_path)
-        info(f"Serving {media_type}/{filename} from static folder")
-        return send_file(static_media_path, mimetype=mimetype)
-    
-    warning(f"Media file not found in any location: {media_type}/{filename}")
-    return "Media not found", 404
+
+    # The filename is URL-controlled. resolve_media_path refuses anything
+    # that could leave the media directory (../, absolute, backslash, NUL)
+    # and only returns an existing file inside one of the allowed roots.
+    static_media_dir = os.path.join(os.path.dirname(__file__), 'static', 'media')
+    resolved = resolve_media_path(media_type, filename, current_module,
+                                  'modules', static_media_dir)
+    if resolved is None:
+        warning(f"Media file not found or refused: {media_type}/{filename}")
+        return "Media not found", 404
+    mimetype, _ = mimetypes.guess_type(resolved)
+    return send_file(resolved, mimetype=mimetype)
 
 @app.route('/get_character_data')
 def get_character_data():
@@ -1334,7 +1408,11 @@ def _effective_character_for_ui(character_data):
         pass
     return character_data
 
+from web.portrait_security import bounded_portrait_upload, decode_portrait
+from werkzeug.exceptions import HTTPException
+
 @app.route('/upload-portrait', methods=['POST'])
+@bounded_portrait_upload
 def upload_portrait():
     """Handle character portrait upload, cropping, and saving."""
     try:
@@ -1359,10 +1437,7 @@ def upload_portrait():
             os.makedirs(portraits_dir, exist_ok=True)
 
             # Open the image with Pillow
-            img = Image.open(file.stream)
-            img.verify()
-            file.stream.seek(0)
-            img = Image.open(file.stream).convert('RGB')
+            img = decode_portrait(file.stream)
 
             # --- Cropping Logic ---
             width, height = img.size
@@ -1407,9 +1482,11 @@ def upload_portrait():
             info(f"PORTRAIT: Saved new portrait for {character_name} to {save_path}")
             return jsonify({'success': True, 'message': 'Portrait uploaded successfully'})
 
+    except HTTPException:
+        raise
     except Exception as e:
         error(f"PORTRAIT: Upload failed", exception=e, category="web_interface")
-        return jsonify({'success': False, 'message': str(e)})
+        return jsonify({'success': False, 'message': 'Unable to process this portrait. Use a PNG, JPEG or WebP image up to 16 megapixels.'}), 400
 
 @app.route('/spell-data')
 def get_spell_data():
@@ -2364,6 +2441,16 @@ def update_monster_description():
         return jsonify({'success': False, 'error': str(e)})
 
 
+def _session_spend_snapshot():
+    """The typed session cost object for token_update (#1388): numbers only."""
+    import model_config
+    from utils.session_spend import snapshot
+
+    provider = model_config.get_provider()
+    kind = "openai" if provider in ("openai", "legacy") else "gemini" if provider == "gemini" else "local"
+    return snapshot(kind)
+
+
 def _provider_credentials_available(provider):
     """Check only credentials required by the selected provider."""
     import config
@@ -2557,7 +2644,6 @@ def get_module_monsters_api(module_name):
         from utils.module_path_manager import ModulePathManager
         from utils.file_operations import safe_read_json
         import os
-        import re
 
         path_manager = ModulePathManager(module_name)
         monster_ids = set()
@@ -2581,14 +2667,8 @@ def get_module_monsters_api(module_name):
                                         # "Bandit Captain Gorvek" -> "bandit_captain_gorvek"
                                         monster_id = monster['name'].lower().replace(' ', '_')
                                         monster_ids.add(monster_id)
-                                    elif isinstance(monster, str):
-                                        # Handle string format like "1 Tainted Naiad"
-                                        # Extract just the monster name
-                                        match = re.search(r'\d*\s*(.+?)(?:\s*\(|$)', monster)
-                                        if match:
-                                            monster_name = match.group(1).strip()
-                                            monster_id = monster_name.lower().replace(' ', '_')
-                                            monster_ids.add(monster_id)
+                                    # Location monsters are objects with a whole name (the location
+                                    # schemas); a name is never cut out of a string (#855).
         
         # Also scan the monsters folder for this module
         monsters_dir = os.path.join('modules', module_name, 'monsters')
@@ -2620,7 +2700,6 @@ def get_module_unified_assets(module_name):
         from utils.file_operations import safe_read_json
         from utils.bestiary_updater import BestiaryUpdater
         import os
-        import re
         
         info(f"TOOLKIT: Scanning unified assets for module {module_name}")
         
@@ -2654,13 +2733,8 @@ def get_module_unified_assets(module_name):
                                         monster_id = monster['name'].lower().replace(' ', '_')
                                         if monster_id not in monsters:
                                             monsters[monster_id] = {'name': monster['name'], 'type': 'monster'}
-                                    elif isinstance(monster, str):
-                                        match = re.search(r'\d*\s*(.+?)(?:\s*\(|$)', monster)
-                                        if match:
-                                            monster_name = match.group(1).strip()
-                                            monster_id = monster_name.lower().replace(' ', '_')
-                                            if monster_id not in monsters:
-                                                monsters[monster_id] = {'name': monster_name, 'type': 'monster'}
+                                    # Location monsters are objects with a whole name (the location
+                                    # schemas); a name is never cut out of a string (#855).
         
         # Check for descriptions and media status
         def check_asset_status(asset_id, asset_type, asset_name):
@@ -2817,9 +2891,9 @@ def _emit_game_resumed():
     """
     from core.managers.status_manager import status_manager
     try:
-        status_message, is_processing = status_manager.get_status()
+        status_message, is_processing, wait, _seq = status_manager.get_status_detail()
     except Exception:
-        status_message, is_processing = '', False
+        status_message, is_processing, wait = '', False, None
     startup = _startup_ui_projection(True)
     emit('startup_status', startup)
     emit('game_resumed', {
@@ -2830,6 +2904,7 @@ def _emit_game_resumed():
     })
     emit('status_update', {
         'message': status_message or '', 'is_processing': bool(is_processing),
+        **({'wait': wait_payload(wait)} if wait is not None and is_processing else {}),
     })
 
 
@@ -2838,9 +2913,9 @@ def handle_ui_snapshot_request(data=None):
     """Return one authoritative lifecycle/processing snapshot on reconnect."""
     from core.managers.status_manager import status_manager
     try:
-        status_message, is_processing = status_manager.get_status()
+        status_message, is_processing, wait, _seq = status_manager.get_status_detail()
     except Exception:
-        status_message, is_processing = '', False
+        status_message, is_processing, wait = '', False, None
     running = bool(game_thread and game_thread.is_alive() and not _web_gameplay_paused())
     with _ui_operation_lock:
         operations = {
@@ -2851,12 +2926,15 @@ def handle_ui_snapshot_request(data=None):
     if restore.get('pending') or restore.get('can_resume') is False:
         status_message = restore.get('message', status_message)
         is_processing = bool(restore.get('pending'))
+        wait = None  # a lifecycle status, not a model call (#1271)
     emit('ui_state_snapshot', _ui_response(data, {
         'game_running': running,
         'is_processing': bool(is_processing),
         'status_message': status_message or '',
+        'wait': wait_payload(wait) if wait is not None and is_processing else None,
         'startup': _startup_ui_projection(running),
         'operations': operations,
+        'roll_prompt': rules_roll_prompt.current() if running else None,
     }))
 
 
@@ -2920,8 +2998,7 @@ def handle_connect():
     # Load and send cached messages from previous session
     with message_cache_lock:
         cached_messages = [] if _web_gameplay_paused() else list(message_cache)
-        if cached_messages:
-            emit('cached_messages', cached_messages)
+        emit('cached_messages', cached_messages)
 
     # If a game is already running, tell THIS client to reattach (issue #122).
     if game_thread and game_thread.is_alive() and not _web_gameplay_paused():
@@ -2940,12 +3017,44 @@ def handle_connect():
         _remember_ui_operation('module', progress_data)
         emit('module_creation_progress', progress_data)
 
+from core.managers import roll_prompt as rules_roll_prompt
+rules_roll_prompt.set_listener(lambda prompt: socketio.emit('roll_prompt', {'prompt': prompt}))
+
+
+@socketio.on('submit_check_roll')
+def handle_check_roll(data):
+    if _web_gameplay_paused() or not (game_thread and game_thread.is_alive()):
+        emit('error', {'message': 'Your game is not waiting for a roll.'})
+        return
+    try:
+        if not isinstance(data, dict) or 'faces' not in data:
+            raise ValueError('Choose Roll for me or enter individual dice results.')
+        rules_roll_prompt.submit(data.get('id'), data['faces'], user_input_queue.put)
+    except ValueError as exc:
+        emit('error', {'message': str(exc)})
+        emit('roll_prompt', {'prompt': rules_roll_prompt.current()})
+
+
 @socketio.on('user_input')
 def handle_user_input(data):
     """Handle input from the user"""
     if _web_gameplay_paused():
         emit('error', {'message': 'Gameplay is paused. Choose Load, Reset, or Exit.'})
         return
+    pending_roll = rules_roll_prompt.current()
+    if pending_roll is not None:
+        # The legacy browser has a text-only composer. Keep its existing
+        # numeric dice input working through the same single-submit boundary.
+        from core.managers.checks_runtime import parse_faces
+        value = data.get('input') if isinstance(data, dict) else None
+        faces = parse_faces(value, pending_roll['faces']) if isinstance(value, str) else None
+        if faces is None:
+            emit('error', {'message': 'Use the roll panel or type the individual d20 results for this check.'})
+            emit('roll_prompt', {'prompt': pending_roll})
+        else:
+            handle_check_roll({'id': pending_roll['id'], 'faces': faces or None})
+        return
+
 
     from utils.conversation_identity import start_new_conversation
     start_new_conversation()
@@ -2955,10 +3064,17 @@ def handle_user_input(data):
     # #214 CR-1: supersede a pending background welcome AT THE ENQUEUE
     # BOUNDARY, before the game thread can pop this text - the game thread
     # then completes the discard handback before processing the input.
+    # #1422 F4: a new game's opening scene is never discarded; the text waits
+    # for it (the game thread holds it until the scene is settled).
+    opening_scene = False
+    try:
+        opening_scene = bool(dm_main.opening_scene_pending())
+    except Exception:
+        opening_scene = False
     try:
         from utils.capture.live_provider_call import get_active_welcome_scope
         welcome_scope = get_active_welcome_scope()
-        if welcome_scope is not None:
+        if welcome_scope is not None and not opening_scene:
             welcome_scope.request_supersession("player_acted")
     except Exception:
         pass
@@ -2971,6 +3087,8 @@ def handle_user_input(data):
     add_to_message_cache(message)
     emit('game_output', message)
     user_input_queue.put(user_input)
+    if opening_scene:
+        emit('system_message', {'content': 'Your action is queued for after the opening scene.'})
     from utils.capture.live_provider_call import get_live_turn_scope
     scope = get_live_turn_scope()
     if scope is not None and scope.purpose == "travel_recovery":
@@ -3524,16 +3642,20 @@ def handle_start_game():
     # Claim the player-output sink only now that a web game session owns
     # the frontend (see the note at the old import-time install site).
     set_player_output_sink(_queue_safe_player_output)
-    
+    # Startup imports can install the terminal callback before capture exists.
+    # Reclaim status delivery when this browser owns the game.
+    set_status_callback(None)
+    set_detail_callback(emit_status_detail)
+
     # Start the game in a separate thread
     startup_handoff_active = True
     startup_ready_emitted = False
     startup_phase = "launching"
     load_message_cache(on_recovery=lambda notice: socketio.emit('game_output', notice))
     game_thread = threading.Thread(target=run_game_loop, daemon=True)
-    game_thread.start()
-
+    # Publish launching before a fast worker can emit its first ready prompt.
     emit('startup_status', {'status': 'in_progress', 'phase': 'launching'})
+    game_thread.start()
 
 @socketio.on('request_player_data')
 def handle_player_data_request(data=None):
@@ -3584,8 +3706,12 @@ def handle_player_data_request(data=None):
             current_module = party_tracker.get("module", "").replace(" ", "_")
             path_manager = ModulePathManager(current_module)
             
-            for npc_info in party_tracker.get('partyNPCs', []):
-                npc_name = npc_info['name']
+            from web.npc_projection import visible_npc_names, npc_sheet_projection
+            # The current location through #448's one reader (#850)
+            from core.managers.current_location import current_location_data
+            location = current_location_data(party_tracker, consumer="player panel")
+            area = {'locations': [location]} if location else {}
+            for npc_name in visible_npc_names(party_tracker, area):
                 
                 try:
                     # Use fuzzy matching to find the correct NPC file
@@ -3598,7 +3724,7 @@ def handle_player_data_request(data=None):
                             with open(npc_file, 'r', encoding='utf-8') as f:
                                 npc_data = json.load(f)
                                 npc_data = _effective_character_for_ui(npc_data)
-                                npcs.append(npc_data)
+                                npcs.append(npc_sheet_projection(npc_data))
                 except:
                     pass
             
@@ -3647,159 +3773,49 @@ def handle_location_data_request(data=None):
     except Exception as e:
         emit('location_data_response', _ui_response(data, {'data': None, 'error': str(e)}))
 
+def _handle_npc_sheet_request(data, kind):
+    """All named-NPC detail responses share visibility and field boundaries."""
+    from web.npc_access import load_inspectable_npc
+    from web.npc_projection import npc_sheet_projection
+    requested = data.get('npcName') if isinstance(data, dict) else None
+    name = requested if isinstance(requested, str) and len(requested) <= 512 else ''
+    event = 'npc_inventory_response' if kind == 'inventory' else 'npc_details_response'
+    payload = {'npcName': name, 'data': None}
+    if kind != 'inventory':
+        payload['modalType'] = kind
+    try:
+        character = load_inspectable_npc(name)
+        if character is not None:
+            sheet = npc_sheet_projection(_effective_character_for_ui(character))
+            payload['data'] = sheet.get('equipment', []) if kind == 'inventory' else sheet
+        else:
+            payload['error'] = 'NPC is not available.'
+    except Exception:
+        # Invalid/private names and malformed records must not reveal paths or
+        # the contents of a saved NPC through exception text.
+        payload['error'] = 'NPC is not available.'
+    emit(event, payload)
+
+
 @socketio.on('request_npc_saves')
 def handle_npc_saves_request(data):
-    """Handle requests for NPC saving throws"""
-    try:
-        npc_name = data.get('npcName', '')
-        
-        # Load the NPC file
-        from utils.module_path_manager import ModulePathManager
-        from utils.encoding_utils import safe_json_load
-        # Get current module from party tracker for consistent path resolution
-        try:
-            party_tracker = safe_json_load("party_tracker.json")
-            current_module = party_tracker.get("module", "").replace(" ", "_") if party_tracker else None
-            path_manager = ModulePathManager(current_module)
-        except:
-            path_manager = ModulePathManager()  # Fallback to reading from file
-        
-        from updates.update_character_info import normalize_character_name, find_character_file_fuzzy
-        
-        # Use fuzzy matching to find the correct NPC file
-        matched_name = find_character_file_fuzzy(npc_name)
-        if matched_name:
-            npc_file = path_manager.get_character_path(matched_name)
-        else:
-            # Fallback to normalized name if no match found
-            npc_file = path_manager.get_character_path(normalize_character_name(npc_name))
-        if os.path.exists(npc_file):
-            with open(npc_file, 'r', encoding='utf-8') as f:
-                npc_data = json.load(f)
-            npc_data = _effective_character_for_ui(npc_data)
-            
-            emit('npc_details_response', {'npcName': npc_name, 'data': npc_data, 'modalType': 'saves'})
-        else:
-            emit('npc_details_response', {'npcName': npc_name, 'data': None, 'error': 'NPC file not found'})
-            
-    except Exception as e:
-        emit('npc_details_response', {'npcName': npc_name, 'data': None, 'error': str(e)})
+    _handle_npc_sheet_request(data, 'saves')
+
 
 @socketio.on('request_npc_skills')
 def handle_npc_skills_request(data):
-    """Handle requests for NPC skills"""
-    try:
-        npc_name = data.get('npcName', '')
-        
-        # Load the NPC file
-        from utils.module_path_manager import ModulePathManager
-        from utils.encoding_utils import safe_json_load
-        # Get current module from party tracker for consistent path resolution
-        try:
-            party_tracker = safe_json_load("party_tracker.json")
-            current_module = party_tracker.get("module", "").replace(" ", "_") if party_tracker else None
-            path_manager = ModulePathManager(current_module)
-        except:
-            path_manager = ModulePathManager()  # Fallback to reading from file
-        
-        from updates.update_character_info import normalize_character_name, find_character_file_fuzzy
-        
-        # Use fuzzy matching to find the correct NPC file
-        matched_name = find_character_file_fuzzy(npc_name)
-        if matched_name:
-            npc_file = path_manager.get_character_path(matched_name)
-        else:
-            # Fallback to normalized name if no match found
-            npc_file = path_manager.get_character_path(normalize_character_name(npc_name))
-        if os.path.exists(npc_file):
-            with open(npc_file, 'r', encoding='utf-8') as f:
-                npc_data = json.load(f)
-            npc_data = _effective_character_for_ui(npc_data)
-            
-            emit('npc_details_response', {'npcName': npc_name, 'data': npc_data, 'modalType': 'skills'})
-        else:
-            emit('npc_details_response', {'npcName': npc_name, 'data': None, 'error': 'NPC file not found'})
-            
-    except Exception as e:
-        emit('npc_details_response', {'npcName': npc_name, 'data': None, 'error': str(e)})
+    _handle_npc_sheet_request(data, 'skills')
+
 
 @socketio.on('request_npc_spells')
 def handle_npc_spells_request(data):
-    """Handle requests for NPC spellcasting"""
-    try:
-        npc_name = data.get('npcName', '')
-        
-        # Load the NPC file
-        from utils.module_path_manager import ModulePathManager
-        from utils.encoding_utils import safe_json_load
-        # Get current module from party tracker for consistent path resolution
-        try:
-            party_tracker = safe_json_load("party_tracker.json")
-            current_module = party_tracker.get("module", "").replace(" ", "_") if party_tracker else None
-            path_manager = ModulePathManager(current_module)
-        except:
-            path_manager = ModulePathManager()  # Fallback to reading from file
-        
-        from updates.update_character_info import normalize_character_name, find_character_file_fuzzy
-        
-        # Use fuzzy matching to find the correct NPC file
-        matched_name = find_character_file_fuzzy(npc_name)
-        if matched_name:
-            npc_file = path_manager.get_character_path(matched_name)
-        else:
-            # Fallback to normalized name if no match found
-            npc_file = path_manager.get_character_path(normalize_character_name(npc_name))
-        if os.path.exists(npc_file):
-            with open(npc_file, 'r', encoding='utf-8') as f:
-                npc_data = json.load(f)
-            npc_data = _effective_character_for_ui(npc_data)
-            
-            emit('npc_details_response', {'npcName': npc_name, 'data': npc_data, 'modalType': 'spells'})
-        else:
-            emit('npc_details_response', {'npcName': npc_name, 'data': None, 'error': 'NPC file not found'})
-            
-    except Exception as e:
-        emit('npc_details_response', {'npcName': npc_name, 'data': None, 'error': str(e)})
+    _handle_npc_sheet_request(data, 'spells')
+
 
 @socketio.on('request_npc_inventory')
 def handle_npc_inventory_request(data):
-    """Handle requests for NPC inventory"""
-    try:
-        npc_name = data.get('npcName', '')
-        
-        # Load the NPC file
-        from utils.module_path_manager import ModulePathManager
-        from utils.encoding_utils import safe_json_load
-        # Get current module from party tracker for consistent path resolution
-        try:
-            party_tracker = safe_json_load("party_tracker.json")
-            current_module = party_tracker.get("module", "").replace(" ", "_") if party_tracker else None
-            path_manager = ModulePathManager(current_module)
-        except:
-            path_manager = ModulePathManager()  # Fallback to reading from file
-        
-        from updates.update_character_info import normalize_character_name, find_character_file_fuzzy
-        
-        # Use fuzzy matching to find the correct NPC file
-        matched_name = find_character_file_fuzzy(npc_name)
-        if matched_name:
-            npc_file = path_manager.get_character_path(matched_name)
-        else:
-            # Fallback to normalized name if no match found
-            npc_file = path_manager.get_character_path(normalize_character_name(npc_name))
-        if os.path.exists(npc_file):
-            with open(npc_file, 'r', encoding='utf-8') as f:
-                npc_data = json.load(f)
-            npc_data = _effective_character_for_ui(npc_data)
-            
-            # Extract equipment for inventory display
-            equipment = npc_data.get('equipment', [])
-            emit('npc_inventory_response', {'npcName': npc_name, 'data': equipment})
-        else:
-            emit('npc_inventory_response', {'npcName': npc_name, 'data': None, 'error': 'NPC file not found'})
-            
-    except Exception as e:
-        emit('npc_inventory_response', {'npcName': npc_name, 'data': None, 'error': str(e)})
+    _handle_npc_sheet_request(data, 'inventory')
+
 
 @socketio.on('request_party_data')
 def handle_party_data_request(data=None):
@@ -4008,42 +4024,48 @@ def handle_party_data_request(data=None):
         current_location_id = world_conditions.get("currentLocationId")
 
         if current_module and current_area_id and current_location_id:
-            # Construct the path to the current area file
-            areas_dir = os.path.join("modules", current_module, "areas")
-            area_file_path = os.path.join(areas_dir, f"{current_area_id}.json")
-            
-            if os.path.exists(area_file_path):
-                area_data = safe_read_json(area_file_path)
-                if area_data and 'locations' in area_data:
-                    # Find the specific location the player is in
-                    current_location_data = next((loc for loc in area_data['locations'] 
-                                                 if loc.get('locationId') == current_location_id), None)
-                    
-                    if current_location_data and 'npcs' in current_location_data:
-                        # Extract the names of the NPCs in that location
-                        for npc in current_location_data['npcs']:
-                            npc_name = npc.get('name') if isinstance(npc, dict) else npc
-                            if npc_name:
-                                # Exclude NPCs that are already in the player's party
-                                # Also exclude NPCs whose names are contained within any party member's name
-                                # Example: "Eirik" should be excluded if "Eirik Hearthwise" is in the party
-                                if not any(npc_name.lower() in member['name'].lower() for member in party_members):
-                                    # Try to load NPC data for HP info
-                                    npc_data_dict = {'name': npc_name, 'type': 'location_npc'}
-                                    try:
-                                        matched_name = find_character_file_fuzzy(npc_name)
-                                        if matched_name:
-                                            npc_file = path_manager.get_character_path(matched_name)
-                                            if os.path.exists(npc_file):
-                                                npc_data = safe_read_json(npc_file)
-                                                if npc_data:
-                                                    npc_data = _effective_character_for_ui(npc_data)
-                                                    npc_data_dict['currentHp'] = npc_data.get('hitPoints', npc_data.get('currentHp', 0))
-                                                    npc_data_dict['maxHp'] = npc_data.get('maxHitPoints', npc_data.get('maxHp', 0))
-                                    except:
-                                        pass
-                                    location_npcs.append(npc_data_dict)
-        
+            # P4-f: the people here come from the engine's view; the authored
+            # list is read only while the view is unavailable.
+            npc_names = None
+            try:
+                from core.nql import occupants as _occupants
+                _here = _occupants.place_roster(current_module, current_location_id)
+                if _here is not None:
+                    npc_names = list(_here["people"])
+            except Exception:
+                npc_names = None
+            if npc_names is None:
+                npc_names = []
+                # The current location through #448's one reader (#850)
+                from core.managers.current_location import current_location_data
+                here = current_location_data(party_tracker, consumer="party panel")
+                for npc in (here or {}).get('npcs') or []:
+                    npc_name = npc.get('name') if isinstance(npc, dict) else npc
+                    if npc_name:
+                        npc_names.append(npc_name)
+            # A person already in the party is not listed again: the same exact
+            # sheet key as a party member's name, never a part of it (#855).
+            party_keys = {normalize_character_name(member['name']) for member in party_members
+                          if member.get('name')}
+            for npc_name in npc_names:
+                if normalize_character_name(npc_name) in party_keys:
+                    continue
+                # Try to load NPC data for HP info
+                npc_data_dict = {'name': npc_name, 'type': 'location_npc'}
+                try:
+                    matched_name = find_character_file_fuzzy(npc_name)
+                    if matched_name:
+                        npc_file = path_manager.get_character_path(matched_name)
+                        if os.path.exists(npc_file):
+                            npc_data = safe_read_json(npc_file)
+                            if npc_data:
+                                npc_data = _effective_character_for_ui(npc_data)
+                                npc_data_dict['currentHp'] = npc_data.get('hitPoints', npc_data.get('currentHp', 0))
+                                npc_data_dict['maxHp'] = npc_data.get('maxHitPoints', npc_data.get('maxHp', 0))
+                except:
+                    pass
+                location_npcs.append(npc_data_dict)
+
         # Send both lists to the frontend
         emit('party_data_response', _ui_response(data, {'members': party_members, 'location_npcs': location_npcs}))
         
@@ -4104,7 +4126,8 @@ def handle_initiative_data_request(data=None):
         # Typed encounters project membership/order/current input ownership from
         # the committed combat ledger. Legacy encounters preserve the existing
         # living-roster/raw-initiative response behavior.
-        sorted_combatants = initiative_ui_projection(encounter_data)
+        # Downed party members stay in the bar, marked ``downed`` (#282).
+        sorted_combatants = initiative_ui_projection(encounter_data, include_downed_party=True)
         combat_state = encounter_data.get("combatState") or {}
         recovery_conflict = combat_state.get("recoveryConflict")
         recovery = None
@@ -4121,14 +4144,14 @@ def handle_initiative_data_request(data=None):
                 "actions": ["load", "reset"],
             }
 
-        if not sorted_combatants:
+        if not any(not c.get("downed") for c in sorted_combatants):
             # Combat is over if no one is alive
             emit('initiative_data_response', _ui_response(data, {'active': False, 'combatants': []}))
             return
 
         # Prepare clean data for frontend with full character data for tooltips
         from utils.module_path_manager import ModulePathManager
-        from updates.update_character_info import normalize_character_name, find_character_file_fuzzy
+        from updates.update_character_info import normalize_character_name, resolve_npc_sheet_id
 
         party_tracker = safe_read_json("party_tracker.json")
         current_module = party_tracker.get("module", "").replace(" ", "_") if party_tracker else ""
@@ -4145,7 +4168,7 @@ def handle_initiative_data_request(data=None):
                 "monsterType": c.get("monsterType"),  # For enemy type lookup
                 "class": c.get("class")  # For NPC class lookup
             }
-            for projected_field in ("combatantId", "controller", "isCurrent"):
+            for projected_field in ("combatantId", "controller", "isCurrent", "downed"):
                 if projected_field in c:
                     combatant_data[projected_field] = c[projected_field]
 
@@ -4156,8 +4179,8 @@ def handle_initiative_data_request(data=None):
 
                     # Try to load character data
                     if c.get("type") == 'npc':
-                        # Use fuzzy matching for NPCs
-                        matched_name = find_character_file_fuzzy(character_name)
+                        # The sheet the encounter recorded for this combatant, else the exact name (#938)
+                        matched_name = resolve_npc_sheet_id(character_name, encounter_data, c)
                         if matched_name:
                             char_file = path_manager.get_character_path(matched_name)
                         else:
@@ -4333,9 +4356,10 @@ def handle_plot_data_request(data=None):
                 emit('plot_data_response', _ui_response(data, {'data': None, 'error': f'Plot file not found for module: {current_module}'}))
                 return
                 
-            # Step 3: Read the plot file and send its data back to the browser.
-            with open(plot_file_path, 'r', encoding='utf-8') as f:
-                plot_data = json.load(f)
+            # Step 3: Read the plot (statuses from the engine's quest record)
+            # and send its data back to the browser.
+            from utils import quest_record
+            plot_data = quest_record.module_plot(current_module)
             
             debug(f"WEB_INTERFACE: Using original plot data for {current_module} (player quests unavailable or stale)", category="web_interface")
         
@@ -4351,6 +4375,13 @@ def handle_plot_data_request(data=None):
 def handle_request_storage_data(data=None):
     """Handles a request from the client to view all player storage."""
     debug("WEB_REQUEST: Received request for storage data from client", category="web_interface")
+    if not os.path.exists("party_tracker.json"):
+        # A fresh start before the first party_tracker.json write: there is
+        # no active module and so no storage yet (issue #448). A tracker that
+        # exists but cannot be read still reports the error below.
+        debug("WEB_REQUEST: No storage yet (no party_tracker.json)", category="web_interface")
+        emit('storage_data_response', _ui_response(data, {'data': {'success': True, 'storage': [], 'count': 0}}))
+        return
     try:
         from core.managers.storage_manager import get_storage_manager
         manager = get_storage_manager()
@@ -4411,7 +4442,8 @@ def handle_get_provider():
         emit('provider_changed', {'provider': provider})
     except Exception as e:
         error(f"Error getting provider: {e}", exception=e, category="web_interface")
-        emit('provider_changed', {'provider': 'legacy'})  # Safe fallback
+        # #1422 F3: never report a provider the server is not using.
+        emit('error', {'message': 'Could not read the AI provider setting. Reload the page to try again.'})
 
 
 @socketio.on('get_codex_status')
@@ -4480,6 +4512,8 @@ def handle_set_provider(data):
                 raise ValueError(f"Unknown provider: {provider}. Valid: {list(model_config.PROVIDER_MODELS.keys())}")
             model_config.persist_provider(provider)
             model_config.set_provider(provider)
+            from utils.startup_provider_recovery import notify_configuration_saved
+            notify_configuration_saved()
 
             debug(f"Model provider set to: {provider}", category="web_interface")
 
@@ -4523,6 +4557,8 @@ def handle_set_local_endpoint(data):
             base_url=data.get('base_url', ''),
             api_key=(raw_key if raw_key else None),
             model=data.get('model', ''))
+        from utils.startup_provider_recovery import notify_configuration_saved
+        notify_configuration_saved('lmstudio')
         debug("Local endpoint updated via web UI", category="web_interface")
         ep = model_config.get_local_endpoint()
         emit('local_endpoint_changed', {
@@ -4537,48 +4573,76 @@ def handle_set_local_endpoint(data):
 
 @socketio.on('get_openai_key')
 def handle_get_openai_key():
-    """Report ONLY whether an OpenAI key is configured. Never sends the secret."""
+    """Report ONLY whether an OpenAI key is configured. Never sends the secret.
+    ``keychain`` is False when a saved key lives in user_settings.json (#1399 G3)."""
     try:
-        import model_config, config as _cfg
-        stored = model_config.has_openai_key()
-        live = bool(getattr(_cfg, "OPENAI_API_KEY", "")) and \
-            getattr(_cfg, "OPENAI_API_KEY", "") != "your_openai_api_key_here"
-        emit('openai_key_status', {'has_key': bool(stored or live)})
+        emit('openai_key_status', _openai_key_status())
     except Exception as e:
         error(f"Error getting openai key status: {e}", exception=e, category="web_interface")
-        emit('openai_key_status', {'has_key': False})
+        emit('openai_key_status', {'has_key': False, 'keychain': True})
+
+
+def _openai_key_status():
+    """{'has_key', 'keychain'}: booleans only, never the key."""
+    import model_config, config as _cfg
+    from utils.secret_store import durable_store_available
+    live = bool(getattr(_cfg, "OPENAI_API_KEY", "")) and \
+        getattr(_cfg, "OPENAI_API_KEY", "") != "your_openai_api_key_here"
+    return {'has_key': bool(model_config.has_openai_key() or live),
+            'keychain': durable_store_available()}
 
 
 @socketio.on('set_openai_key')
 def handle_set_openai_key(data):
-    """Set the OpenAI key from the UI: update config live AND persist. No echo.
+    """Set the OpenAI key from the UI: check it once, update config live AND
+    persist. No echo.
+
+    #1399 G1: a non-blank key is first checked with one free models.list
+    (utils/openai_key_check). Only a key OpenAI rejects (401) is not saved;
+    every other result saves it, so a rate limit, an empty account or an
+    unreachable OpenAI never makes the player type the key again. The result
+    reaches the browser as a typed slug in 'openai_key_check'; the key, the
+    raw exception and the response body are never logged or sent.
 
     Scope of the live update: writing config.OPENAI_API_KEY reaches every reader
     that reads it at call time (utils/openai_client.get_openai_client and the
     per-request toolkit generators). A few long-lived managers cache an OpenAI
     client in __init__ (e.g. campaign_manager, storage_processor); those keep the
     previous key until the next restart -- a pre-existing pattern, not specific to
-    this feature. The PERSISTED key is applied at startup for ALL readers (see the
-    boot-time apply_persisted_openai_key above), so a player who sets the key in
-    Settings before starting a game -- the intended flow -- is fully covered.
+    this feature, which is why a running game is told to restart. The PERSISTED
+    key is applied at startup for ALL readers (see the boot-time
+    apply_persisted_openai_key above).
     """
     try:
         import model_config, config as _cfg
+        from utils.openai_key_check import REJECTED, check_openai_key
         api_key = ((data or {}).get('api_key') or '').strip()
         if not api_key:
             # Blank submit: do NOT wipe an existing key (prevents accidental erase
-            # from a double-click after the field auto-clears). Report status only.
-            live = bool(getattr(_cfg, "OPENAI_API_KEY", "")) and \
-                getattr(_cfg, "OPENAI_API_KEY", "") != "your_openai_api_key_here"
-            emit('openai_key_status', {'has_key': model_config.has_openai_key() or live})
+            # from a double-click after the field auto-clears). No check is made.
+            status = _openai_key_status()
+            emit('openai_key_status', status)
+            emit('openai_key_check', {'result': 'no_new_key', 'has_key': status['has_key']})
             return
-        _cfg.OPENAI_API_KEY = api_key            # live: all config.OPENAI_API_KEY readers
-        model_config.persist_openai_key(api_key) # survive restart
-        debug("OpenAI API key updated via web UI", category="web_interface")
-        emit('openai_key_status', {'has_key': model_config.has_openai_key()}, broadcast=True)
-    except Exception as e:
-        error(f"Error setting openai key: {e}", exception=e, category="web_interface")
-        emit('error', {'message': "Failed to set OpenAI API key"})  # generic: no key leak
+        emit('openai_key_check', {'result': 'checking'})
+        check = check_openai_key(api_key)
+        if check['result'] != REJECTED:
+            _cfg.OPENAI_API_KEY = api_key            # live: all config.OPENAI_API_KEY readers
+            model_config.persist_openai_key(api_key) # survive restart
+            from utils.startup_provider_recovery import notify_configuration_saved
+            notify_configuration_saved('legacy')
+            notify_configuration_saved('openai')
+            debug("OpenAI API key updated via web UI", category="web_interface")
+        emit('openai_key_check', {
+            'result': check['result'],
+            'wait_seconds': check['wait_seconds'],
+            'restart_needed': check['result'] != REJECTED and bool(game_thread and game_thread.is_alive()),
+        })
+        emit('openai_key_status', _openai_key_status(), broadcast=True)
+    except Exception:
+        # Generic, and no exception text: it could carry key material (#1399).
+        error("Error setting openai key", category="web_interface")
+        emit('error', {'message': "Failed to set OpenAI API key"})
 
 @socketio.on('get_gemini_key')
 def handle_get_gemini_key():
@@ -4615,6 +4679,8 @@ def handle_set_gemini_key(data):
             return
         _cfg.GEMINI_API_KEY = api_key            # live: config.GEMINI_API_KEY readers
         model_config.persist_gemini_key(api_key) # survive restart
+        from utils.startup_provider_recovery import notify_configuration_saved
+        notify_configuration_saved('gemini')
         debug("Gemini API key updated via web UI", category="web_interface")
         emit('gemini_key_status', {'has_key': model_config.has_gemini_key()}, broadcast=True)
     except Exception as e:
@@ -4715,8 +4781,9 @@ def handle_generate_image(data):
         from datetime import datetime
         from utils.file_operations import safe_read_json, safe_write_json
         
-        # Initialize OpenAI client
-        client = OpenAI(api_key=config.OPENAI_API_KEY)
+        # Initialize the OpenAI client (#1399: base_url pinned to the OpenAI API)
+        from utils.openai_client import openai_api_client
+        client = openai_api_client()
         
         # Try to generate image
         try:
@@ -4730,11 +4797,19 @@ def handle_generate_image(data):
             # Get the image URL
             image_url = response.data[0].url
         except Exception as dalle_error:
-            # Check if it's a content policy violation
-            if "content_policy_violation" in str(dalle_error) or "400" in str(dalle_error):
-                # Silently sanitize and retry
+            # A content-policy refusal, by the provider's typed error code (#855)
+            if getattr(dalle_error, "code", None) == "content_policy_violation":
+                # Rewrite (T089) and retry once
                 from utils.prompt_sanitizer import sanitize_prompt
                 sanitized_prompt = sanitize_prompt(prompt)
+                if sanitized_prompt is None:
+                    emit('image_generation_error', {
+                        'message': ("The image could not be made: the image service refused this "
+                                    "scene and no safer description could be written."),
+                        'request_id': data.get('request_id'),
+                        'source_message_id': data.get('source_message_id'),
+                    })
+                    return
                 
                 # Retry with sanitized prompt
                 response = client.images.generate(
@@ -4747,6 +4822,8 @@ def handle_generate_image(data):
             else:
                 # Re-raise if it's not a content policy issue
                 raise dalle_error
+        from utils.session_spend import record_other
+        record_other("portrait")  # #1388: billed per image, counted, not priced
         
         # Save the image locally with metadata
         try:
@@ -4865,8 +4942,9 @@ def generate_tts():
         else:
             selected_model = TTS_MODEL
         
-        # Initialize OpenAI client
-        client = OpenAI(api_key=config.OPENAI_API_KEY)
+        # Initialize the OpenAI client (#1399: base_url pinned to the OpenAI API)
+        from utils.openai_client import openai_api_client
+        client = openai_api_client()
         
         # Generate speech
         response = client.audio.speech.create(
@@ -4875,6 +4953,8 @@ def generate_tts():
             input=text,
             speed=TTS_SPEED
         )
+        from utils.session_spend import record_other
+        record_other("voice")  # #1388: billed per character, counted, not priced
         
         # Return audio as streaming response
         return Response(
@@ -5119,6 +5199,8 @@ def run_game_loop():
         # Run the main game
         from updates.save_game_manager import RestoreRequest
         handoff = dm_main.main_game_loop()
+        if isinstance(handoff, dm_main.WebRecoveryPause):
+            _pause_web_gameplay(handoff.message)
         if isinstance(handoff, RestoreRequest):
             previous_clean = _web_restore_state().get('can_resume') is not False
             _finish_web_restore(
@@ -5256,7 +5338,8 @@ def send_output_to_clients():
                     socketio.emit('token_update', {
                         'tpm': stats.get('tpm', 0),
                         'rpm': stats.get('rpm', 0),
-                        'total_tokens': stats.get('total_tokens', 0)
+                        'total_tokens': stats.get('total_tokens', 0),
+                        'spend': _session_spend_snapshot(),
                     })
                 except:
                     # If anything fails, just send zeros (but don't spam)
@@ -5686,10 +5769,11 @@ def extract_module_context_for_npcs(module_name):
         # Header for the entire context block
         context_parts.append(f"--- START OF CONTEXT FOR MODULE: {module_name} ---")
 
-        # 1. Read and append the entire module plot file
+        # 1. Read and append the entire module plot (statuses from the engine's quest record)
         plot_file = os.path.join('modules', module_name, 'module_plot.json')
         if os.path.exists(plot_file):
-            plot_data = safe_read_json(plot_file)
+            from utils import quest_record
+            plot_data = quest_record.module_plot(module_name)
             if plot_data:
                 context_parts.append("\n--- MODULE PLOT FILE: module_plot.json ---")
                 context_parts.append(json.dumps(plot_data, indent=2))

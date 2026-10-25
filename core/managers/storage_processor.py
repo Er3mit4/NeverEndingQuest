@@ -38,6 +38,7 @@ register_callsite("T049", "core/managers/storage_processor.py", 313)
 import config
 from core.ai import api_client
 from utils.encoding_utils import safe_json_load, safe_json_dump
+from utils.transient_filesystem import ReadOnlySaveStop
 from utils.module_path_manager import ModulePathManager
 import jsonschema
 from utils.enhanced_logger import debug, info, warning, error, set_script_name
@@ -127,15 +128,33 @@ class StorageProcessor:
                     "quantity": item.get("quantity", 1),
                     "type": item.get("item_type", "miscellaneous")
                 })
+        # The ammunition stock is inventory too (#366): one entry per row the
+        # character still holds, so storing arrows names an item it has.
+        ammunition = (context.get("character") or {}).get("ammunition")
+        for row in ammunition if isinstance(ammunition, list) else []:
+            if not isinstance(row, dict):
+                continue
+            name = row.get("name")
+            quantity = row.get("quantity")
+            if isinstance(name, str) and name.strip() and type(quantity) is int and quantity > 0:
+                character_inventory.append({
+                    "name": name,
+                    "quantity": quantity,
+                    "type": "ammunition"
+                })
                 
         # Format existing storage for context
         existing_storage_info = []
         for storage in context.get("existing_storage", []):
+            # The exact stored names are what retrieve_item matches on (#458).
             existing_storage_info.append({
                 "id": storage["id"],
                 "name": storage["deviceName"],
                 "type": storage["deviceType"],
-                "contents_count": len(storage.get("contents", []))
+                "contents": [
+                    {"name": item.get("item_name", "Unknown"), "quantity": item.get("quantity", 1)}
+                    for item in storage.get("contents", [])
+                ]
             })
             
         system_prompt = f"""You are a storage operations specialist for a 5th Edition RPG system. Your task is to convert natural language storage descriptions into valid JSON operations that match the provided schema.
@@ -159,7 +178,7 @@ INSTRUCTIONS:
 2. Determine the appropriate storage action (create_storage, store_item, retrieve_item, view_storage)
 3. Extract all relevant information (character, items, quantities, storage types, etc.)
 4. If creating new storage, infer appropriate storage type and name
-5. If referencing existing storage, use the storage_id from the context
+5. If referencing existing storage, use the storage_id from the context. To store into or take from a container listed under EXISTING STORAGE AT LOCATION, always give its storage_id; a store_item without a storage_id makes a new container
 6. Ensure all required fields are present according to the schema
 7. Use the current location information provided in context
 8. Validate item names against the character's inventory for store operations
@@ -169,7 +188,8 @@ INSTRUCTIONS:
 OUTPUT REQUIREMENTS:
 - Return ONLY valid JSON that matches the storage action schema
 - Include all required fields for the detected action type
-- Use EXACT item names from character inventory (never modify or assume item names)
+- Use EXACT item names from character inventory for store operations (never modify or assume item names)
+- For retrieve operations, use the EXACT item name as listed in that storage's "contents" (same spelling and capitalization); the player's wording may differ
 - Extract the specific item name mentioned in the player's request
 - Use the exact quantity requested, or 1 if not specified
 - Reference existing storage IDs when applicable
@@ -188,13 +208,11 @@ For "I store my rope in a chest here":
   "quantity": 1
 }}
 
-For "I store my torch and dagger in the chest":
+For "I store my torch and dagger in the chest" (a chest listed under EXISTING STORAGE AT LOCATION):
 {{
   "action": "store_item",
   "character": "Norn",
-  "storage_type": "chest",
-  "storage_name": "Equipment Chest",
-  "location_description": "current location", 
+  "storage_id": "storage_12345678",
   "items": [
     {{"item_name": "Torch", "quantity": 1}},
     {{"item_name": "Dagger", "quantity": 1}}
@@ -246,20 +264,14 @@ For "What's in our storage here?":
             if not operation.get("location_id") and context.get("location"):
                 operation["location_id"] = context["location"]["id"]
                 
-        # Handle existing storage references
-        if operation.get("action") in ["retrieve_item", "view_storage", "store_item"]:
-            if not operation.get("storage_id") and context.get("existing_storage"):
-                # Try to match storage by type or name
-                storage_type = operation.get("storage_type", "").lower()
-                for storage in context["existing_storage"]:
-                    if storage_type in storage.get("deviceType", "").lower():
-                        operation["storage_id"] = storage["id"]
-                        break
-                        
-                # If still no match, use first available storage
-                if not operation.get("storage_id") and context["existing_storage"]:
-                    operation["storage_id"] = context["existing_storage"][0]["id"]
-                    
+        # Existing storage: the typed storage_id, or the one container here
+        # whose name is the typed storage_name. Never a partial type match or
+        # the first container (#855; view_storage reads the whole location).
+        if operation.get("action") in ["retrieve_item", "store_item"] and not operation.get("storage_id"):
+            named = self._containers_named(operation, context)
+            if len(named) == 1:
+                operation["storage_id"] = named[0]["id"]
+
         # Handle combined create/store operations (only if no existing storage found)
         if operation.get("action") == "store_item" and not operation.get("storage_id"):
             # This will trigger storage creation in storage_manager
@@ -268,6 +280,35 @@ For "What's in our storage here?":
                 
         return operation
         
+    @staticmethod
+    def _containers_named(operation: Dict[str, Any], context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The containers here whose name equals the typed storage_name as a
+        whole value (case ignored)."""
+        wanted = str(operation.get("storage_name") or "").strip().casefold()
+        if not wanted:
+            return []
+        return [
+            storage for storage in context.get("existing_storage") or []
+            if str(storage.get("deviceName") or "").strip().casefold() == wanted
+        ]
+
+    def _container_error(self, operation: Dict[str, Any], context: Dict[str, Any]) -> str:
+        """Why the operation names no container here, or "". A store with no
+        storage_id and no matching name makes a new container."""
+        if operation.get("action") not in ("retrieve_item", "store_item") or operation.get("storage_id"):
+            return ""
+        here = ", ".join(
+            "%s (%s)" % (storage["id"], storage.get("deviceName"))
+            for storage in context.get("existing_storage") or []
+        ) or "none"
+        if len(self._containers_named(operation, context)) > 1:
+            return ("several containers here are named %r; give the storage_id of the one meant. "
+                    "EXISTING STORAGE AT LOCATION: %s" % (operation.get("storage_name"), here))
+        if operation.get("action") == "retrieve_item":
+            return ("retrieve_item names no container; give the storage_id of the container to take from. "
+                    "EXISTING STORAGE AT LOCATION: %s" % here)
+        return ""
+
     def process_storage_description(
         self,
         description: str,
@@ -277,15 +318,16 @@ For "What's in our storage here?":
     ) -> Dict[str, Any]:
         """Process natural language storage description into validated operation with retry logic"""
         
-        max_attempts = None if structural_reissue else 3
+        # A required travel proposal (structural_reissue) gets the same 3
+        # tries; its caller then drops it and the travel goes on (#855).
+        max_attempts = 3
         original_description = description
 
         attempt = 0
-        while max_attempts is None or attempt < max_attempts:
+        while attempt < max_attempts:
             try:
                 attempt += 1
-                attempt_label = str(max_attempts) if max_attempts is not None else "unbounded"
-                debug(f"AI_CALL: Storage processing attempt {attempt} of {attempt_label}", category="storage_operations")
+                debug(f"AI_CALL: Storage processing attempt {attempt} of {max_attempts}", category="storage_operations")
                 
                 # Get game context
                 context = self._get_game_context(character_name)
@@ -340,7 +382,7 @@ For "What's in our storage here?":
                     operation = json.loads(ai_response)
                     
                 except json.JSONDecodeError as e:
-                    if max_attempts is not None and attempt >= max_attempts:
+                    if attempt >= max_attempts:
                         return {
                             "success": False,
                             "error": f"AI response was not valid JSON after {max_attempts} attempts: {e}",
@@ -352,12 +394,16 @@ For "What's in our storage here?":
                 operation = self._post_process_operation(operation, context)
                 
                 # Validate operation
-                is_valid, validation_error = self._validate_operation(operation)
+                container_error = self._container_error(operation, context)
+                if container_error:
+                    is_valid, validation_error = False, container_error
+                else:
+                    is_valid, validation_error = self._validate_operation(operation)
                 
                 if not is_valid:
                     warning(f"VALIDATION: Failed on attempt {attempt + 1}: {validation_error}", category="storage_operations")
                     
-                    if max_attempts is not None and attempt >= max_attempts:
+                    if attempt >= max_attempts:
                         return {
                             "success": False,
                             "error": f"Generated operation failed validation after {max_attempts} attempts: {validation_error}",
@@ -365,7 +411,9 @@ For "What's in our storage here?":
                         }
                     
                     # Prepare retry with error feedback
-                    if "Character does not have" in validation_error:
+                    if container_error:
+                        description = f"{original_description}\n\nPREVIOUS ATTEMPT FAILED: {container_error}"
+                    elif "Character does not have" in validation_error:
                         # Extract the problematic item name from the error
                         error_parts = validation_error.split("Character does not have ")
                         if len(error_parts) > 1:
@@ -385,9 +433,11 @@ For "What's in our storage here?":
                     "processed_at": datetime.now().isoformat()
                 }
                 
+            except ReadOnlySaveStop:
+                raise
             except Exception as e:
                 error(f"FAILURE: Storage processing exception on attempt {attempt + 1}", exception=e, category="storage_operations")
-                if max_attempts is not None and attempt >= max_attempts:
+                if attempt >= max_attempts:
                     return {
                         "success": False,
                         "error": f"Failed to process storage description after {max_attempts} attempts: {str(e)}",
@@ -402,49 +452,6 @@ For "What's in our storage here?":
             "description": original_description
         }
             
-    def suggest_storage_actions(self, character_name: str) -> List[str]:
-        """Suggest possible storage actions based on current context"""
-        
-        try:
-            context = self._get_game_context(character_name)
-            suggestions = []
-            
-            # Suggest based on character inventory
-            if context.get("character") and context["character"].get("equipment"):
-                high_quantity_items = [
-                    item for item in context["character"]["equipment"]
-                    if item.get("quantity", 1) > 5
-                ]
-                
-                if high_quantity_items:
-                    item_name = high_quantity_items[0].get("item_name", "items")
-                    suggestions.append(f"Store excess {item_name} in a chest")
-                    
-            # Suggest based on existing storage
-            if context.get("existing_storage"):
-                storage_name = context["existing_storage"][0].get("deviceName", "storage")
-                suggestions.append(f"Retrieve items from {storage_name}")
-                suggestions.append(f"Check what's in {storage_name}")
-            else:
-                suggestions.append("Create a chest to store valuable items")
-                
-            # Location-specific suggestions
-            location_name = context.get("location", {}).get("name", "").lower()
-            if "tavern" in location_name or "inn" in location_name:
-                suggestions.append("Create a lockbox for secure storage")
-            elif "home" in location_name or "base" in location_name:
-                suggestions.append("Create a barrel for bulk storage")
-                
-            return suggestions[:3]  # Return top 3 suggestions
-            
-        except Exception as e:
-            print(f"[WARNING] Could not generate storage suggestions: {e}")
-            return [
-                "Store items in a chest",
-                "Retrieve items from storage", 
-                "Check storage contents"
-            ]
-
 # Convenience functions for external use
 def process_storage_request(
     description: str,
@@ -459,8 +466,3 @@ def process_storage_request(
         character_name,
         structural_reissue=structural_reissue,
     )
-
-def get_storage_suggestions(character_name: str) -> List[str]:
-    """Get storage action suggestions for a character"""
-    processor = StorageProcessor()
-    return processor.suggest_storage_actions(character_name)

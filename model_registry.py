@@ -50,9 +50,11 @@ class ModelCatalogEntry:
     owned_by: Optional[str]
 
 
-# Pricing snapshot from the model pages fetched directly on 2026-08-16.
-# Sol and the unsuffixed gpt-5.6 alias are intentionally
-# absent; discovery never makes a model eligible automatically.
+# Pricing snapshot: the gpt-5.6 entries from the model pages fetched directly on 2026-08-16;
+# gpt-6-luna, gpt-6-sol, gpt-6.1-sol and gpt-5.2 (T046) from the owner's price table of
+# 2026-10-18 (D-CREATE-COST-2; short context; cache-write prices are not modelled). The two
+# Sol entries are for pricing only: no binding sends them. gpt-5.6-sol and the unsuffixed
+# gpt-5.6 alias are intentionally absent; discovery never makes a model eligible automatically.
 MODEL_CATALOG: Mapping[str, ModelCatalogEntry] = MappingProxyType(
     {
         "gpt-5.6-luna": ModelCatalogEntry(
@@ -103,6 +105,66 @@ MODEL_CATALOG: Mapping[str, ModelCatalogEntry] = MappingProxyType(
             shutdown_at=None,
             owned_by="opencode-go",
         ),
+        "gpt-6-luna": ModelCatalogEntry(
+            model_id="gpt-6-luna",
+            family="gpt-6-luna",
+            supported_efforts=SUPPORTED_GPT56_EFFORTS,
+            input_usd_per_million=0.10,
+            cached_input_usd_per_million=0.01,
+            output_usd_per_million=0.50,
+            pricing_source_date="2026-10-18",
+            pricing_source_url="owner price table 2026-10-18 (short context; kit reference/openai-pricing-2026-10-18.md)",
+            available=True,
+            availability_checked_at="2026-10-18",
+            created_at=None,
+            shutdown_at=None,
+            owned_by=None,
+        ),
+        "gpt-6-sol": ModelCatalogEntry(
+            model_id="gpt-6-sol",
+            family="gpt-6-sol",
+            supported_efforts=SUPPORTED_GPT56_EFFORTS,
+            input_usd_per_million=2.00,
+            cached_input_usd_per_million=0.20,
+            output_usd_per_million=10.00,
+            pricing_source_date="2026-10-18",
+            pricing_source_url="owner price table 2026-10-18 (short context; kit reference/openai-pricing-2026-10-18.md)",
+            available=True,
+            availability_checked_at="2026-10-18",
+            created_at=None,
+            shutdown_at=None,
+            owned_by=None,
+        ),
+        "gpt-6.1-sol": ModelCatalogEntry(
+            model_id="gpt-6.1-sol",
+            family="gpt-6.1-sol",
+            supported_efforts=SUPPORTED_GPT56_EFFORTS,
+            input_usd_per_million=2.00,
+            cached_input_usd_per_million=0.10,
+            output_usd_per_million=10.00,
+            pricing_source_date="2026-10-18",
+            pricing_source_url="owner price table 2026-10-18 (short context; kit reference/openai-pricing-2026-10-18.md)",
+            available=True,
+            availability_checked_at="2026-10-18",
+            created_at=None,
+            shutdown_at=None,
+            owned_by=None,
+        ),
+        "gpt-5.2": ModelCatalogEntry(
+            model_id="gpt-5.2",
+            family="gpt-5.2",
+            supported_efforts=SUPPORTED_GPT56_EFFORTS,
+            input_usd_per_million=1.75,
+            cached_input_usd_per_million=0.175,
+            output_usd_per_million=14.00,
+            pricing_source_date="2026-10-18",
+            pricing_source_url="owner price table 2026-10-18 (short context; kit reference/openai-pricing-2026-10-18.md)",
+            available=True,
+            availability_checked_at="2026-10-18",
+            created_at=None,
+            shutdown_at=None,
+            owned_by=None,
+        ),
     }
 )
 
@@ -151,7 +213,7 @@ def _declare(task_ids, profiles, *, status="active", note=""):
 
 
 _declare(
-    "T022 T023 T025 T028 T029 T031 T036 T037 T059 T092",
+    "T022 T023 T025 T028 T029 T031 T036 T037 T059",
     _profiles(
         "OPENAI_GPT56_LUNA_NONE",
         "DM_MAIN_GEMINI_PRO_LOW",
@@ -160,15 +222,36 @@ _declare(
     ),
 )
 _declare(
-    "T024",
+    "T092",
     _profiles(
-        "OPENAI_GPT56_LUNA_NONE",
+        "OPENAI_GPT56_LUNA_LOW",
         "DM_MAIN_GEMINI_PRO_LOW",
         "DM_MAIN_LEGACY",
         "DM_MAIN_LMSTUDIO",
     ),
-    status="dormant",
-    note="Direct comparison only; helper is currently unreferenced.",
+    note="Startup interview author (#682), split from the T022 group. OpenAI=luna|low: in acceptance run 5 at "
+         "luna|none each finalize attempt carried new real rules errors (Soldier equipment package omitted, "
+         "masteries on unmastered weapons, engine equipment_effects copied back). Other providers unchanged.",
+)
+_declare(
+    "T124",
+    _profiles(
+        "STARTUP_REVIEW_T124_GPT_5_6_LUNA_LOW",
+        "DM_MAIN_GEMINI_PRO_LOW",
+        "DM_MAIN_LEGACY",
+        "DM_MAIN_LMSTUDIO",
+    ),
+    note="Startup semantic reviewer (#682), split from T092 so the reviewer binds alone. OpenAI=gpt-5.6-luna|low "
+         "(D-CREATE-COST-2 amendment 4, 2026-10-19: terra|low was 98% of a creation's cost; in the headless Cleric "
+         "creation L4h gpt-5.6-luna|low gave 11 reviews, 3 rejections, each a real mistake in the draft (one already "
+         "normalized by the engine), no reference-gap rejection, "
+         "no contradiction, mean 4.9 s, max 7.0 s; the creation cost $0.1097, the reviewer $0.093). Fallback: "
+         "gpt-6-luna|medium (OPENAI_GPT56_LUNA_MEDIUM), consistent in creation L2 at $0.102 with reviews averaging "
+         "44 s; gpt-6-luna|low reversed its own demand three times at finalize and saved nothing. Before that "
+         "terra|low (T040 precedent). History, on gpt-5.6-luna|none (shared with T092, acceptance runs 1-3) it invented "
+         "requirements (a sheet-approval step, a required null, shifting wording demands); at luna|low (run 4) "
+         "it twice blamed the author for engine-written savingThrowBonuses. Gemini/legacy/lmstudio keep T092's "
+         "profiles.",
 )
 _declare(
     "T026",
@@ -182,15 +265,6 @@ _declare(
 )
 _declare(
     "T027 T030 T032 T033 T038",
-    _profiles(
-        "OPENAI_GPT56_LUNA_NONE",
-        "DM_SUMM_GEMINI_FLASH_LOW",
-        "DM_SUMM_LEGACY",
-        "DM_SUMM_LMSTUDIO",
-    ),
-)
-_declare(
-    "T066",
     _profiles(
         "OPENAI_GPT56_LUNA_NONE",
         "DM_SUMM_GEMINI_FLASH_LOW",
@@ -245,27 +319,6 @@ _declare(
     ),
 )
 _declare(
-    "T014",
-    _profiles(
-        "OPENAI_GPT56_LUNA_NONE",
-        "NPC_MOVEMENT_T014_GEMINI_FLASH_LOW",
-        "NPC_INFO_LEGACY",
-        "NPC_INFO_LMSTUDIO",
-    ),
-    note="T014 needs its OWN gemini config carrying response_schema; NPC_INFO_GEMINI_FLASH_LOW "
-         "(shared with T091) has none, so gemini would emit narration and silently drop the NPC "
-         "movement update. Must match the live callsite (action_handler.py NPC_MOVEMENT_T014_*).",
-)
-_declare(
-    "T091",
-    _profiles(
-        "OPENAI_GPT56_LUNA_NONE",
-        "NPC_INFO_GEMINI_FLASH_LOW",
-        "NPC_INFO_LEGACY",
-        "NPC_INFO_LMSTUDIO",
-    ),
-)
-_declare(
     "T015 T016 T018 T019",
     _profiles(
         "OPENAI_GPT56_LUNA_NONE",
@@ -273,16 +326,6 @@ _declare(
         "ADV_SUMM_LEGACY",
         "ADV_SUMM_LMSTUDIO",
     ),
-)
-_declare(
-    "T017",
-    _profiles(
-        "OPENAI_GPT56_LUNA_MEDIUM",
-        "COMBAT_COMPRESS_GEMINI_FLASH_LOW",
-        "COMBAT_COMPRESS_LEGACY",
-        "COMBAT_COMPRESS_LMSTUDIO",
-    ),
-    note="Luna-medium passed 6/6 source-aware compression cases versus 5/6 for the incumbent and 1/6 for Luna-none.",
 )
 _declare(
     "T020",
@@ -376,15 +419,15 @@ _declare(
     note="Retain incumbent: Terra-none was only 0.12s faster over four cases and offered no material accepted-result efficiency gain.",
 )
 _declare(
-    "T047",
+    "T121",
     _profiles(
         "OPENAI_GPT56_LUNA_LOW",
         "LEVELUP_CONV_GEMINI_FLASH_LOW",
         "LEVELUP_CONV_LEGACY",
         "LEVELUP_CONV_LMSTUDIO",
     ),
-    note="#323 level-up interview on Luna low (owner ruling 2026-09-14: the whole level-up path runs on "
-         "Luna; replays showed reasoning=none re-emits rejected answers while low converges in 1-2 rounds).",
+    note="L1 level-up agent (2026-09-29): the one conversational callsite of the table-driven level-up; "
+         "same Luna low binding as the T047 interview it replaces.",
 )
 _declare(
     "T086",
@@ -396,32 +439,12 @@ _declare(
     ),
 )
 _declare(
-    "T048",
-    _profiles(
-        "OPENAI_GPT56_LUNA_LOW",
-        "LEVELUP_VAL_GEMINI_PRO_LOW",
-        "LEVELUP_VAL_LEGACY",
-        "LEVELUP_VAL_LMSTUDIO",
-    ),
-    note="#323 owner-selected Terra low for the level-up full validator. "
-         "Narrow interview controls passed; full saved-level-up acceptance remains pending.",
-)
-_declare(
     "T049",
     _profiles(
         "OPENAI_GPT56_LUNA_NONE",
         "STORAGE_PROCESSOR_T049_GEMINI_FLASHLITE_LOW",
         "STORAGE_PROCESSOR_T049_LEGACY",
         "STORAGE_PROCESSOR_T049_LMSTUDIO",
-    ),
-)
-_declare(
-    "T050",
-    _profiles(
-        "OPENAI_GPT56_LUNA_NONE",
-        "CHAR_VALIDATOR_GEMINI_FLASH_LOW",
-        "CHAR_VALIDATOR_LEGACY",
-        "CHAR_VALIDATOR_LMSTUDIO",
     ),
 )
 _declare(
@@ -443,15 +466,6 @@ _declare(
     ),
 )
 _declare(
-    "T053",
-    _profiles(
-        "OPENAI_GPT56_LUNA_NONE",
-        "CHAR_VALIDATOR_T053_GEMINI_FLASH_LOW",
-        "CHAR_VALIDATOR_LEGACY",
-        "CHAR_VALIDATOR_LMSTUDIO",
-    ),
-)
-_declare(
     "T054",
     _profiles(
         "OPENAI_GPT56_LUNA_NONE",
@@ -459,6 +473,44 @@ _declare(
         "CHAR_VALIDATOR_LEGACY",
         "CHAR_VALIDATOR_LMSTUDIO",
     ),
+)
+_declare(
+    "T125",
+    _profiles(
+        "OPENAI_GPT56_LUNA_NONE",
+        "CHAR_VALIDATOR_GEMINI_FLASH_LOW",
+        "CHAR_VALIDATOR_LEGACY",
+        "CHAR_VALIDATOR_LMSTUDIO",
+    ),
+    note="Legacy feature names (keyword validation V4, owner Q-V3 a): once per sheet whose SRD table lookup "
+         "misses, names each non-SRD classFeatures entry from the class's closed SRD feature list or null; "
+         "code checks the answer and writes srd_name. T054's validator profiles.",
+)
+_declare(
+    "T126",
+    _profiles(
+        "OPENAI_GPT56_LUNA_NONE",
+        "NPC_RECALL_T112_GEMINI_FLASHLITE_LOW",
+        "NPC_RECALL_T112_LEGACY",
+        "NPC_RECALL_T112_LMSTUDIO",
+    ),
+    note="Roll answer (#1118, D-1118-2): reads a player's line while code holds an open roll and "
+         "returns one typed kind (let_game_roll, faces, decline, other); the site checks the faces "
+         "against the dice. Required in a live turn. Service: core/ai/roll_answer.py.",
+)
+_declare(
+    "T127",
+    _profiles(
+        "OPENAI_GPT56_LUNA_NONE",
+        "MINI_UTIL_GEMINI_FLASH_LOW",
+        "MINI_UTIL_LEGACY",
+        "MINI_UTIL_LMSTUDIO",
+    ),
+    note="Startup menu answer (#1260, D-STARTUP-MENU-1): reads a player's sentence at the adventure or "
+         "character menu when code did not resolve a number or whole name, and returns the typed option "
+         "number or a clarifying question; code checks the number is listed. One bounded attempt outside "
+         "the live turn path; any failure falls back to the menu's own line. T093's MINI_UTIL profiles. "
+         "Service: core/ai/menu_answer.py.",
 )
 _declare(
     "T065",
@@ -484,15 +536,6 @@ _declare(
         "the same action turn on one attempt. The earlier reasoning-off "
         "failures were a stale-prompt fixture, not the effort setting, so no "
         "measurement justifies paying for a higher rung here."
-    ),
-)
-_declare(
-    "T077",
-    _profiles(
-        "OPENAI_GPT56_LUNA_NONE",
-        "PLOT_UPD_GEMINI_FLASH_LOW",
-        "PLOT_UPD_LEGACY",
-        "PLOT_UPD_LMSTUDIO",
     ),
 )
 _declare(
@@ -627,6 +670,28 @@ _declare(
     note="Classic-build NPC coherence repair is enabled at the reviewed tip default.",
 )
 _declare(
+    "T122",
+    _profiles(
+        "NPC_TYPING_T122_GPT56LUNA_NONE",
+        "NPC_TYPING_T122_GEMINI_PRO_LOW",
+        "NPC_TYPING_T122_LEGACY",
+        "NPC_TYPING_T122_LMSTUDIO",
+    ),
+    note="Typing a module that joins without a module declaration (N4), once per "
+         "module at its integration. Bound like T104.",
+)
+_declare(
+    "T123",
+    _profiles(
+        "ROUTE_TIMING_T123_GPT56LUNA_NONE",
+        "ROUTE_TIMING_T123_GEMINI_PRO_LOW",
+        "ROUTE_TIMING_T123_LEGACY",
+        "ROUTE_TIMING_T123_LMSTUDIO",
+    ),
+    note="Timing a built module's links (N5), once per build in the declaration "
+         "emitter. Bound like T122.",
+)
+_declare(
     "T105",
     _profiles(
         "NPC_VOICE_T105_OPENAI_LUNA_NONE",
@@ -672,9 +737,9 @@ _declare(
         "NPC_RECALL_T112_LEGACY",
         "NPC_RECALL_T112_LMSTUDIO",
     ),
-    note="Episodic RECALL anchor-parse: parses a player's 'remember when...' line into "
-         "structured anchors; CODE selects the matching episodeIds from the NPC's own "
-         "index (model never selects episodes -> cannot fabricate). Always "
+    note="Episodic RECALL selection: reads a player's 'remember when...' line with each "
+         "companion's own witnessed episodes and returns the episodeIds it refers to; CODE "
+         "drops any id outside that companion's witnessed set (cannot fabricate). Always "
          "on. OpenAI luna|low. Service: core/npc/episode_recall.py.",
 )
 _declare(
@@ -708,36 +773,6 @@ _declare(
 )
 
 
-_declare(
-    "T115 T117",
-    _profiles(
-        "OPENAI_GPT56_LUNA_LOW",
-        "LEVELUP_CONV_GEMINI_FLASH_LOW",
-        "LEVELUP_CONV_LEGACY",
-        "LEVELUP_CONV_LMSTUDIO",
-    ),
-    note="Required private level-up domain authors: features, spells, numbers (#323).",
-)
-_declare(
-    "T119",
-    _profiles(
-        "OPENAI_GPT56_LUNA_LOW",
-        "LEVELUP_CONV_GEMINI_FLASH_LOW",
-        "LEVELUP_CONV_LEGACY",
-        "LEVELUP_CONV_LMSTUDIO",
-    ),
-    note="Required private level-up numbers author (#323); Luna low with the rest of the level-up path (2026-09-14).",
-)
-_declare(
-    "T116 T118 T120",
-    _profiles(
-        "OPENAI_GPT56_LUNA_LOW",
-        "LEVELUP_VAL_GEMINI_PRO_LOW",
-        "LEVELUP_VAL_LEGACY",
-        "LEVELUP_VAL_LMSTUDIO",
-    ),
-    note="Required focused reviews of level-up domain proposals (#323).",
-)
 
 
 def _build_bindings():
@@ -757,18 +792,62 @@ def _build_bindings():
 
 
 CALLSITE_BINDINGS: Mapping[str, CallsiteBinding] = _build_bindings()
-# Reviewed source inventory: 75 register_callsite IDs plus enabled T104, plus the
+
+# Per-callsite output ceilings for OpenAI answers, in characters of streamed
+# output: four times the 95th percentile of that callsite's captured answers
+# (owner rule, 2026-09-29; measured over the kit captures, see the table's
+# source note). A streamed answer that passes its ceiling is aberrant by
+# measurement (the observed runaway was 55 times the largest real T067
+# answer), so the stream is closed and the identical request is reissued.
+# Callsites without an entry have no ceiling. Never sent to a provider.
+OPENAI_OUTPUT_CEILING_CHARS: Mapping[str, int] = {
+    # Source: kit captures scanned 2026-09-29 (OpenAI answers only; callsites with
+    # fewer than 30 answers are not listed). T067 max excludes the 170,922-char runaway.
+    "T013": 3560,  # n=55 p95=890 max=1003
+    "T015": 35244,  # n=43 p95=8811 max=9749
+    "T016": 6652,  # n=43 p95=1663 max=2129
+    "T034": 5540,  # n=32 p95=1385 max=1386
+    "T040": 3344,  # n=31 p95=836 max=949
+    "T042": 13512,  # n=90 p95=3378 max=3798
+    "T044": 5416,  # n=31 p95=1354 max=1535
+    "T049": 1168,  # n=60 p95=292 max=309
+    "T051": 14628,  # n=117 p95=3657 max=3906
+    "T052": 4204,  # n=38 p95=1051 max=1518
+    "T063": 4680,  # n=55 p95=1170 max=1226
+    "T064": 7960,  # n=56 p95=1990 max=2012
+    "T065": 1564,  # n=706 p95=391 max=584
+    "T067": 5528,  # n=1368 p95=1382 max=3099
+    "T078": 1800,  # n=85 p95=44 max=44 were all "none" answers; a real add is 390-450 chars (E12a probe), 4x that
+    "T079": 3576,  # n=100 p95=894 max=2415
+    "T082": 960,  # n=356 p95=240 max=276
+    "T084": 18448,  # n=3830 p95=4612 max=7811
+    "T090": 5892,  # n=73 p95=1473 max=1580
+    "T092": 18808,  # n=34 p95=4702 max=4747
+    "T124": 4972,  # startup reviewer (split from T092): n=25 p95=1243 max=1347
+    "T096": 7412,  # n=353 p95=1853 max=1896
+    "T097": 3012,  # n=122 p95=753 max=826
+    "T105": 2776,  # n=477 p95=694 max=1275
+    "T107": 5372,  # n=858 p95=1343 max=1884
+    "T112": 376,  # n=102 p95=94 max=175
+}
+
+
+def openai_output_ceiling(task_id):
+    """The output ceiling for one callsite on the openai provider, or None."""
+    value = OPENAI_OUTPUT_CEILING_CHARS.get(task_id)
+    return value if isinstance(value, int) and value > 0 else None
+# Reviewed source inventory: 78 registered callsite IDs (T014 and T091 retired in P4-e/P4-f, T024 in keyword GEN-11, T066 in keyword H5, T053 in keyword validation DS-3, T050 in keyword validation V5, T017 in keyword KW-6, T128 in D-ALLCLASS-4, the retired level-up interview, validator and domain layer in D-COST-2; T125 added in keyword validation V4, T126 in #1118, T127 in #1260, T128 in D-CREATE-COST-5) plus enabled T104, plus the
 # NPC-voice family T105 (voice+affinity) and T107 (profile seed). Keep this
 # independent from _DECLARATIONS so deleting/adding a binding cannot make the
 # expected set silently redefine itself.
 REGISTERED_TASK_IDS = tuple(
-    "T012 T013 T014 T015 T016 T017 T018 T019 T020 T021 T022 T023 T024 T025 "
+    "T012 T013 T015 T016 T018 T019 T020 T021 T022 T023 T025 "
     "T026 T027 T028 T029 T030 T031 T032 T033 T034 T035 T036 T037 T038 T039 "
-    "T040 T041 T042 T043 T044 T045 T046 T047 T048 T049 T050 T051 T052 T053 "
-    "T054 T059 T063 T064 T065 T066 T067 T077 T078 T079 T081 T082 T083 T084 "
-    "T085 T086 T087 T088 T089 T090 T091 T092 T093 T094 T095 T096 T097 T098 "
+    "T040 T041 T042 T043 T044 T045 T046 T049 T051 T052 "
+    "T054 T059 T063 T064 T065 T067 T078 T079 T081 T082 T083 T084 "
+    "T085 T086 T087 T088 T089 T090 T092 T093 T094 T095 T096 T097 T098 "
     "T099 T100 T101 T102 T103 T105 T107 T108 T112 T113 T114 "
-    "T115 T116 T117 T118 T119 T120".split()
+    "T121 T122 T123 T124 T125 T126 T127".split()
 )
 EXPECTED_TASK_IDS = tuple(sorted(REGISTERED_TASK_IDS + ("T104",)))
 

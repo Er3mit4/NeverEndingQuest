@@ -1,3 +1,6 @@
+import { isTransientNotice, useConnectionNotice } from '../stores/connectionNotices'
+import { useRulesRoll } from '../stores/rulesRoll'
+import { useInputSuggestion } from '../stores/inputSuggestion'
 /**
  * services/socket.ts -- the ONLY module in src/ allowed to import socket.io-client.
  * It owns the connection to the Flask-SocketIO server (:8357, default /socket.io
@@ -74,6 +77,7 @@ export function emitC<K extends keyof ClientEvents>(ev: K, payload: ClientEvents
   if (isHydrationEvent(String(ev))) {
     return hydration.request(ev as HydrationEvent, payload as HydrationPayload)
   }
+  if (ev === 'submit_check_roll' && !socket.connected) return
   const identified = withRequestIdentity(String(ev), payload)
   if (CLIENT_EVENT_ARITY[ev] === 0) {
     socket.emit(ev)
@@ -110,6 +114,8 @@ function refreshAuthoritativeState(): void {
 
 // ---------- transport-level ----------
 socket.on('connect', () => {
+  useLog.getState().beginHistorySync()
+  useConnectionNotice.getState().clear()
   void reloadIfRestartPending()
   const connectionEpoch = hydration.beginConnection()
   useSession.getState().beginConnection()
@@ -122,11 +128,12 @@ socket.on('connect', () => {
   refreshAuthoritativeState()
 })
 socket.on('disconnect', () => {
+  useRulesRoll.getState().setPrompt(null)
   useSession.getState().setConnected(false)
   // #214 F10: a welcome clear emitted while disconnected is lost; drop the
   // placeholder now - a still-active welcome's next heartbeat restores it.
   useSession.getState().setWelcome('')
-  useLog.getState().append({ type: 'system', content: 'Disconnected from the game server. Reconnecting...', message_id: `disconnect-${hydration.currentEpoch()}` })
+  useConnectionNotice.getState().show('Disconnected from the game server. Reconnecting...')
 })
 
 // ---------- session / startup ----------
@@ -153,7 +160,7 @@ on('startup_status', (s) => {
 })
 // #214 D-214-4=A: background welcome liveness - presentational only, never
 // touches isProcessing, so it can never lock the input.
-on('welcome_progress', (p) => useSession.getState().setWelcome((p && p.message) || ''))
+on('welcome_progress', (p) => useSession.getState().setWelcome((p && p.message) || '', p?.kind))
 on('game_started', (p) => {
   localStorage.setItem('neq_hasPlayed', 'true')
   useSession.getState().gameStarted(p.message)
@@ -161,10 +168,12 @@ on('game_started', (p) => {
 })
 on('game_resumed', (p) => {
   applyProcessingTransition(p.is_processing, () => useSession.getState().gameResumed(p.is_processing))
-  useLog.getState().append({ type: 'system', content: p.message })
+  if (isTransientNotice(p.message)) useConnectionNotice.getState().show(p.message)
+  else useLog.getState().append({ type: 'system', content: p.message })
   refreshAuthoritativeState()
 })
 on('startup_recovery_response', (p) => useSession.getState().setRecovery(p))
+on('roll_prompt', (p) => useRulesRoll.getState().setPrompt(p.prompt))
 on('ui_state_snapshot', (p) => {
   if (!hydration.accept('request_ui_snapshot', p)) return
   const session = useSession.getState()
@@ -176,6 +185,7 @@ on('ui_state_snapshot', (p) => {
     p.is_processing,
     () => session.applySnapshot(p),
   )
+  useRulesRoll.getState().setPrompt(p.roll_prompt ?? null)
   if (p.operations) {
     if (p.operations.restore?.can_resume === false || p.operations.restore?.restart_required === false) cancelPendingRestart()
     useDialogs.getState().applyOperationSnapshot(p.operations)
@@ -190,10 +200,17 @@ on('ui_state_snapshot', (p) => {
 })
 
 // ---------- game log ----------
-on('game_output', (m) => useLog.getState().append(m))
+on('game_output', (m) => {
+  if (m.type === 'input_suggestion') useInputSuggestion.getState().offer(m.content)
+  else if (m.type === 'system' && isTransientNotice(m.content)) useConnectionNotice.getState().show(m.content)
+  else useLog.getState().append(m)
+})
 on('cached_messages', (ms) => useLog.getState().replaceAll(ms))
 on('debug_output', (m) => useLog.getState().appendDebug(m))
-on('system_message', (p) => useLog.getState().append({ type: 'system', content: p.content }))
+on('system_message', (p) => {
+  if (isTransientNotice(p.content)) useConnectionNotice.getState().show(p.content)
+  else useLog.getState().append({ type: 'system', content: p.content })
+})
 on('error', (p) => useLog.getState().append({ type: 'error', content: p.message }))
 on('token_update', (t) => useLog.getState().setTokens(t))
 on('image_generated', (p) => useLog.getState().addImage(p))
@@ -234,12 +251,14 @@ on('restore_complete', (p) => {
   if (p.can_resume === false || p.restart_required === false) cancelPendingRestart()
   useSession.getState().setRestoreResult(p)
   useDialogs.getState().setActionResult({ kind: 'restore', ...p })
-  useLog.getState().append({ type: 'system', content: p.message })
+  if (isTransientNotice(p.message)) useConnectionNotice.getState().show(p.message)
+  else useLog.getState().append({ type: 'system', content: p.message })
 })
 on('reset_complete', (p) => {
   useDialogs.getState().setActionResult({ kind: 'reset', message: p.message })
   useLog.getState().append({ type: 'system', content: 'Campaign has been reset. The page will now reload.' })
 })
+on('message_log_cleared', () => useLog.getState().clear())
 on('exit_acknowledged', () => {
   // The legacy overlay owns fixed player-facing copy. Do not let the server's
   // transport acknowledgment ("Exit acknowledged") replace that sentence.
@@ -267,6 +286,7 @@ on('codex_login', (p) => useDialogs.getState().setCodexLogin(p))
 on('codex_model_changed', (p) => useDialogs.getState().setCodexModel(p))
 on('local_endpoint_changed', (p) => useDialogs.getState().setLocalEndpoint(p))
 on('openai_key_status', (p) => useDialogs.getState().setOpenaiKeyStatus(p))
+on('openai_key_check', (p) => useDialogs.getState().setOpenaiKeyCheck(p))
 on('gemini_key_status', (p) => useDialogs.getState().setGeminiKeyStatus(p))
 on('opencodego_key_status', (p) => useDialogs.getState().setOpencodegoKeyStatus(p))
 on('local_endpoint_test_result', (p) => useDialogs.getState().setEndpointTestResult(p))

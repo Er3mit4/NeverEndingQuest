@@ -104,6 +104,14 @@ class HeadlessSession:
                     "require their own credentials."))
         copied = bootstrap_mod.prepare_game_dir(
             self.game_dir, self.repo_root, module=module)
+        refreshed = [entry for entry in copied if entry.startswith("refreshed ")]
+        if refreshed:
+            self.writer.emit(
+                "system",
+                content=(
+                    "This game folder held older copies of the game's files "
+                    "and was updated from this install: %s."
+                    % ", ".join(refreshed)))
         os.chdir(self.game_dir)
         bootstrap_mod.ensure_runtime_dirs()
         if copied and self.debug:
@@ -314,11 +322,14 @@ class HeadlessSession:
             payload = {"data": str(data)}
         self.writer.emit("compression", event=event_type, **payload)
 
-    def _on_welcome(self, message):
+    def _on_welcome(self, message, kind=None):
         # #214 D-214-4=A: background startup-welcome liveness. A separate
         # additive NDJSON event type - deliberately NOT a "status" event, so
         # harnesses never read it as input-locking processing state.
-        self.writer.emit("welcome_progress", message=str(message))
+        if kind is None:
+            self.writer.emit("welcome_progress", message=str(message))
+        else:
+            self.writer.emit("welcome_progress", message=str(message), kind=str(kind))
 
     def _on_player_output(self, payload, *, commit_guard=None):
         # Structured sink messages (all DM narration since P2, plus module
@@ -337,6 +348,8 @@ class HeadlessSession:
     def _classify_prompt(self, clean_prompt, snapshot):
         if "(Leveling Up)" in clean_prompt:
             return "levelup"
+        if "[ROLL]" in clean_prompt:
+            return "roll"
         if looks_like_prompt(clean_prompt) or clean_prompt.endswith(":"):
             combat = snapshot.get("combat") or {}
             if combat.get("active"):
@@ -353,20 +366,25 @@ class HeadlessSession:
         import re
         stats = {}
         # Main prompts show [HH:MM (context)]; combat prompts show the raw
-        # [HH:MM:SS] with no context. Accept both.
+        # [HH:MM:SS] with no context. Accept both. #642: main prompts may lead
+        # with the calendar day ([Springmonth 4]); it is reported as "date"
+        # only when present, so older prompt lines parse to the same keys.
         match = re.search(
+            r"(?:\[([A-Za-z]+ \d{1,2})\])?"
             r"\[(\d\d:\d\d)(?::\d\d)?(?: \(([^)]*)\))?\]\[HP:([^/\]]+)/([^\]]+)\]"
             r"\[XP:([^/\]]+)/([^\]]+)\]",
             clean_prompt)
         if match:
             stats = {
-                "time": match.group(1),
-                "time_context": match.group(2),
-                "hp": match.group(3),
-                "max_hp": match.group(4),
-                "xp": match.group(5),
-                "next_level_xp": match.group(6),
+                "time": match.group(2),
+                "time_context": match.group(3),
+                "hp": match.group(4),
+                "max_hp": match.group(5),
+                "xp": match.group(6),
+                "next_level_xp": match.group(7),
             }
+            if match.group(1):
+                stats["date"] = match.group(1)
         return stats
 
     def _on_prompt(self):
@@ -408,8 +426,17 @@ class HeadlessSession:
                 ),
             )
             return
+        # #1436: the web's notice for input held behind a new game's opening
+        # scene, read before the queue as the web reads it.
+        try:
+            opening_scene = bool(self._dm_main and self._dm_main.opening_scene_pending())
+        except Exception:
+            opening_scene = False
         self.prompt_pending.clear()
         self.input_queue.put(content)
+        if opening_scene:
+            self.writer.emit("operation", name="input", status="accepted_deferred",
+                             message="Your action is queued for after the opening scene.")
         from utils.capture.live_provider_call import get_live_turn_scope
         scope = get_live_turn_scope()
         if scope is not None and scope.purpose == "travel_recovery":

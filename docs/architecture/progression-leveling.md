@@ -1,5 +1,14 @@
 # Progression and Leveling
 
+## Retired level-up layer (2026-10-20; D-COST-2, #193)
+
+A level-up now calls only T121, the level-up agent (core/managers/level_up_session.py,
+prompts/leveling/level_up_agent.txt). The interview (T047), its validator (T048), the
+domain authors and proposal reviews (T115-T120), and their domain layer were deleted with
+their prompts and registry ids (#1314). Sections below that describe the interview,
+specialists or independent proposal reviews record the retired design, not current
+behaviour.
+
 ## #323 source-echo removal (2026-09-13; live acceptance pending)
 
 Specialist output now contains only calculations, rule facts/references, variations
@@ -108,19 +117,19 @@ verification pin. Live #193 v3.1, including D-323-1, remains authority.
 
 1. `utils/xp.py:10-30` - CR-to-XP table and normalization.
 2. `utils/xp.py:35-112` - defeated-enemy accounting and party division.
-3. `core/managers/combat_manager.py:1555-1580` - exact recipient character paths.
-4. `core/managers/combat_manager.py:2129-2205` - completion, XP history, and summary.
-5. `core/managers/combat_transaction.py:1266-1309` - reward journal and receipt-last writes.
-6. `schemas/encounter_schema.json:532-549` - completion receipt schema.
-7. `schemas/char_schema.json:24-26` and `schemas/char_schema.json:519-548` - progression fields.
-8. `prompts/system_prompt.txt:965` and `prompts/validation/validation_prompt.txt:194` - full advancement-entry contracts; their compressed counterparts carry the same distinction.
-9. `core/ai/action_handler.py:3759` - `levelUp` entrant and session creation.
-10. `main.py:5384` - level-up interception before ordinary action output.
-11. `core/managers/level_up_manager.py:78` - captured commit guard and process-local session.
-12. `core/managers/level_up_manager.py:230`, `:372`, `:470`, `:484`, `:520`, `:635` and `:726` - interview loop, prospective guards, answer retention, domain packets, preparation, commit and shared evidence (2026-09-12 working candidate).
+3. `core/managers/combat_manager.py:1634-1659` - exact recipient character paths.
+4. `core/managers/combat_manager.py:2358-2461` - completion, XP history, and summary.
+5. `core/managers/combat_transaction.py:1477-1520` - reward journal and receipt-last writes.
+6. `schemas/encounter_schema.json:570-582` - completion receipt schema.
+7. `schemas/char_schema.json:24-26` and `schemas/char_schema.json:578-589` - progression fields.
+8. `prompts/system_prompt.txt:934` and `prompts/validation/validation_prompt.txt:206` - full advancement-entry contracts; their compressed counterparts carry the same distinction.
+9. `core/ai/action_handler.py:4256` - `levelUp` entrant and session creation.
+10. `main.py::process_ai_response` at `is_levelup_action = any(action.get("action") == "levelUp" for action in actions)` - level-up interception before ordinary action output.
+11. `core/managers/level_up_manager.py:88` - captured commit guard and process-local session.
+12. `core/managers/level_up_manager.py:234`, `:444`, `:520`, `:534`, `:579`, `:687` and `:788` - interview loop, prospective guards, answer retention, domain packets, preparation, commit and shared evidence (2026-09-12 working candidate).
 13. `core/ai/level_up_specialists.py` `collect_domain_work` and `run_layer` - owned collection and fixed forward calculation; `utils/level_up_workspace.py` `promote`/`withdraw` preserve approved fact delivery/currentness. Specialist question/parking helpers are retired.
-14. `main.py:9566` and `main.py:9713` - typed handback and guarded common-tail save.
-15. `updates/update_character_info.py:1075` and `:1117` - shared preparation and guarded canonical commit used by the current level-up candidate.
+14. `main.py::_main_game_loop` at `elif isinstance(final_result, dict) and final_result.get("status") == "enter_levelup_mode":` and `main.py::_main_game_loop` at `save_conversation_history(conversation_history, commit_guard=level_up_publication_guard)` - typed handback and guarded common-tail save.
+15. `updates/update_character_info.py:1326` and `:1560` - shared preparation and guarded canonical commit used by the current level-up candidate.
 
 ## Invariants
 

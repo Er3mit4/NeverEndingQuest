@@ -4,12 +4,12 @@ import copy
 import hashlib
 import json
 import os
-import re
 import shutil
 import stat
 from uuid import uuid4
 from utils.module_path_manager import ModulePathManager
 from utils.file_operations import safe_read_json
+from utils.transient_filesystem import raise_if_save_stopped
 from utils.module_context import ModuleContext
 from utils.path_transaction_lock import (
     path_transaction_lock,
@@ -110,6 +110,7 @@ def _capture_contained_json(module_dir, path):
 
 def _durable_copy(source, destination):
     """Atomically preserve a byte-for-byte backup without writer sentinels."""
+    raise_if_save_stopped()
     canonical_source = os.path.abspath(os.path.normpath(os.fspath(source)))
     canonical_destination = os.path.abspath(
         os.path.normpath(os.fspath(destination))
@@ -144,6 +145,7 @@ def _durable_copy(source, destination):
 
 def _durable_write_json(path, payload, *, create_backup=False):
     """Atomically persist JSON and its directory without sentinel locks."""
+    raise_if_save_stopped()
     canonical = os.path.abspath(os.path.normpath(os.fspath(path)))
     parent = os.path.dirname(canonical)
     if parent:
@@ -168,6 +170,7 @@ def _durable_write_json(path, payload, *, create_backup=False):
 
 def _durable_remove(path):
     """Remove a transaction marker durably when the platform supports it."""
+    raise_if_save_stopped()
     canonical = os.path.abspath(os.path.normpath(os.fspath(path)))
     try:
         os.remove(canonical)
@@ -190,23 +193,24 @@ def _fsync_parent(parent):
         pass
 
 
-def build_npc_merge_confirmation_prompt(npc1_name: str, npc2_name: str) -> str:
-    """Build T088's conservative, fail-closed identity decision prompt."""
-    return f"""Decide whether these two fantasy NPC name labels refer to the same established person.
+def build_npc_roster_duplicate_prompt(roster) -> str:
+    """Build T088's one conservative, fail-closed duplicate-identity prompt over
+    the module's whole NPC roster."""
+    return f"""Below is the complete NPC roster of one fantasy module. Each entry is one NPC record with its exact "name", any recorded aliases, role, faction, description, and the locations it appears in.
 
-Answer true ONLY when the labels share a distinctive personal name and the difference is a compatible title, honorific, surname, epithet, or role. A short personal name and its clearly expanded form may match.
+Find the records that refer to the same established person. Records are the same person ONLY when their names share a distinctive personal name and the difference is a compatible title, honorific, surname, epithet, role, or form (for example a spirit or specter of the same named person). A short personal name and its clearly expanded form may match.
 
-Answer false when either of these is true:
-- Both labels are generic or anonymous descriptions without a shared proper name.
+Records are NOT the same person when any of these is true:
+- Both names are generic or anonymous descriptions without a shared proper name.
 - Their age or identity descriptors conflict, such as "Old" versus "Young".
 - They name different people or the evidence is ambiguous.
 
-There is no context beyond the two labels. Do not invent an identity connection. When uncertain, answer false.
+Do not invent an identity connection. When uncertain, leave the records apart.
 
-- NPC 1: "{npc1_name}"
-- NPC 2: "{npc2_name}"
+Roster:
+{json.dumps(roster, indent=2, ensure_ascii=True)}
 
-Respond with exactly one JSON object: {{"answer": true}} or {{"answer": false}}."""
+Respond with exactly one JSON object: {{"duplicateGroups": [["<name>", "<name>"], ...]}}. Each group lists two or more "name" values copied exactly from the roster, and a name appears in at most one group. Use {{"duplicateGroups": []}} when no records are the same person."""
 
 
 class NpcReconciler:
@@ -281,22 +285,28 @@ class NpcReconciler:
 
     def get_canonical_name(self, original_name: str) -> str:
         """Finds the canonical name for a given NPC name."""
-        # First, try a direct match in our map
+        # Every built name is registered exactly through add_npc; a name that is
+        # not in the map stays as written (keyword program GEN-14).
         if original_name in self.canonical_map:
             return self.canonical_map[original_name]
-        
-        # If not found, try matching the base name (without parentheses)
-        base_name = re.sub(r'\s*\([^)]*\)\s*', '', original_name).strip()
-        if base_name in self.canonical_map:
-            return self.canonical_map[base_name]
-            
-        # If still not found, return the original name as a fallback
         print(f"WARNING: [NpcReconciler] Could not find canonical name for '{original_name}'. Using original.")
         return original_name
 
-    def _ai_confirm_merge(self, npc1_name: str, npc2_name: str) -> bool:
-        """Uses a cheap AI call to confirm if two NPCs are the same entity."""
-        prompt = build_npc_merge_confirmation_prompt(npc1_name, npc2_name)
+    def _ai_duplicate_groups(self, npc_list):
+        """One T088 call over the whole roster; returns its validated duplicate
+        groups as lists of exact roster names, or [] when the reply is refused."""
+        roster = [
+            {
+                "name": npc["name"],
+                "aliases": npc.get("aliases", []),
+                "role": npc.get("role", ""),
+                "faction": npc.get("faction", ""),
+                "description": npc.get("description", ""),
+                "appearsIn": npc.get("appears_in", []),
+            }
+            for npc in npc_list
+        ]
+        prompt = build_npc_roster_duplicate_prompt(roster)
         try:
             from model_config import MODEL_PROVIDER
             if MODEL_PROVIDER == "openai":
@@ -318,16 +328,36 @@ class NpcReconciler:
             result = json.loads(response.choices[0].message.content)
             if (
                 not isinstance(result, dict)
-                or set(result) != {"answer"}
-                or type(result["answer"]) is not bool
+                or set(result) != {"duplicateGroups"}
+                or not isinstance(result["duplicateGroups"], list)
             ):
                 raise ValueError(
-                    "T088 response must be exactly a JSON object containing a boolean answer"
+                    "T088 response must be exactly a JSON object containing a duplicateGroups list"
                 )
-            return result["answer"]
+            # A name held by two records does not say which record it means.
+            held = [npc["name"] for npc in npc_list]
+            roster_names = {name for name in held if held.count(name) == 1}
+            grouped = set()
+            for group in result["duplicateGroups"]:
+                if (
+                    not isinstance(group, list)
+                    or len(group) < 2
+                    or not all(isinstance(name, str) for name in group)
+                    or len(set(group)) != len(group)
+                ):
+                    raise ValueError(
+                        "T088 duplicate group must list two or more distinct roster names"
+                    )
+                unknown = [name for name in group if name not in roster_names]
+                if unknown:
+                    raise ValueError(f"T088 duplicate group names no single roster NPC: {unknown}")
+                if grouped & set(group):
+                    raise ValueError("T088 lists an NPC in more than one duplicate group")
+                grouped.update(group)
+            return result["duplicateGroups"]
         except Exception as e:
-            print(f"WARNING: [NpcReconciler] AI merge confirmation failed: {e}")
-            return False
+            print(f"WARNING: [NpcReconciler] AI duplicate check failed: {e}")
+            return []
 
     @staticmethod
     def _rewrite_name_list(names, identity_map):
@@ -371,42 +401,38 @@ class NpcReconciler:
         npc_list = list(self.context.npcs.values())
         merged_keys = set()
         identity_map = {}
-        
-        for i in range(len(npc_list)):
-            for j in range(i + 1, len(npc_list)):
-                npc1 = npc_list[i]
-                npc2 = npc_list[j]
+        if len(npc_list) < 2:
+            return {}
 
-                # Skip if either has already been merged
-                if npc1['name'] in merged_keys or npc2['name'] in merged_keys:
-                    continue
+        # One T088 call sees the whole roster (keyword program GEN-9, D-KWG-2 a).
+        # Each group merges into its earliest roster entry, in roster order.
+        position = {npc['name']: index for index, npc in enumerate(npc_list)}
+        for group in self._ai_duplicate_groups(npc_list):
+            members = sorted(group, key=position.__getitem__)
+            npc1 = npc_list[position[members[0]]]
+            for name in members[1:]:
+                npc2 = npc_list[position[name]]
+                print(f"  -> AI confirmed merge: '{npc2['name']}' into '{npc1['name']}'")
 
-                # Simple check: if one name is a substring of the other (e.g., "Elara" in "Old Elara")
-                # This is a good heuristic to find potential matches
-                if npc1['name'].lower() in npc2['name'].lower() or npc2['name'].lower() in npc1['name'].lower():
-                    if self._ai_confirm_merge(npc1['name'], npc2['name']):
-                        # AI confirmed they are the same. Merge npc2 into npc1.
-                        print(f"  -> AI confirmed merge: '{npc2['name']}' into '{npc1['name']}'")
-                        
-                        # Add npc2's original name and aliases to npc1's aliases
-                        npc2_aliases = npc2.get('aliases', [])
-                        npc1.setdefault('aliases', []).append(npc2['name'])
-                        npc1['aliases'].extend(npc2_aliases)
-                        npc1['aliases'] = sorted(list(set(npc1['aliases']))) # Remove duplicates
-                        
-                        # Merge appearances
-                        npc1.setdefault('appears_in', [])
-                        for appearance in npc2.get('appears_in', []):
-                            if appearance not in npc1['appears_in']:
-                                npc1['appears_in'].append(appearance)
-                        
-                        # Mark npc2 for deletion
-                        merged_keys.add(npc2['name'])
-                        identity_map[npc2['name']] = npc1['name']
-                        for alias in npc1['aliases']:
-                            identity_map[alias] = npc1['name']
-                        for alias in npc2_aliases:
-                            identity_map[alias] = npc1['name']
+                # Add npc2's original name and aliases to npc1's aliases
+                npc2_aliases = npc2.get('aliases', [])
+                npc1.setdefault('aliases', []).append(npc2['name'])
+                npc1['aliases'].extend(npc2_aliases)
+                npc1['aliases'] = sorted(list(set(npc1['aliases']))) # Remove duplicates
+
+                # Merge appearances
+                npc1.setdefault('appears_in', [])
+                for appearance in npc2.get('appears_in', []):
+                    if appearance not in npc1['appears_in']:
+                        npc1['appears_in'].append(appearance)
+
+                # Mark npc2 for deletion
+                merged_keys.add(npc2['name'])
+                identity_map[npc2['name']] = npc1['name']
+                for alias in npc1['aliases']:
+                    identity_map[alias] = npc1['name']
+                for alias in npc2_aliases:
+                    identity_map[alias] = npc1['name']
 
         # Now, remove the merged NPCs from the context
         if merged_keys:
@@ -721,14 +747,18 @@ class NpcReconciler:
         self._validate_transaction_record(record)
         return record
 
-    def reconcile_all_areas(self):
+    def reconcile_all_areas(self, refresh_lock=None):
         """Optimistically reconcile one exact module snapshot.
 
         Standalone calls release module refresh and the context target lock
         during provider waits, then reacquire strictly refresh -> context and
         revalidate bytes, containment, and directory/file identities. A caller
-        that already owns refresh (managed build) retains its outer fence.
+        that already owns refresh retains its outer fence. ``refresh_lock`` is
+        the context-manager factory used to take refresh (default
+        ``module_refresh_lock``); a module build passes one that waits instead
+        of refusing (issue #708).
         """
+        refresh_lock = refresh_lock or module_refresh_lock
         # Do not create a phantom module directory merely to place a lock file.
         # The context is required for both normal work and pending recovery.
         if not os.path.isfile(self.context_path):
@@ -747,7 +777,7 @@ class NpcReconciler:
             return False
         try:
             for source_attempt in range(_T088_SOURCE_RETRY_LIMIT):
-                with module_refresh_lock() as snapshot_acquired:
+                with refresh_lock() as snapshot_acquired:
                     if not snapshot_acquired:
                         print(
                             "ERROR: [NpcReconciler] Module refresh is busy; "
@@ -779,7 +809,7 @@ class NpcReconciler:
                     )
                     return False
 
-                with module_refresh_lock() as commit_acquired:
+                with refresh_lock() as commit_acquired:
                     if not commit_acquired:
                         self.context = original_context
                         self._rebuild_canonical_map()

@@ -57,6 +57,10 @@ export interface ProviderSettings {
   provider: string | null
   localEndpoint: ServerEvents['local_endpoint_changed'] | null
   openaiHasKey: boolean | null
+  /** False when no system keychain holds the key (#1399 G3); null until known. */
+  openaiKeychain: boolean | null
+  /** The last key check (#1399 G1). */
+  keyCheck: ServerEvents['openai_key_check'] | null
   geminiHasKey: boolean | null
   opencodegoHasKey: boolean | null
   codexStatus: ServerEvents['codex_status'] | null
@@ -75,6 +79,8 @@ export interface DialogsState {
   /** compression_start/progress/complete overlay state. */
   compression: CompressionState
   settings: ProviderSettings
+  /** #1399 G2: the New game / Load the player pressed before adding a key. */
+  keyGate: 'start' | 'load' | null
   update: UpdateState
   moduleOperation: ModuleOperationState | null
 
@@ -93,6 +99,8 @@ export interface DialogsState {
   setProvider: (payload: ServerEvents['provider_changed']) => void
   setLocalEndpoint: (payload: ServerEvents['local_endpoint_changed']) => void
   setOpenaiKeyStatus: (payload: ServerEvents['openai_key_status']) => void
+  setOpenaiKeyCheck: (payload: ServerEvents['openai_key_check'] | null) => void
+  setKeyGate: (gate: 'start' | 'load' | null) => void
   setGeminiKeyStatus: (payload: ServerEvents['gemini_key_status']) => void
   setOpencodegoKeyStatus: (payload: ServerEvents['opencodego_key_status']) => void
   setCodexStatus: (payload: ServerEvents['codex_status']) => void
@@ -130,12 +138,15 @@ export const useDialogs = create<DialogsState>((set) => ({
     provider: null,
     localEndpoint: null,
     openaiHasKey: null,
+    openaiKeychain: null,
+    keyCheck: null,
     geminiHasKey: null,
     opencodegoHasKey: null,
     codexStatus: null,
     codexLogin: null,
     endpointTest: null,
   },
+  keyGate: null,
   update: { running: false, log: [], error: null, complete: null },
   moduleOperation: null,
 
@@ -218,7 +229,13 @@ export const useDialogs = create<DialogsState>((set) => ({
   setLocalEndpoint: (payload) =>
     set((s) => ({ settings: { ...s.settings, localEndpoint: payload } })),
   setOpenaiKeyStatus: (payload) =>
-    set((s) => ({ settings: { ...s.settings, openaiHasKey: payload.has_key } })),
+    set((s) => ({ settings: {
+      ...s.settings,
+      openaiHasKey: payload.has_key,
+      openaiKeychain: typeof payload.keychain === 'boolean' ? payload.keychain : s.settings.openaiKeychain,
+    } })),
+  setOpenaiKeyCheck: (keyCheck) => set((s) => ({ settings: { ...s.settings, keyCheck } })),
+  setKeyGate: (keyGate) => set({ keyGate }),
   setGeminiKeyStatus: (payload) =>
     set((s) => ({ settings: { ...s.settings, geminiHasKey: payload.has_key } })),
   setOpencodegoKeyStatus: (payload) =>

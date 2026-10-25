@@ -75,6 +75,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from uuid import uuid4
 # Import our existing utilities
 from utils.file_operations import atomic_writer, safe_write_json, safe_read_json
+from utils.transient_filesystem import ReadOnlySaveStop, raise_if_save_stopped
 from web.shared_state import message_cache_lock
 from utils.module_path_manager import ModulePathManager
 from utils.encoding_utils import safe_json_load
@@ -102,6 +103,30 @@ def _lifecycle_wait_reporter(operation):
 
     return report
 
+
+def _busy_file_wait_reporter(operation):
+    """Report one Save/Load step waiting for a busy file (#826).
+
+    Silent below one second, so an instant retry does not blame another
+    program.
+    """
+    last_second = [0]
+
+    def report(elapsed):
+        second = int(elapsed)
+        if second < 1 or second == last_second[0]:
+            return
+        last_second[0] = second
+        from core.managers.status_manager import status_manager
+
+        status_manager.update_status(
+            "%s is waiting for a file another program is using (%d seconds)"
+            % (operation, second),
+            True,
+        )
+
+    return report
+
 # Versioned rules guidance ships with the application. It is never campaign
 # state, and an older saved-game folder must not overwrite a newer installation.
 APPLICATION_OWNED_REFERENCE_FILES = frozenset(
@@ -110,6 +135,18 @@ APPLICATION_OWNED_REFERENCE_FILES = frozenset(
         "data/srd_common_rules.json",
     )
 )
+
+# The story-compression cache is saved, but a Load merges it into the live
+# cache by content key instead of restoring it as a file (#1452).
+COMPRESSION_CACHE_PATH = "modules/conversation_history/compression_cache.json"
+
+
+# Automatic checkpoints before combat (#263). The typed metadata marker
+# (#845) alone selects them for pruning, and only the newest few are kept;
+# the description prefix is display text only.
+AUTO_CHECKPOINT_PREFIX = "Auto-save before combat"
+AUTO_CHECKPOINT_KIND = "pre_combat"
+AUTO_CHECKPOINT_KEEP = 5
 
 
 @dataclass(frozen=True)
@@ -201,7 +238,7 @@ class SaveGameManager:
         from utils.transient_filesystem import is_transient_filesystem_error
 
         started = time.monotonic()
-        report = _lifecycle_wait_reporter(wait_label)
+        report = _busy_file_wait_reporter(wait_label)
         while True:
             if cancel_check is not None:
                 cancel_check()
@@ -211,6 +248,17 @@ class SaveGameManager:
                 if not is_transient_filesystem_error(exc):
                     raise
                 _wait_to_retry(None, 0.05, report, started)
+
+    def _discard_unfinished_save(self, save_path):
+        """Remove a save folder that did not finish (#1003). If it cannot be
+        removed, its ``save_incomplete`` marker keeps it out of the Load list."""
+        try:
+            self._restore_io(shutil.rmtree, save_path, wait_label='Save')
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            warning(f"SAVE: An unfinished save stays on disk, hidden from Load: {save_path}: {exc}",
+                    category="save_game")
 
     @staticmethod
     def _clear_campaign_completion_metadata(*, generation_only=False) -> None:
@@ -248,6 +296,19 @@ class SaveGameManager:
             pass
 
     @staticmethod
+    def _clear_departure_summary_runtime_marker() -> None:
+        """Discard departure-summary recovery from the replaced timeline."""
+        marker = os.path.join(
+            "modules",
+            "conversation_history",
+            "pending_departure_summary.json",
+        )
+        try:
+            os.remove(marker)
+        except FileNotFoundError:
+            pass
+
+    @staticmethod
     def _restore_path_value(path):
         """Read a restore-owned node without following links out of the game."""
         if os.path.islink(path) or (hasattr(os.path, "isjunction") and os.path.isjunction(path)):
@@ -271,6 +332,27 @@ class SaveGameManager:
         return filename.endswith((".lock", "_BU.json")) or filename in {".gitkeep", ".gitignore"}
 
     @staticmethod
+    def _module_owned_path(path):
+        """Module content an older save must never downgrade (#832).
+
+        The pristine ``*_BU.json`` masters and a module's monster stat blocks
+        ship with the module (an update can author or rebalance them); fight
+        state lives in encounters and sheets. Load keeps the installed copy
+        and takes the save's copy only when the installation has none.
+        """
+        parts = os.path.normpath(path).split(os.sep)
+        if parts[-1].endswith("_BU.json"):
+            return True
+        return (
+            len(parts) == 4 and parts[0] == "modules" and parts[2] == "monsters"
+            and parts[3].endswith(".json")
+        )
+
+    @classmethod
+    def _restore_preserves_path(cls, path):
+        return cls._restore_preserves_file(os.path.basename(path)) or cls._module_owned_path(path)
+
+    @staticmethod
     def _clear_restore_directory(directory):
         """Remove replaceable contents; propagate failures and retain held locks."""
         if not os.path.exists(directory):
@@ -281,13 +363,33 @@ class SaveGameManager:
 
         for root, directories, files in os.walk(directory, topdown=False, onerror=walk_error):
             for filename in files:
-                if SaveGameManager._restore_preserves_file(filename):
+                if SaveGameManager._restore_preserves_path(os.path.join(root, filename)):
                     continue
                 os.remove(os.path.join(root, filename))
             for name in directories:
                 child = os.path.join(root, name)
                 if not os.listdir(child):
                     os.rmdir(child)
+
+    @staticmethod
+    def _merge_saved_compression_cache(save_path):
+        """Add the save's compression results to the live cache (#1452).
+
+        Best-effort: an old save has none, and a cache can never fail a Load
+        that has already been verified. The live entry wins on a shared key.
+        """
+        saved = os.path.join(save_path, COMPRESSION_CACHE_PATH)
+        if not os.path.isfile(saved):
+            return
+        try:
+            from utils.compression.conversation_compressor_parallel import (
+                ParallelConversationCompressor,
+            )
+
+            added = ParallelConversationCompressor.merge_saved_cache(saved)
+            info(f"Merged {added} saved compression entries", category="save_game")
+        except Exception as exc:
+            warning(f"Saved compression cache not merged: {exc}", category="save_game")
 
     def _freeze_restore_inventory(self, save_path):
         """Freeze original membership/values before cleanup can change its inputs.
@@ -327,6 +429,9 @@ class SaveGameManager:
         for path in (
             "modules/encounters", "modules/.campaign.json.completion",
             "modules/conversation_history/pending_location_transition.json",
+            "modules/conversation_history/pending_departure_summary.json",
+            # D4: removed by the restore, so a failed Load can put it back.
+            "live_state.json.bak",
         ):
             record(path, recursive=True)
 
@@ -348,6 +453,11 @@ class SaveGameManager:
                     or normalized == "modules/.campaign.json.completion-epoch.json"
                     or normalized.startswith("modules/.campaign.json.completion/")
                     or normalized == "modules/conversation_history/pending_location_transition.json"
+                    or normalized == "modules/conversation_history/pending_departure_summary.json"
+                    # #1452: merged after verification, never copied over the live cache.
+                    or normalized == COMPRESSION_CACHE_PATH
+                    # #832: the installed module content wins over the save's copy.
+                    or (self._module_owned_path(relative) and os.path.isfile(relative))
                 ):
                     continue
                 record(relative, recursive=True)
@@ -441,13 +551,19 @@ class SaveGameManager:
             'modules/campaign_archives', 'modules/campaign_summaries',
         )))
         for path, value in original.items():
-            if value[0] == 'file' and replaced(path) and not self._restore_preserves_file(os.path.basename(path)):
+            if value[0] == 'file' and replaced(path) and not self._restore_preserves_path(path):
                 expected[path] = ('absent', None)
         for path in ('modules/effects_state.json',
+                     'modules/checks_state.json',
+                     'journal.json',
+                     'live_state.json',
+                     'live_state.json.bak',
+                     'player_storage.json',
                      'modules/conversation_history/combat_conversation_history.json',
                      'modules/conversation_history/startup_conversation.json',
                      'modules/conversation_history/game_interface_cache.json',
-                     'modules/conversation_history/pending_location_transition.json'):
+                     'modules/conversation_history/pending_location_transition.json',
+                     'modules/conversation_history/pending_departure_summary.json'):
             path = os.path.normpath(path)
             if path not in source_files:
                 expected[path] = ('absent', None)
@@ -480,6 +596,7 @@ class SaveGameManager:
             "current_location.json", 
             "journal.json",
             "player_storage.json",
+            "live_state.json",
             "data/companion_memories/",
 
             # Installed SRD reference data is application-owned, not campaign
@@ -492,6 +609,9 @@ class SaveGameManager:
             "modules/conversation_history/chat_history.json",
             "modules/conversation_history/startup_conversation.json",
             "modules/conversation_history/game_interface_cache.json",
+            # Story-compression results, keyed by content; restore merges
+            # them into the live cache instead of copying (#1452).
+            "modules/conversation_history/compression_cache.json",
             
             # Character data
             "characters/",
@@ -525,6 +645,8 @@ class SaveGameManager:
             "modules/world_registry.json",
             "modules/effects_tracker.json",
             "modules/effects_state.json",
+            # Pending checks and unreported check results belong to this save (#940).
+            "modules/checks_state.json",
             "modules/default/effects_tracker.json",
         ])
         
@@ -577,6 +699,7 @@ class SaveGameManager:
             "modules/.runtime_quarantine/",
             ".runtime_locks/",
             "modules/conversation_history/pending_location_transition.json",
+            "modules/conversation_history/pending_departure_summary.json",
             
             # CRITICAL: Exclude save directories to prevent recursive nesting
             "saved_games/",
@@ -827,7 +950,14 @@ class SaveGameManager:
                 return False, "listed state schema version differs"
         return True, ""
 
-    def generate_save_metadata(self, description: str = "", save_mode: str = "essential") -> Dict[str, Any]:
+    def generate_save_metadata(
+        self,
+        description: str = "",
+        save_mode: str = "essential",
+        *,
+        auto_checkpoint: Optional[str] = None,
+        auto_backup: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Generate metadata for a save game"""
         timestamp = datetime.now()
         
@@ -885,6 +1015,13 @@ class SaveGameManager:
             },
             "state_manifest": self._state_manifest_for_root(),
         }
+        if auto_checkpoint is not None:
+            # #845: the typed marker that alone makes a save prunable.
+            metadata["auto_checkpoint"] = auto_checkpoint
+        if auto_backup is not None:
+            # #1376: the typed kind of a save the game takes for itself
+            # (never pruned, never a checkpoint); the Load list labels it.
+            metadata["auto_backup"] = auto_backup
 
         return metadata
     
@@ -894,6 +1031,8 @@ class SaveGameManager:
         save_mode: str = "essential",
         *,
         save_folder: Optional[str] = None,
+        auto_checkpoint: Optional[str] = None,
+        auto_backup: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Settle completion outside snapshot locks; recheck at the boundary."""
         from core.managers.campaign_manager import (
@@ -905,6 +1044,8 @@ class SaveGameManager:
         wait_reporter = _lifecycle_wait_reporter("Save")
         from utils.transient_filesystem import is_transient_filesystem_error
 
+        # After a read-only save stop, a Save writes nothing (issue #654).
+        raise_if_save_stopped()
         try:
             while True:
                 try:
@@ -919,6 +1060,7 @@ class SaveGameManager:
                     if settled and not outcome["blocked"]:
                         return self._create_save_at_boundary(
                             description, save_mode, save_folder=save_folder,
+                            auto_checkpoint=auto_checkpoint, auto_backup=auto_backup,
                         )
                 except _CampaignCompletionActive:
                     # New work appeared after settlement. Release and follow it.
@@ -942,6 +1084,8 @@ class SaveGameManager:
         save_mode: str = "essential",
         *,
         save_folder: Optional[str] = None,
+        auto_checkpoint: Optional[str] = None,
+        auto_backup: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Take one verified snapshot, or release its locks for settlement."""
         from core.managers.campaign_manager import _CampaignCompletionActive
@@ -993,7 +1137,7 @@ class SaveGameManager:
                                 cache_available = False
                                 try:
                                     try:
-                                        atomic_writer.acquire_lock(cache_path)
+                                        atomic_writer.acquire_lock(cache_path, wait_reporter=wait_reporter)
                                         cache_available = True
                                     except OSError as exc:
                                         # acquire_lock retries typed busy errors;
@@ -1007,6 +1151,8 @@ class SaveGameManager:
                                         description,
                                         save_mode,
                                         save_folder=save_folder,
+                                        auto_checkpoint=auto_checkpoint,
+                                        auto_backup=auto_backup,
                                         _cache_available=cache_available,
                                     )
                                 finally:
@@ -1032,6 +1178,8 @@ class SaveGameManager:
         save_mode: str = "essential",
         *,
         save_folder: Optional[str] = None,
+        auto_checkpoint: Optional[str] = None,
+        auto_backup: Optional[str] = None,
         _cache_available: bool = True,
     ) -> Tuple[bool, str]:
         """
@@ -1044,6 +1192,7 @@ class SaveGameManager:
         Returns:
             Tuple of (success: bool, message: str)
         """
+        unfinished = None
         try:
             # Generate timestamp for save directory
             if save_folder is None:
@@ -1068,14 +1217,21 @@ class SaveGameManager:
             
             # Create save directory
             os.makedirs(save_path, exist_ok=True)
+            unfinished = save_path
             info(f"FILE_OP: Created save directory: {save_path}", category="save_game")
             
-            # Generate and save metadata
-            metadata = self.generate_save_metadata(description, save_mode)
+            # Generate and save metadata. Until the last write the save is
+            # marked unfinished, so it is never offered for Load (#1003).
+            metadata = self.generate_save_metadata(
+                description, save_mode, auto_checkpoint=auto_checkpoint,
+                auto_backup=auto_backup,
+            )
+            metadata["save_incomplete"] = True
             metadata_path = f"{save_path}/save_metadata.json"
             if not safe_write_json(
                 metadata_path, metadata, create_backup=False
             ):
+                self._discard_unfinished_save(save_path)
                 return False, "Failed to write save metadata"
             
             # Copy files based on save mode
@@ -1160,16 +1316,22 @@ class SaveGameManager:
                                             category='save_game',
                                         )
                             continue
-                        if dest_dir:
-                            os.makedirs(dest_dir, exist_ok=True)
-                        
                         try:
-                            shutil.copy2(source_path, dest_path)
-                            copied_files.append(file_path)
-                            debug(f"FILE_OP: Copied: {file_path}", category="save_game")
-                        except Exception as e:
-                            error(f"FAILURE: Failed to copy {file_path}", exception=e, category="save_game")
+                            # A busy file is retried. A file that still cannot be
+                            # copied ends the save: Load reads a missing file as
+                            # one this save never had and removes it (#1003).
+                            if dest_dir:
+                                self._restore_io(os.makedirs, dest_dir, exist_ok=True, wait_label='Save')
+                            self._restore_io(shutil.copy2, source_path, dest_path, wait_label='Save')
+                        except FileNotFoundError:
+                            # Gone at the save boundary: absent from this save too.
                             skipped_files.append(file_path)
+                            continue
+                        except OSError as exc:
+                            error(f"FAILURE: Failed to copy {file_path}", exception=exc, category="save_game")
+                            raise RuntimeError(f"could not copy {file_path}: {exc}") from exc
+                        copied_files.append(file_path)
+                        debug(f"FILE_OP: Copied: {file_path}", category="save_game")
                     else:
                         skipped_files.append(file_path)
             
@@ -1185,10 +1347,13 @@ class SaveGameManager:
             metadata["state_manifest"] = self._state_manifest_for_root(save_path)
 
             # Save updated metadata
+            metadata.pop("save_incomplete", None)
             if not safe_write_json(
                 metadata_path, metadata, create_backup=False
             ):
+                self._discard_unfinished_save(save_path)
                 return False, "Failed to finalize save metadata"
+            unfinished = None
             
             success_msg = f"Save game created successfully: {save_path}"
             success_msg += f"\nCopied {len(copied_files)} files"
@@ -1205,9 +1370,13 @@ class SaveGameManager:
             info(f"SUCCESS: {success_msg}", category="save_game")
             return True, success_msg
             
+        except ReadOnlySaveStop:
+            raise
         except Exception as e:
             error_msg = f"Failed to create save game: {str(e)}"
             error(f"FAILURE: {error_msg}", category="save_game")
+            if unfinished:
+                self._discard_unfinished_save(unfinished)
             return False, error_msg
     
     def list_save_games(self) -> List[Dict[str, Any]]:
@@ -1228,7 +1397,8 @@ class SaveGameManager:
                     metadata_path = os.path.join(item_path, "save_metadata.json")
                     if os.path.exists(metadata_path):
                         metadata = safe_read_json(metadata_path)
-                        if metadata:
+                        # A save that did not finish is never offered (#1003).
+                        if metadata and metadata.get("save_incomplete") is not True:
                             metadata["save_folder"] = item
                             metadata["save_path"] = item_path
                             save_games.append(metadata)
@@ -1312,7 +1482,7 @@ class SaveGameManager:
                             boundary_clean = previous_clean
                             with message_cache_lock:
                                 cache_path = "modules/conversation_history/game_interface_cache.json"
-                                atomic_writer.acquire_lock(cache_path)
+                                atomic_writer.acquire_lock(cache_path, wait_reporter=wait_reporter)
                                 try:
                                     restore_outcome = self._restore_save_game_locked(
                                         save_folder, previous_clean=previous_clean
@@ -1348,6 +1518,11 @@ class SaveGameManager:
                 f"Failed to restore save game: {exc}",
             )
         finally:
+            # A restored roster numbers its own [slot] rows; the old turn's
+            # pair is never answered again.
+            from core.ai.action_handler import TurnRoster
+
+            TurnRoster.clear()
             end_invocation_supersession(invocation_barrier)
 
     def validate_restore_target(
@@ -1439,6 +1614,21 @@ class SaveGameManager:
             # The verified backup retains these files for a failed-Load rollback.
             for optional_path in (
                 "modules/effects_state.json",
+                # An older save has no check state; never keep the current
+                # game's pending roll or results (#940).
+                "modules/checks_state.json",
+                # A save from before the first departure has no chronicle;
+                # keeping the current one would record a journey not taken.
+                "journal.json",
+                # A save from before the engine's location record: the record
+                # is re-created from that save's files on the next roster call.
+                "live_state.json",
+                # Never saved (*.bak). Left behind, the refusal ladder could
+                # take a document with a later clock than the restored tracker.
+                "live_state.json.bak",
+                # A save from before the first storage container: its chests
+                # did not exist yet (#468).
+                "player_storage.json",
                 "modules/conversation_history/combat_conversation_history.json",
                 "modules/conversation_history/startup_conversation.json",
                 "modules/conversation_history/game_interface_cache.json",
@@ -1496,6 +1686,7 @@ class SaveGameManager:
             # campaign data on the next CampaignManager construction.
             self._restore_io(self._clear_campaign_completion_metadata)
             self._restore_io(self._clear_location_transition_runtime_marker)
+            self._restore_io(self._clear_departure_summary_runtime_marker)
             self._restore_io(self._verify_selected_restore,
                 original_inventory, source_files, directory_roots,
                 directories_to_clean + [
@@ -1503,6 +1694,7 @@ class SaveGameManager:
                     'modules/.campaign.json.completion',
                 ],
             )
+            self._merge_saved_compression_cache(save_path)
             
             success_msg = f"Save game restored successfully from: {save_folder}"
             success_msg += f"\nRestored {len(source_files)} files"
@@ -1557,6 +1749,53 @@ class SaveGameManager:
             error_msg = f"Failed to delete save game: {str(e)}"
             error(f"FAILURE: {error_msg}", category="save_game")
             return False, error_msg
+
+    def create_combat_checkpoint(self, summary: str = "") -> Tuple[bool, str]:
+        """Save automatically just before a fight begins (#263).
+
+        Owner rule: an automatic checkpoint happens only before combat starts,
+        never during it. Fail-forward: a checkpoint that cannot be written is
+        logged and the fight goes on; nothing claims a save that was not made.
+        A player's Load or Exit (LiveProviderSuperseded) and a read-only save
+        stop (#654) are not failures to swallow: they end the turn now (#845).
+        Only the newest AUTO_CHECKPOINT_KEEP checkpoints are kept, chosen by
+        the typed auto_checkpoint marker; a save without it, made by the
+        player, the DM or an older build, is never pruned.
+        """
+        from utils.capture.live_provider_call import LiveProviderSuperseded
+
+        summary = " ".join(str(summary or "").split())
+        if len(summary) > 120:
+            summary = summary[:117].rstrip() + "..."
+        description = AUTO_CHECKPOINT_PREFIX + (": " + summary if summary else "")
+        try:
+            success, message = self.create_save_game(
+                description, "essential",
+                save_folder=datetime.now().strftime("save_%Y%m%d_%H%M%S_%f"),
+                auto_checkpoint=AUTO_CHECKPOINT_KIND,
+            )
+        except LiveProviderSuperseded:
+            raise
+        except Exception as exc:
+            success, message = False, str(exc)
+        if not success:
+            # The save may have met the read-only stop first and reported it
+            # as (False, msg); the recorded stop still ends the session now.
+            raise_if_save_stopped()
+            warning(f"Combat checkpoint not saved: {message}", category="save_game")
+            return False, message
+        try:
+            checkpoints = [
+                save for save in self.list_save_games()
+                if save.get("auto_checkpoint") == AUTO_CHECKPOINT_KIND
+                and save.get("save_folder")
+            ]
+            for stale in checkpoints[AUTO_CHECKPOINT_KEEP:]:
+                self.delete_save_game(stale["save_folder"])
+        except Exception as exc:
+            warning(f"Old combat checkpoints not pruned: {exc}", category="save_game")
+        info(f"SUCCESS: Combat checkpoint saved: {description}", category="save_game")
+        return True, message
 
     def prepare_staged_delete(
         self, save_folder: str, operation_id: str

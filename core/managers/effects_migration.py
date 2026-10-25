@@ -29,12 +29,16 @@ from core.managers.effects_state import (
 )
 from updates.save_game_manager import SaveGameManager
 from utils.encoding_utils import safe_json_load
+from utils.enhanced_logger import warning
 from utils.file_operations import safe_write_json
 from utils.path_transaction_lock import path_transaction_lock
 
 
 TRACKER_PATH = os.path.join("modules", "effects_tracker.json")
 MIGRATION_GUARD_PATH = os.path.join("modules", "effects_migration")
+# #1376: the typed save_metadata kind of the pre-conversion save; the Load
+# list labels it from this field, never from its description.
+EFFECTS_BACKUP_KIND = "effects_v2_preconversion"
 
 
 class EffectsMigrationError(RuntimeError):
@@ -77,6 +81,7 @@ def _discover_character_files(party, tracker_names=None):
             roots.append(candidate)
     discovered = {}
     duplicates = {}
+    unreadable = []
     for root in roots:
         if not os.path.isdir(root):
             continue
@@ -89,7 +94,15 @@ def _discover_character_files(party, tracker_names=None):
             ):
                 continue
             path = os.path.join(root, filename)
-            value = safe_json_load(path)
+            try:
+                value = safe_json_load(path)
+            except ValueError as exc:
+                # Empty or broken JSON is not a sheet (#408): report it and
+                # leave the file as it is; never stop the conversion on it.
+                unreadable.append(path.replace("\\", "/"))
+                warning(f"EFFECTS: skipped unreadable file {path}: {exc}",
+                        category="effects_tracking")
+                continue
             if not isinstance(value, dict) or not value.get("name"):
                 continue
             key = _normalized_name(value["name"])
@@ -102,7 +115,7 @@ def _discover_character_files(party, tracker_names=None):
                 duplicates.setdefault(key, [discovered[key]]).append(path)
             else:
                 discovered[key] = path
-    return discovered, duplicates
+    return discovered, duplicates, unreadable
 
 
 def _load_tracker():
@@ -148,8 +161,9 @@ def _combat_migration_gate(party):
 
 def _effect_matches(effect, source):
     def label(value):
-        normalized = re.sub(r"\s+", " ", str(value or "").strip().casefold())
-        return re.sub(r"\s+(spell|effect|bonus|penalty)$", "", normalized)
+        # The whole name: an unpaired modifier is materialized as its own
+        # effect, and the visible-sheet check below refuses any change.
+        return " ".join(str(value or "").split()).casefold()
 
     source_key = label(source)
     if not source_key or not isinstance(effect, dict):
@@ -439,6 +453,38 @@ def _convert_sheet(owner, original, modifiers, world, migration_id):
     return sheet, report
 
 
+def _party_sheet_paths(party):
+    """Canonical sheet paths of the party (characters/<stem>.json)."""
+    from utils.module_path_manager import ModulePathManager
+    manager = ModulePathManager(str(party.get("module") or "").replace(" ", "_"))
+    names = [name for name in party.get("partyMembers") or [] if isinstance(name, str)]
+    names += [npc.get("name") for npc in party.get("partyNPCs") or []
+              if isinstance(npc, dict) and isinstance(npc.get("name"), str)]
+    return {os.path.normcase(os.path.normpath(manager.get_character_path(name))) for name in names}
+
+
+def _settle_duplicates(party, files, duplicates, reports):
+    """Two sheets with one name settle on the file the game opens for that
+    name, characters/<stem>.json (#1005); the others are reported and left as
+    they are. A name whose own file is not among them stays a refusal."""
+    from utils.module_path_manager import ModulePathManager
+    manager = ModulePathManager(str(party.get("module") or "").replace(" ", "_"))
+    unsettled = {}
+    for key, paths in sorted(duplicates.items()):
+        name = (safe_json_load(paths[0]) or {}).get("name")
+        own = os.path.normcase(os.path.normpath(manager.get_character_path(name)))
+        kept = [path for path in paths if os.path.normcase(os.path.normpath(path)) == own]
+        if len(kept) != 1:
+            unsettled[key] = paths
+            continue
+        files[key] = kept[0]
+        reports.extend(
+            "duplicate sheet left as it is: %s (the game uses %s)"
+            % (path.replace("\\", "/"), kept[0].replace("\\", "/"))
+            for path in paths if path != kept[0])
+    return unsettled
+
+
 def preflight_effects_migration():
     party = safe_json_load("party_tracker.json")
     if not isinstance(party, dict) or not party.get("module"):
@@ -450,15 +496,20 @@ def preflight_effects_migration():
         return {"status": "deferred", "reason": combat_gate}
 
     tracker = _load_tracker()
-    files, duplicates = _discover_character_files(
+    files, duplicates, unreadable = _discover_character_files(
         party,
         (tracker.get("characters") or {}).keys(),
     )
+    party_paths = _party_sheet_paths(party)
+    held = sorted(path for path in unreadable if os.path.normcase(os.path.normpath(path)) in party_paths)
+    if held:
+        return {"status": "deferred", "reason": "party sheet unreadable: %s" % held}
+    reports = ["unreadable file skipped: %s" % path for path in unreadable]
+    duplicates = _settle_duplicates(party, files, duplicates, reports)
     if duplicates:
         return {"status": "blocked", "refusals": ["duplicate character sheets: %s" % sorted(duplicates)]}
     migration_id = uuid.uuid4().hex
     conversions = []
-    reports = []
     refusals = []
     world = party.get("worldConditions") or {}
     for owner, path in sorted(files.items()):
@@ -497,7 +548,8 @@ def _create_backup():
     manager = SaveGameManager()
     before = {item.get("save_folder") for item in manager.list_save_games()}
     success, message = manager.create_save_game(
-        "Automatic backup before Effects V2 conversion", "essential"
+        "Automatic backup before Effects V2 conversion", "essential",
+        auto_backup=EFFECTS_BACKUP_KIND,
     )
     if not success:
         raise EffectsMigrationError("pre-migration save failed: %s" % message)

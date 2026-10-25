@@ -36,6 +36,17 @@ from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from utils.transient_filesystem import (
+    ON_READ_ONLY_FAIL,
+    ON_READ_ONLY_STOP,
+    ReadOnlySaveStop,
+    ReplaceContention,
+    check_on_read_only,
+    raise_if_save_stopped,
+    record_save_stop,
+    replace_target_is_read_only,
+)
+
 
 # Comprehensive character mapping for problematic Unicode characters
 CHARACTER_REPLACEMENTS = {
@@ -174,6 +185,24 @@ def normalize_typography_deep(value: Any):
     return normalized, count, residual
 
 
+def unicode_name_stem(name):
+    """A file stem from a name's non-ASCII letters, digits and marks (#894).
+
+    Used only when a name has no ASCII letter or digit. NFC, then the same
+    lower() as normalize_character_name; every other character becomes one
+    "_" and the ends are stripped. The result holds no ASCII letter or digit,
+    so it can never equal an ASCII stem. A name with no letter or digit at
+    all still gives "".
+    """
+    text = unicodedata.normalize("NFC", str(name).strip()).lower()
+    kept = "".join(
+        ch if not ch.isascii() and (ch.isalnum() or unicodedata.category(ch).startswith("M")) else "_"
+        for ch in text
+    )
+    stem = "_".join(part for part in kept.split("_") if part)
+    return stem if any(ch.isalnum() for ch in stem) else ""
+
+
 def safe_json_load(filepath: str) -> Any:
     """
     Load JSON file with proper encoding and error handling.
@@ -196,7 +225,8 @@ def safe_json_load(filepath: str) -> Any:
         raise
 
 
-def safe_json_dump(data: Any, filepath: str, *, commit_guard=None, **kwargs) -> None:
+def safe_json_dump(data: Any, filepath: str, *, commit_guard=None,
+                   on_read_only: str = ON_READ_ONLY_STOP, **kwargs) -> None:
     """
     Save JSON with sanitization and an atomic same-directory replacement.
 
@@ -204,7 +234,18 @@ def safe_json_dump(data: Any, filepath: str, *, commit_guard=None, **kwargs) -> 
     state.  Flushing the file before ``os.replace`` means readers observe the
     complete old document or the complete new one, never a partially-written
     JSON document.
+
+    A read-only target never clears by waiting (issue #654). With
+    ``on_read_only="stop"`` (the default) the save raises ReadOnlySaveStop and
+    the session stops; ``"raise"`` and ``"fail"`` raise the replace error, for
+    a caller that handles the raise (``"fail"`` only for a file that is not
+    game state).
     """
+    on_read_only = check_on_read_only(on_read_only)
+    stop_on_read_only = on_read_only == ON_READ_ONLY_STOP
+    if on_read_only != ON_READ_ONLY_FAIL:
+        # No game state is written after a read-only save stopped the session.
+        raise_if_save_stopped()
     # Sanitize data before saving
     clean_data = sanitize_dict(data) if isinstance(data, (dict, list)) else data
     
@@ -228,6 +269,9 @@ def safe_json_dump(data: Any, filepath: str, *, commit_guard=None, **kwargs) -> 
         ),
     )
 
+    contention = ReplaceContention(
+        filepath, check_save_stop=on_read_only != ON_READ_ONLY_FAIL
+    )
     try:
         with open(temporary_path, 'w', encoding='utf-8') as f:
             json.dump(clean_data, f, **default_kwargs)
@@ -238,6 +282,10 @@ def safe_json_dump(data: Any, filepath: str, *, commit_guard=None, **kwargs) -> 
         # the destination. One blip must not fail the write (a live
         # acceptance run lost a combat to this class in the sibling
         # writer). Retain the write until the transient sharing lock clears.
+        # A read-only target never clears by waiting, so the save stops the
+        # session, or raises for a caller that passed on_read_only="raise" or
+        # "fail" (issue #654). The wait is reported and, during a live turn,
+        # shown on screen; it still never gives up on a timer (#653 item 6).
         while True:
             try:
                 with commit_guard() if commit_guard is not None else nullcontext():
@@ -247,7 +295,12 @@ def safe_json_dump(data: Any, filepath: str, *, commit_guard=None, **kwargs) -> 
                 winerror = getattr(replace_error, 'winerror', None)
                 if winerror not in (5, 32):
                     raise
-                time.sleep(0.1)
+                if winerror == 5 and replace_target_is_read_only(filepath):
+                    if stop_on_read_only:
+                        record_save_stop(filepath)
+                        raise ReadOnlySaveStop(filepath) from replace_error
+                    raise
+                contention.tick(winerror)
 
         # Persist the directory entry where the platform supports fsync on a
         # directory. Windows does not expose an equivalent through os.open.
@@ -258,6 +311,7 @@ def safe_json_dump(data: Any, filepath: str, *, commit_guard=None, **kwargs) -> 
             finally:
                 os.close(directory_fd)
     finally:
+        contention.finish()
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
 
@@ -291,3 +345,16 @@ def setup_utf8_console():
             reconfigure = getattr(stream, 'reconfigure', None)
             if callable(reconfigure):
                 reconfigure(encoding='utf-8', errors='strict')
+
+
+def utf8_child_env():
+    """Environment for a Python child whose stdio the game reads (#895).
+
+    On Windows a child with piped stdio prints with the locale code page
+    (cp1252), so a name or model text outside it raised UnicodeEncodeError
+    at the first print. A copy of os.environ keeps PATH, PYTHONPATH and the
+    rest; only the child's stdio encoding changes.
+    """
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
+    return env

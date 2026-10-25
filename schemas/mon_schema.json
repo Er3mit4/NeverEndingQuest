@@ -30,6 +30,28 @@
       "speed": {
         "type": "integer"
       },
+      "alternateSpeeds": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "fly": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "swim": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "burrow": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "climb": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
       "abilities": {
         "type": "object",
         "properties": {
@@ -134,6 +156,119 @@
             },
             "damageType": {
               "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": ["attack", "save", "trait"]
+            },
+            "description": {
+              "type": "string"
+            },
+            "save": {
+              "type": "object",
+              "properties": {
+                "ability": {
+                  "type": "string",
+                  "enum": ["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
+                },
+                "dc": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "halfOnSave": {
+                  "type": "boolean"
+                },
+                "onFail": {
+                  "type": "object",
+                  "properties": {
+                    "damageDice": {
+                      "type": "string"
+                    },
+                    "damageBonus": {
+                      "type": "integer"
+                    },
+                    "damageType": {
+                      "type": "string"
+                    },
+                    "conditions": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": ["blinded", "charmed", "deafened", "exhaustion", "frightened", "grappled", "incapacitated", "invisible", "paralyzed", "petrified", "poisoned", "prone", "restrained", "stunned", "unconscious"]
+                      }
+                    },
+                    "roundsRemaining": {
+                      "type": ["integer", "null"]
+                    },
+                    "repeatAtEndOfTurn": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["damageDice", "damageBonus", "damageType", "conditions"]
+                }
+              },
+              "required": ["ability", "dc", "halfOnSave", "onFail"]
+            },
+            "rider": {
+              "type": "object",
+              "properties": {
+                "ability": {
+                  "type": "string",
+                  "enum": ["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
+                },
+                "dc": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "halfOnSave": {
+                  "type": "boolean"
+                },
+                "onFail": {
+                  "type": "object",
+                  "properties": {
+                    "damageDice": {
+                      "type": "string"
+                    },
+                    "damageBonus": {
+                      "type": "integer"
+                    },
+                    "damageType": {
+                      "type": "string"
+                    },
+                    "conditions": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": ["blinded", "charmed", "deafened", "exhaustion", "frightened", "grappled", "incapacitated", "invisible", "paralyzed", "petrified", "poisoned", "prone", "restrained", "stunned", "unconscious"]
+                      }
+                    },
+                    "roundsRemaining": {
+                      "type": ["integer", "null"]
+                    },
+                    "repeatAtEndOfTurn": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["damageDice", "damageBonus", "damageType", "conditions"]
+                }
+              },
+              "required": ["ability", "dc", "halfOnSave", "onFail"]
+            },
+            "recharge": {
+              "type": "object",
+              "properties": {
+                "min": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 6
+                },
+                "max": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 6
+                }
+              },
+              "required": ["min", "max"]
             }
           },
           "required": [
@@ -164,6 +299,119 @@
             },
             "damageType": {
               "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": ["attack", "save", "trait"]
+            },
+            "description": {
+              "type": "string"
+            },
+            "save": {
+              "type": "object",
+              "properties": {
+                "ability": {
+                  "type": "string",
+                  "enum": ["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
+                },
+                "dc": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "halfOnSave": {
+                  "type": "boolean"
+                },
+                "onFail": {
+                  "type": "object",
+                  "properties": {
+                    "damageDice": {
+                      "type": "string"
+                    },
+                    "damageBonus": {
+                      "type": "integer"
+                    },
+                    "damageType": {
+                      "type": "string"
+                    },
+                    "conditions": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": ["blinded", "charmed", "deafened", "exhaustion", "frightened", "grappled", "incapacitated", "invisible", "paralyzed", "petrified", "poisoned", "prone", "restrained", "stunned", "unconscious"]
+                      }
+                    },
+                    "roundsRemaining": {
+                      "type": ["integer", "null"]
+                    },
+                    "repeatAtEndOfTurn": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["damageDice", "damageBonus", "damageType", "conditions"]
+                }
+              },
+              "required": ["ability", "dc", "halfOnSave", "onFail"]
+            },
+            "rider": {
+              "type": "object",
+              "properties": {
+                "ability": {
+                  "type": "string",
+                  "enum": ["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
+                },
+                "dc": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "halfOnSave": {
+                  "type": "boolean"
+                },
+                "onFail": {
+                  "type": "object",
+                  "properties": {
+                    "damageDice": {
+                      "type": "string"
+                    },
+                    "damageBonus": {
+                      "type": "integer"
+                    },
+                    "damageType": {
+                      "type": "string"
+                    },
+                    "conditions": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": ["blinded", "charmed", "deafened", "exhaustion", "frightened", "grappled", "incapacitated", "invisible", "paralyzed", "petrified", "poisoned", "prone", "restrained", "stunned", "unconscious"]
+                      }
+                    },
+                    "roundsRemaining": {
+                      "type": ["integer", "null"]
+                    },
+                    "repeatAtEndOfTurn": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["damageDice", "damageBonus", "damageType", "conditions"]
+                }
+              },
+              "required": ["ability", "dc", "halfOnSave", "onFail"]
+            },
+            "recharge": {
+              "type": "object",
+              "properties": {
+                "min": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 6
+                },
+                "max": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 6
+                }
+              },
+              "required": ["min", "max"]
             }
           },
           "required": [
@@ -173,6 +421,20 @@
             "damageBonus",
             "damageType"
           ]
+        }
+      },
+      "multiattackSequence": {
+        "type": "array",
+        "description": "Typed Multiattack: the swings one Attack action makes, in order. Each name is an executable entry in actions.",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "count": {"type": "integer", "minimum": 1}
+          },
+          "required": ["name", "count"],
+          "additionalProperties": false
         }
       },
       "legendaryActions": {

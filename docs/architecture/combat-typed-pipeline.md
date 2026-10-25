@@ -33,6 +33,8 @@ Development checks alone are not gameplay evidence.
 | HP, resources, conditions | Character JSON for player/NPC; encounter state for monsters | Staged absolute events apply under ordered leases; encounter receipt writes last |
 | Dice reserve | Encounter `preroll_cache` | Reserve before intent; consumption joins the staged receipt |
 | Player roll or clarification | `combatState.pendingTurn.playerExchanges` | Accepted input persists beside the same `turnId` |
+| Answer at a code-issued roll phase | the phase record `pendingTurn.weaponAttack` (`lead`, `card`, `cardId`, `prompt`) | `_advance_weapon_attack` only (#1118): blank, the D-KW-1 line, the tray sentence and bare numbers on the fast path; any other line read by T126 (`core/ai/roll_answer.py`); unfitting numbers and non-answers keep the phase open with T096's words-only `openRollReply` re-ask |
+| Game roll for a DM request | the answering exchange's `rolledBy: "game"` and `rolledFaces` | `mark_pending_game_roll` only (#1118): the D-KW-1 line, or T096's typed `playerRoll: {"gameRolls": true}` answer, after which T096 rules again with a "Game roll for the DM's request" record line |
 | Undelivered committed beat | `combatState.pendingDelivery` | Narration records after mechanics; durable display precedes acknowledgment |
 | Combat transcript | `modules/conversation_history/combat_conversation_history.json` | `_combatDeliveryId` marker persists before receipt clear |
 | Completion and rewards | `combatState.completion`, character XP, area summary, archive | Exit clock, XP, summary, archive, tracker clear, closed receipt |
@@ -78,7 +80,10 @@ immediately. In-combat `pendingTurn` remains initiative-owned and unchanged.
 2. On the voices branch, an actor-window T105 batch is collected before T096; main at this
    pin has no typed combat voice stage.
 3. T096 selects one ordered structured intent per claimed actor. Corrections reuse the same
-   turn claim.
+   turn claim. When the player asks the game to roll a DM-requested roll, T096 answers
+   `playerRoll: {"gameRolls": true}`; code rolls the typed dice once
+   (`mark_pending_game_roll`) and T096 rules again with the "Game roll for the DM's request"
+   record line (#1118).
 4. `resolve_claimed_window` validates and resolves mechanics without provider authority.
 5. Transaction code stages events and preimages, then applies character files and writes the
    encounter commit/cursor last.
@@ -110,7 +115,7 @@ immediately. In-combat `pendingTurn` remains initiative-owned and unchanged.
 2. Completion exits the combat effect clock and applies XP once.
 3. T041 builds the combat summary; area/history summary receipts are persisted.
 4. The deterministic transcript archive is written before active combat is cleared.
-5. `action_handler` emits the historical no-reapply record and `needs_post_combat_narration`.
+5. `action_handler` (normal flow) or the resumed-startup flow in `main.py` emits the historical no-reapply record via `combat_manager.render_combat_record_marker`, then runs the T091 location reconcile (`reconcile_location_state.run`) on the fight's "Combat Summary:" line so the location's `monsters[]` drops what the fight resolved; the normal flow then returns `needs_post_combat_narration`.
 6. Main rebuilds authoritative history and T067 handles the immediate post-combat beat.
 
 ## State and atomicity
@@ -127,21 +132,21 @@ immediately. In-combat `pendingTurn` remains initiative-owned and unchanged.
 
 ## Load-bearing seams
 
-1. `core/combat/scene.py:71` - exact-key scene reconciliation.
-2. `core/generators/combat_builder.py:570` - new typed encounter construction.
-3. `core/managers/combat_state.py:448` - conditional activation publication.
-4. `core/managers/combat_state.py:727` - durable turn claim.
-5. `core/managers/combat_state.py:855` - cursor advance and pending delivery.
-6. `core/managers/combat_state.py:924` - restart recovery classifier.
-7. `core/managers/combat_transaction.py:806` - staged events and preconditions.
-8. `core/managers/combat_transaction.py:1160` - lease-protected exact-once apply.
-9. `core/managers/combat_orchestrator.py:949` - typed turn coordinator.
-10. `core/managers/combat_manager.py:3615` - T043 resume/pending-receipt split.
-11. `core/managers/combat_manager.py:3840` - T044 opening; T040 follows in validation.
-12. `core/managers/combat_manager.py:4507` - manager-to-orchestrator entry.
-13. `core/managers/combat_manager.py:4652` - history-backed display and acknowledgment.
-14. `core/managers/combat_manager.py:2129` - completion, rewards, summary, archive, clear.
-15. `main.py:6195` - post-combat T067 handoff.
+1. `core/combat/scene.py:70` - exact-key scene reconciliation.
+2. `core/generators/combat_builder.py:620` - new typed encounter construction.
+3. `core/managers/combat_state.py:599` - conditional activation publication.
+4. `core/managers/combat_state.py:878` - durable turn claim.
+5. `core/managers/combat_state.py:1117` - cursor advance and pending delivery.
+6. `core/managers/combat_state.py:1200` - restart recovery classifier.
+7. `core/managers/combat_transaction.py:897` - staged events and preconditions.
+8. `core/managers/combat_transaction.py:1271` - lease-protected exact-once apply.
+9. `core/managers/combat_orchestrator.py:1348` - typed turn coordinator.
+10. `core/managers/combat_manager.py:4062` - T043 resume/pending-receipt split.
+11. `core/managers/combat_manager.py:4316` - T044 opening; T040 follows in validation.
+12. `core/managers/combat_manager.py:5140` - manager-to-orchestrator entry.
+13. `core/managers/combat_manager.py:5304` - history-backed display and acknowledgment.
+14. `core/managers/combat_manager.py:2358` - completion, rewards, summary, archive, clear.
+15. `main.py::process_ai_response` at `if isinstance(result, dict) and result.get("status") == "needs_post_combat_narration":` - post-combat T067 handoff.
 
 ## Invariants
 

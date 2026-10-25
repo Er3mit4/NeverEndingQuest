@@ -21,9 +21,9 @@ by the existing cache file lock; both release before post-Load memory repair.
 Save stages complete cache bytes outside the saved-game directory before atomic
 publication. Cache-only failure preserves canonical Save and reports omission.
 
-Seams: `updates/save_game_manager.py:494` (membership), `:992` (ownership),
-`:1119` (publication), `:1314` (restore), `:1444` and `:449` (absence);
-`web/shared_state.py:15` (same reentrant memory lock used by web writers).
+Seams: `updates/save_game_manager.py:517` (membership), `:1017` (ownership),
+`:1145` (publication), `:1341` (restore), `:1481` and `:470` (absence);
+`web/shared_state.py:16` (same reentrant memory lock used by web writers).
 Policy: #193 p9/p10, B1/B2, GL-1. Browser and native fault evidence remain scoped;
 this source map is not a full acceptance verdict.
 
@@ -48,9 +48,9 @@ buffer. Already admitted output is not retroactively revoked. Main's final
 common-tail history save retains the captured callback through compression and
 context refresh; ordinary turns keep a None callback and their existing behavior.
 
-Seams: `level_up_manager.py:78`, `updates/update_character_info.py:1324`,
-`utils/encoding_utils.py:200`, `main.py:6967`, `main.py:9540`, `main.py:9687`,
-`web/web_interface.py:632`, `core/headless/protocol.py:46`.
+Seams: `core/managers/level_up_manager.py:185`, `updates/update_character_info.py:1855`,
+`utils/encoding_utils.py:209`, `main.py::_main_game_loop` at `level_up_publication_guard = level_up_session.commit_guard`, `main.py::_main_game_loop` at the first `save_conversation_history(` given `commit_guard=level_up_publication_guard`, `main.py::_main_game_loop` at `save_conversation_history(conversation_history, commit_guard=level_up_publication_guard)`,
+`web/web_interface.py::_queue_safe_player_output`, `core/headless/protocol.py:46`.
 These are source contracts, not proof of live Load/Reset/Quit timing or #116
 display-replay acceptance. Native gates remain required under #193.
 
@@ -197,6 +197,39 @@ Startup/locking delta verified 2026-09-05 against the `fix/issue-114-startup-rep
   Startup's optional `commit_guard` checks supersession before a late replace.
   The #323 candidate adds the same optional replacement authority to sibling
   `safe_json_dump`; unguarded callers keep their existing behavior.
+- A read-only target never clears by waiting, so a save to one stops the
+  session (issue #654). The shared writers raise `ReadOnlySaveStop` and record
+  the stop. From then on every game-state save raises it at once and writes
+  nothing, as does every `_interruptible_wait` and every web or headless input
+  boundary. `main_game_loop` catches the stop and shows one system line naming
+  the file, and the session ends as a read-only start does. A stop that a
+  caller swallows ends the session at the top of the next loop turn.
+  - Under a recorded stop nothing more runs, whatever a caller catches.
+    `capture_and_fanout` raises the stop before any model call. Every
+    durable writer, remover and mover that bypasses the shared writers
+    (`_durable_*`, `_atomic_write_*`, `_write_mapping_unlocked`,
+    `generate_chat_history`, the encounter update) raises it before touching
+    a file. The terminal combat and level-up loops raise it before builtin
+    `input()`, which has no input boundary.
+  - A broad catch in play code lets `ReadOnlySaveStop` through, next to the
+    supersession errors it already lets through. A retry loop must not catch
+    it: under the stop every retry fails at once, and a loop with no
+    `_interruptible_wait` would spin.
+  - Under a stop no cleanup is written: a prepared module-completion intent,
+    an unreceipted startup kickoff or a departure-summary marker stays on disk
+    for the next start's recovery.
+  - Only an explicit keyword changes this. With `on_read_only="raise"` (the
+    start-path registry writers) the save returns False (`safe_write_json`)
+    or raises the plain error (`safe_json_dump`), and records nothing.
+    `on_read_only="fail"` (the web message cache, which is not game state)
+    does the same and keeps writing after a stop.
+  - Every `.bak` keeps a write bit.
+  - WinError 32 and other denials keep the wait.
+- A read-only `modules/conversation_history/conversation_history.json`
+  refuses the start instead. `_main_game_loop` checks it first, before any
+  start path writes it or calls a model, shows one system line, and returns.
+  Play reads that file back throughout every turn, so the game never runs
+  without saving it (issue #654).
 
 ## Deployment boundary
 
@@ -223,19 +256,19 @@ Live Load-during-calculation and full committed-level-up continuity remain unpro
 
 ## Load-bearing seams
 
-1. `utils/capture/live_provider_call.py:96-333` - live/welcome scope authority, promotion, queues, and quiescence.
+1. `utils/capture/live_provider_call.py:185-725` - live/welcome scope authority, promotion, queues, and quiescence.
 2. `utils/capture/live_provider_call.py` `call_live_provider` (generation loop; anchors moved by #284) - child polling, reaping, universal backstop envelope, and correlation gate.
-3. `main.py:298-378` - welcome ownership and generation-only worker.
-4. `main.py:392-530` - handback ordering, attempt/lease receipt, and reconciliation.
-5. `main.py:753-924` - input pump, teardown, welcome registration, and worker start.
-6. `main.py:8231-8258` - ordinary live scope opening.
-7. `main.py:8888-8904` - mutation boundary.
-8. `main.py:9122-9163` - superseded and normal turn terminals.
-9. `core/headless/session.py:379-693` - headless lifecycle commands (reset/quit at :379-466) and restart.
-10. `web/web_interface.py:2614-2959` - web input and Save/Load/Reset entrants.
-11. `updates/save_game_manager.py:147` and `updates/save_game_manager.py:232` - pending module context and essential startup history (startup candidate).
-12. `updates/save_game_manager.py:919` and `utils/file_operations.py:83` - restore rollback/absence semantics and guarded shared writer (startup candidate).
-13. `utils/reset_campaign.py:395-447` - reset backup-before-wipe ordering.
+3. `main.py::_WelcomeLifecycle` and `main.py::_welcome_worker_main` - welcome ownership and generation-only worker.
+4. `main.py::_finish_welcome` - handback ordering, attempt/lease receipt, and reconciliation.
+5. `main.py::service_welcome_lifecycle` - input pump, teardown, welcome registration, and worker start.
+6. `main.py::_main_game_loop` from `from utils.capture.live_provider_call import open_live_turn_scope` - ordinary live scope opening.
+7. `main.py::_main_game_loop` from `valid_response_received = True` - mutation boundary.
+8. `main.py::_main_game_loop` from the `if invocation_superseded:` that raises `InvocationSupersededError("The player turn was superseded")` - superseded and normal turn terminals.
+9. `core/headless/session.py:425-1032` - headless lifecycle commands (reset/quit at :483-539) and restart.
+10. `web/web_interface.py::handle_check_roll`, `::handle_user_input` and `::handle_action` - web input and Save/Load/Reset entrants.
+11. `updates/save_game_manager.py:175` and `updates/save_game_manager.py:497` - pending module context and essential startup history (startup candidate).
+12. `updates/save_game_manager.py:1465` and `utils/file_operations.py:106` - restore rollback/absence semantics and guarded shared writer (startup candidate).
+13. `utils/reset_campaign.py:507-547` - reset backup-before-wipe ordering.
 
 ## Invariants
 

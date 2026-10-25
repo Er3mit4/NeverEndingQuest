@@ -166,8 +166,9 @@ def _valid_ai_tracker(tracker_text, creatures, current_round):
 
     markers = {}
     for line, creature in zip(tracker_lines, sorted_creatures):
-        if "(player)" in line.lower() or "(npc)" in line.lower():
-            return False
+        # The line is matched whole against this creature's exact name and
+        # initiative, so a role tag beside the name ("Aldric (player) (5)")
+        # fails here; the state after " - " is the tracker's own words.
         name = creature.get("name", "Unknown")
         initiative = creature.get("initiative", 0)
         match = re.fullmatch(
@@ -307,6 +308,38 @@ def _valid_ai_tracker(tracker_text, creatures, current_round):
     return True
 
 
+def tracker_current_turn_names(tracker_text, creatures):
+    """The names of the creatures a tracker points at with [>].
+
+    Each "- [m] Name (initiative) - ..." line is matched whole against its own
+    creature, in initiative order, the way _valid_ai_tracker reads it, so a
+    name is never found inside another name ("Kira" is not "Kiran"). Lines
+    that do not line up with the creatures give [] (no current turn).
+    """
+    if not isinstance(tracker_text, str):
+        return []
+    start = tracker_text.find("**Live Initiative Tracker:**")
+    if start < 0:
+        return []
+    lines = [line.strip() for line in tracker_text[start:].splitlines() if line.strip().startswith("- [")]
+    ordered = sorted(creatures or [], key=lambda creature: creature.get("initiative", 0), reverse=True)
+    if len(lines) != len(ordered):
+        return []
+    names = []
+    for line, creature in zip(lines, ordered):
+        name = creature.get("name", "Unknown")
+        match = re.fullmatch(
+            rf"- \[(X|>| |D)\] (?:\*\*)?{re.escape(name)} "
+            rf"\({re.escape(str(creature.get('initiative', 0)))}\)(?:\*\*)? - .+",
+            line,
+        )
+        if not match:
+            return []
+        if match.group(1) == ">":
+            names.append(name)
+    return names
+
+
 def extract_recent_combat_messages(conversation, current_round):
     """Extract messages relevant to the current and previous round."""
     # Filter out system messages
@@ -320,15 +353,10 @@ def extract_recent_combat_messages(conversation, current_round):
             
         content = msg["content"]
         
-        # Look for round markers in user messages (combat state)
-        if msg["role"] == "user" and "Round:" in content:
-            match = re.search(r"Round:\s*(\d+)", content)
-            if match:
-                round_num = int(match.group(1))
-                round_markers.append({"index": i, "round": round_num})
-        
-        # Look for round markers in assistant messages
-        elif msg["role"] == "assistant":
+        # Round markers come from the DM's own combat_round field. User
+        # messages carry none the game writes ("Round: N" there could only
+        # be the player's words).
+        if msg["role"] == "assistant":
             json_match = re.search(r'"combat_round"\s*:\s*(\d+)', content)
             if json_match:
                 round_num = int(json_match.group(1))

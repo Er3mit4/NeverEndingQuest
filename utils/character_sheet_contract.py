@@ -539,8 +539,83 @@ def repair_and_persist_character(
     # Run repair (runtime mode - comprehensive repairs for game execution)
     repaired_data, raw_changes = normalize_for_runtime(character_data, character_type=character_type)
 
+    # Old saves may mark a shield and multiple weapons ready at once. Resolve
+    # that legacy ambiguity once, with a receipt, before engine validation.
+    from core.nql.legacy_loadout import migrate as migrate_legacy_loadout
+    raw_changes = list(raw_changes) + migrate_legacy_loadout(repaired_data)
+
+    # #1442: a live effect saved before its spell's typed rule (a Mage Armor cast
+    # before #1421, modifiers []) takes the rule once, with a receipt; the engine
+    # then derives the armor class. Fail forward: the rule is kept when the
+    # engine is unavailable, and the next projection derives it.
+    rule_lines = []
+    try:
+        from core.effects.clock import scalar_from_calendar
+        from core.nql import armor_class
+        from core.nql.legacy_effect_rules import migrate as migrate_effect_rules
+        party = safe_read_json("party_tracker.json")
+        try:
+            now_tick = scalar_from_calendar(party.get("worldConditions") or {}) if isinstance(party, dict) else None
+        except (TypeError, ValueError):
+            now_tick = None
+        rule_changes, rule_gaps = migrate_effect_rules(repaired_data, now_tick)
+        for gap in rule_gaps:
+            warning(f"REPAIR: {gap}", category="character_repair")
+            rule_lines.append(f"[SYSTEM] {gap}.")
+        if rule_changes:
+            raw_changes = list(raw_changes) + rule_changes
+        # A receipt for a gap (#1446) writes no rule, so the armor class is left as it was.
+        if any(change.split("=", 1)[0].endswith(".modifiers") for change in rule_changes):
+            projection = armor_class.project(repaired_data)
+            if projection.applied:
+                repaired_data = projection.sheet
+            else:
+                warning(f"REPAIR: armor class not re-derived for {character_file_path}: {projection.reason}",
+                        category="character_repair")
+    except Exception as exc:  # the repair pass never blocks a game from loading
+        warning(f"REPAIR: legacy effect rules not checked for {character_file_path}: {exc}", category="character_repair")
+
+    try:
+        from core.leveling.creation_picks import recover_feat_spell_bindings
+        if recover_feat_spell_bindings(repaired_data, character_file_path):
+            raw_changes.append("feat_spell_bindings=recovered")
+    except Exception as exc:  # an absent/unavailable archive never blocks loading
+        warning(f"REPAIR: feat spell bindings not checked for {character_file_path}: {exc}", category="character_repair")
+
+    # A class order's typed grants (Divine Order: Protector, Primal Order: Warden)
+    # on a hero saved before character creation wrote them (#888). Taken only when
+    # the engine reads something new, and said in one line once the sheet is saved.
+    order_lines = []
+    try:
+        from core.leveling import choices as srd_choices
+        granted = copy.deepcopy(repaired_data)
+        order_added = [entry for entry in srd_choices.apply_order_grants(granted) if entry["added"]]
+    except Exception as exc:  # the repair pass never blocks a game from loading
+        order_added = []
+        warning(f"REPAIR: class order grants not checked for {character_file_path}: {exc}", category="character_repair")
+    if order_added:
+        repaired_data = granted
+        raw_changes = raw_changes + ["order_grants=" + ",".join(entry["feature"] for entry in order_added)]
+        hero = repaired_data.get("name") or os.path.basename(character_file_path)
+        order_lines = [f"[SYSTEM] {hero}'s sheet now records what the {entry['option']} {entry['choice']} grants: "
+                       f"{entry['printed']} (SRD 5.2.1)." for entry in order_added]
+
     # Extract field names from changes (e.g., "ammunition=default_list" -> "ammunition")
     changes = [change.split("=", 1)[0] for change in raw_changes]
+
+    # The engine's totals at load (X1a): proficiency, skills, saves, roll modes, the XP the next
+    # level needs and the level-ups already earned, so the first DM note is right before any
+    # action touches the engine. Fail forward: an unavailable engine leaves the sheet as repaired.
+    try:
+        from core.nql import stats as nql_stats
+        problem = nql_stats.refresh(repaired_data)
+    except Exception as exc:  # the repair pass never blocks a game from loading
+        problem = str(exc)
+    if problem:
+        warning(f"REPAIR: engine totals not refreshed for {character_file_path}: {problem}", category="character_repair")
+    elif repaired_data != character_data:
+        raw_changes = list(raw_changes) + ["engine_totals=refreshed"]
+        changes = changes + ["engine_totals"]
 
     # Only persist if there were actual changes
     if changes:
@@ -555,5 +630,9 @@ def repair_and_persist_character(
                 f"REPAIR: Persisted {len(changes)} fixes to {character_file_path}: {', '.join(raw_changes)}",
                 category="character_repair",
             )
+            for line in order_lines:
+                print(line)
+    for line in rule_lines:
+        print(line)
 
     return repaired_data, changes

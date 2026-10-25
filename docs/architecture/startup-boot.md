@@ -27,8 +27,9 @@ No model, lifecycle, schema or saved-state contract changes.
 
 ## #336 cancellation delta (2026-09-09; owner accepted A7 test gap)
 
-Intentional wizard input cancellation (EOF, Ctrl-C, or the existing interview
-quit/exit/cancel command) propagates as process-local StartupCancelled. The shared
+Intentional wizard input cancellation (EOF, Ctrl-C, or the interview's typed
+pause_setup decision, reviewed like any proposal; keyword item 4 of #855 retired
+the quit/exit/cancel words) propagates as process-local StartupCancelled. The shared
 runner owns one neutral pause acknowledgment. Both main entry points and the
 standalone wizard catch it without printing failure or starting incomplete play.
 Real False results, readiness checks and LiveProviderSuperseded remain distinct.
@@ -48,7 +49,7 @@ Recovered records receive once-persisted UUIDs and an explicit partial-transcrip
 notice. Empty existing cache is not missing cache. Source conversations remain
 untouched; native transient publication retries retain the candidate and IDs.
 There is no new provider call, startup authority, schema or gameplay decision.
-Seams: `web/web_interface.py:378`, `:436`, `:479`, `:3503`.
+Seams: `web/web_interface.py::_saved_narration_messages`, `::_publish_recovered_cache`, `::load_message_cache`, `::handle_start_game`.
 Policy: #193 p8-p12 and D-NPC-PARTY-3 history isolation. Full browser matrix remains
 an execution gate, not a claim made by this schematic.
 
@@ -106,6 +107,7 @@ Other historical anchors are not recertified by this note.
 | Available adventures | Public module directories and files on disk | Read-only module scan |
 | Wizard dialogue and resume phase | `modules/conversation_history/startup_conversation.json` | Accepted author response and code-authored v1 checkpoint; rejected proposals remain correction context |
 | Character sheet | Unified canonical character path, with legacy module identity discovery | New conversational builds receive schema/semantic review; existing sheets retain values; supplied headless seeds use their existing repair/validation path. Guarded write/read-back publishes the sheet |
+| Starting gold and gear | T092's typed `origin` and `starting_equipment` picks (checked by T124); packages, coins and uncatalogued items from `data/srd/choices.json` and `data/srd_character_origins.json`; the balance, item ids and rows from the engine | `_prepare_startup_proposal` sets the authored purse and gear aside and makes one engine grant (`startup_rows.grant_starting_packages`); a busy engine is waited for, and an engine that cannot run saves the character without gear and tells the player (D-PKG-1, D-PKG-5). Headless seeds keep their own gear |
 | Initial location | T093 proposal resolved against selected module's actual areas/locations | Validated IDs and canonical names precede whole tracker projection; no invented fallback |
 | Current game context | Tracker, module, location, plot, roster, and history files | Reloaded after recovery and used to rebuild conversation context |
 | Welcome identity | `startup_state.json` attempt ID, status, and lease owner | Lock-protected claim/processing/done transition |
@@ -126,7 +128,7 @@ Other historical anchors are not recertified by this note.
 9. On raw terminal, welcome generation and applicable shared review run synchronously before existing lease/processing checks, game-thread apply, and completion receipt. Startup supplies no current player input; synthetic notes are not consent.
 10. The loop emits `startup_loop_ready`, refreshes state/effects, loads player statistics, and requests input. Queue-backed input can therefore be reachable while welcome generation is still active.
 11. If the player submits first, the game thread supersedes and reaps the welcome, then discards or hands it back before processing player text.
-12. T092 authors a typed interview/finalize response. A separate T092 review judges player intent, complete-build approval, and truthful narration; code checks shape and the latest actual player-message reference. Only accepted responses enter durable history.
+12. T092 authors a typed interview/finalize response. A separate T124 review (split from T092 by #682, its own model binding) judges player intent, complete-build approval, and truthful narration; code checks shape and the latest actual player-message reference. Only accepted responses enter durable history. A finalize also carries the typed `origin` (class and background keys) and `starting_equipment` (package keys, slot picks, what is worn or held). Code writes the display class and background from the keys and the starting gold and gear from one engine grant of the chosen packages (D-KW-16); the engine's attack rows and armor class follow.
 13. Finalization checkpoints `approved`, writes and reads back the sheet, checkpoints `character_saved`, resolves T093 against installed module data, writes/reads the tracker, then checkpoints `ready`. The caller verifies readiness before archiving the interview or announcing success.
 14. Headless installs its shims before starting the engine thread and converts startup markers, output, and prompts into NDJSON events.
 15. Module choices come from the public installed catalog, never fixed adventure names. If a selected module disappears, choosing its replacement retains approved character identity, clears the former location, and re-enters the shared commit/read-back path.
@@ -159,21 +161,22 @@ Other historical anchors are not recertified by this note.
 
 ## Load-bearing seams
 
-1. `main.py:9172-9295` - terminal wrapper and shared-loop handoff.
-2. `main.py:7007-7057` - shared hydration, memory check, and startup attempt.
-3. `utils/startup_wizard.py:174` - orchestration, checkpoint/interview resume, and verified handoff.
-4. `utils/startup_wizard.py:392` and `:460` - isolated menu requests, dynamic module choice and missing-module continuity.
-5. `utils/startup_wizard.py:714` - independent semantic review, followed by the author/review interview loop.
-6. `utils/startup_wizard.py:1654` - approved-build commit and per-file read-back.
-7. `utils/startup_contract.py:1` and `utils/startup_prompt_builder.py:19` - narrow response/checkpoint contract and agent instructions.
-8. `utils/startup_handoff_state.py:112-159` - handoff-state loading and wizard status.
-9. `utils/startup_handoff_state.py:212-350` - welcome claim and completion lifecycle.
-10. `main.py:7135-7294` - module, effects, and travel recovery before context.
-11. `main.py:7305-7370` - active-combat startup branch.
-12. `main.py:7481-7584` - authoritative context build and no-compression save.
-13. `main.py:362` and `main.py:9524` - detached generation and applicable shared membership review.
-14. `main.py:443`, `main.py:702` and `main.py:6756` - welcome acceptance, owner currentness checks and shared stale resolver.
-15. `main.py:7586-7758` - surface split, readiness marker, and first input.
+1. `main.py::main` - terminal wrapper and shared-loop handoff.
+2. `main.py::_main_game_loop` - shared hydration, memory check, and startup attempt.
+3. `utils/startup_wizard.py:182` - orchestration, checkpoint/interview resume, and verified handoff.
+4. `utils/startup_wizard.py:400` and `:468` - isolated menu requests, dynamic module choice and missing-module continuity.
+5. `utils/startup_wizard.py:748` - independent semantic review, followed by the author/review interview loop.
+6. `utils/startup_wizard.py:1972` - approved-build commit and per-file read-back.
+7. `utils/startup_contract.py:1` and `utils/startup_prompt_builder.py:96` - narrow response/checkpoint contract and agent instructions.
+8. `utils/startup_handoff_state.py:114-161` - handoff-state loading and wizard status.
+9. `utils/startup_handoff_state.py:214-356` - welcome claim and completion lifecycle.
+10. `main.py::_main_game_loop` from `travel_was_recovered = False` - module, effects, and travel recovery before context.
+11. `main.py::_main_game_loop` from `if party_tracker_data and party_tracker_data["worldConditions"].get("activeCombatEncounter"):` - active-combat startup branch.
+12. `main.py::_main_game_loop` from `# Normal game loop (when not resuming from combat)` - authoritative context build and no-compression save.
+13. `main.py::_welcome_worker_main` and `main.py::_review_fresh_membership_candidate` - detached generation and applicable shared membership review.
+14. `main.py::_apply_welcome`, `main.py::recovery_authority_current` and `main.py::resolve_retryable_ai_result` - welcome acceptance, owner currentness checks and shared stale resolver.
+15. `main.py::_main_game_loop` from `# #214 D-214-1=B: on the queue-backed input surfaces (web + headless` - surface split, readiness marker, and first input.
+16. `utils/startup_wizard.py::_prepare_startup_proposal -> core/nql/startup_rows.py::grant_starting_packages` - typed starting packages, the engine grant, and the creation-time engine fault rule (`_startup_engine_fault`).
 
 ## Invariants
 
@@ -188,3 +191,18 @@ Other historical anchors are not recertified by this note.
 - Wizard and new-game behavior: #114, #115, #170, #232, #234, #235, and #257.
 - Welcome and UI handoff: #214, #221, and #248.
 - Legacy/startup reconciliation: #158, #199, and #238.
+
+## #1323 typed feat spell payment (D-1323-1 candidate)
+
+Creation keeps the origin feat's chosen leveled spell in optional grantedSpells
+entries (spell key and resource name). Runtime sheet repair recovers a missing
+binding only from the creation archive paired to this sheet path and startup id.
+No matching archive leaves an older save playable without guessing a binding.
+Both shared DM/validator sheet views carry the complete binding.
+
+A spell's updateCharacterInfo parameters may carry castingResource (feature with
+featureName, or slot with integer level). Both ordinary and staged effects updates
+pass it into atomic character preparation. Code replaces updater payment deltas
+with exactly one chosen engine delta; the existing resource engine checks the
+pool and owns its result. T079 still supplies the spell effect. No schema file or
+engine binary change. Live acceptance is recorded separately with the draft PR.

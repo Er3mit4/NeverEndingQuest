@@ -66,8 +66,20 @@ def extract_npcs_from_area(area_data: dict) -> Dict[str, Set[str]]:
     return npcs_by_location
 
 def scan_module_areas(module_name: str) -> Dict[str, Set[str]]:
-    """Scan all area files in a module for NPCs."""
+    """The people at each place of a module: the engine's view (P4-f); the
+    area files are scanned only while the view is unavailable."""
     all_npcs = {}
+    try:
+        from core.nql import occupants as _occupants
+        roster = _occupants.module_roster(module_name)
+    except Exception:
+        roster = None
+    if roster is not None:
+        for location_id, here in roster.items():
+            names = {n.split("(")[0].strip().replace(",", "") for n in here.get("people") or [] if n}
+            if names:
+                all_npcs[location_id] = names
+        return all_npcs
     module_path = Path(f"modules/{module_name}")
     areas_path = module_path / "areas"
     
@@ -120,7 +132,23 @@ def scan_all_modules() -> Dict[str, Dict[str, Set[str]]]:
     
     return all_modules
 
-def build_npc_validation_context(current_module: str, current_location: str, party_npcs: List[str] = None) -> str:
+def current_location_npc_lines(current_module: str, current_location: str) -> str:
+    """@CURRENT_LOC from the authored lists (or the engine roster when it answers),
+    for the one case the canonical origin record is unavailable (C2 F2): the
+    validator must still know who may be here."""
+    all_modules = scan_all_modules()
+    module_key = str(current_module or "").replace(" ", "_")
+    names = set()
+    for key in (current_module, module_key):
+        if key in all_modules and current_location in all_modules[key]:
+            names |= set(all_modules[key][current_location])
+    return (f"@NPC_VALIDATION_DATA (origin record unavailable this turn)\n"
+            f"@CURRENT_LOC[{current_location}]: {','.join(sorted(names)) if names else 'NONE'}\n"
+            f"@RULES: Any listed NPC is VALID here; the party's NPCs travel with the party.")
+
+
+def build_npc_validation_context(current_module: str, current_location: str, party_npcs: List[str] = None,
+                                 party_span: str = "", orphan_sentence: str = "") -> str:
     """
     Build compressed NPC context for validation.
     
@@ -128,6 +156,8 @@ def build_npc_validation_context(current_module: str, current_location: str, par
         current_module: Name of the current module
         current_location: Current location ID
         party_npcs: List of NPCs in the party
+        party_span: The DM note's party line ("Party NPCs: ...", with ids and [slot] numbers)
+        orphan_sentence: The DM note's list of joined people with no party id ("" when none)
     
     Returns:
         Compressed machine-readable context string
@@ -139,24 +169,18 @@ def build_npc_validation_context(current_module: str, current_location: str, par
     lines = []
     lines.append("@NPC_VALIDATION_DATA")
     
-    # NPCs at current location
-    current_loc_npcs = []
-    if current_module in all_modules and current_location in all_modules[current_module]:
-        current_loc_npcs = sorted(all_modules[current_module][current_location])
-    lines.append(f"@CURRENT_LOC[{current_location}]: {','.join(current_loc_npcs) if current_loc_npcs else 'NONE'}")
-    
-    # NPCs in current module
+    # C2: NPCs at the current location are told once, by the canonical location
+    # records (the rules engine's occupants); party NPCs by the character records.
+
+    # NPCs elsewhere in the current module (C2: the ones at the current
+    # location are told once, by the canonical location record's occupants)
     module_npcs = set()
     if current_module in all_modules:
-        for loc_npcs in all_modules[current_module].values():
-            module_npcs.update(loc_npcs)
-    lines.append(f"@CURRENT_MODULE[{current_module}]: {','.join(sorted(module_npcs)[:50]) if module_npcs else 'NONE'}")
-    
-    # Party NPCs
-    if party_npcs:
-        lines.append(f"@PARTY_NPCS: {','.join(party_npcs)}")
-    else:
-        lines.append("@PARTY_NPCS: NONE")
+        for loc_id, loc_npcs in all_modules[current_module].items():
+            if loc_id != current_location:
+                module_npcs.update(loc_npcs)
+        module_npcs -= set(all_modules[current_module].get(current_location) or [])
+    lines.append(f"@CURRENT_MODULE_ELSEWHERE[{current_module}]: {','.join(sorted(module_npcs)[:50]) if module_npcs else 'NONE'}")
     
     # All NPCs from other modules (compressed list)
     other_npcs = set()
@@ -176,6 +200,10 @@ def build_npc_validation_context(current_module: str, current_location: str, par
             total_npcs.update(loc_npcs)
     lines.append(f"@TOTAL_NPC_COUNT: {len(total_npcs)}")
     
+    # The party line exactly as the DM note shows it
+    if party_span or orphan_sentence:
+        lines.append(f"@PARTY: {party_span}{orphan_sentence}")
+
     # Compressed validation rules
     lines.append("@RULES: Any listed NPC is VALID. NPCs can appear as ghosts/spirits/memories. Do NOT flag missing physical presence as error.")
     

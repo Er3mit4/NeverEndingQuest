@@ -252,23 +252,6 @@ CHAR_UPDATE_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 # LM Studio (local passthrough)
 CHAR_UPDATE_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
-# --- T017 Combat Compression Model Configs (from synthetic testing v5 prompt) ---
-# CRITICAL: This callsite outputs plain text tags (@T=CS/v2), NOT JSON.
-# response_format=None opts out of default JSON mode.
-# Temperature is 0.3 at callsite.
-
-# OpenAI (mini model with low reasoning -- 5/6 correct, entry 4 @ROUND cosmetic only)
-COMBAT_COMPRESS_GPT5MINI_LOW = {"model": "gpt-5-mini", "reasoning_effort": "low", "response_format": None}
-
-# Gemini (3-flash with low thinking -- stable 6/6, 2.0s avg, fastest)
-COMBAT_COMPRESS_GEMINI_FLASH_LOW = {"model": "gemini-3-flash-preview", "thinking_level": "low", "response_format": None}
-
-# Legacy (no extra params)
-COMBAT_COMPRESS_LEGACY = {"model": "gpt-4.1-mini-2025-04-14", "response_format": None}
-
-# LM Studio (local passthrough)
-COMBAT_COMPRESS_LMSTUDIO = {"model": "local-model", "response_format": None, "reasoning_effort": "none"}
-
 # ----- T096/T097 Agentic Combat -----
 # T096 selects one ordered tactical intent per persisted actor window. T097
 # narrates already-committed events. Both avoid reasoning-heavy variants: code
@@ -286,6 +269,19 @@ _AGENTIC_COMBAT_INTENT_SCHEMA = {
                     "mode": {"type": "string", "enum": ["known", "adjudicated"]},
                     "action": {"type": "string"},
                     "ability": {"type": "string"},
+                    "featureName": {"type": "string"},
+                    "bonusAction": {
+                        "type": "object",
+                        "properties": {
+                            "featureName": {"type": "string"},
+                            "option": {"type": "string", "enum": ["dash", "disengage", "hide"]},
+                            "ability": {"type": "string"},
+                            "targetId": {"type": "string"},
+                            "targets": {"type": "array", "items": {"type": "object"}},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["featureName"],
+                    },
                     "targetId": {"type": "string"},
                     "description": {"type": "string"},
                     "save": {"type": "object"},
@@ -293,6 +289,7 @@ _AGENTIC_COMBAT_INTENT_SCHEMA = {
                     "resources": {"type": "array", "items": {"type": "object"}},
                     "effects": {"type": "array", "items": {"type": "object"}},
                     "requiresPlayerInput": {"type": "object"},
+                    "playerRoll": {"type": "object"},
                 },
                 "required": ["actorId", "mode"],
             },
@@ -460,9 +457,8 @@ COMBAT_VALID_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 CHAR_VALIDATOR_GPT52_NONE = {"model": "gpt-5.2", "reasoning_effort": "none"}
 
 # Gemini (3-flash with low thinking -- 3/3 correct, 4.0s avg, fastest + cheapest)
-# T051, T052, and T053 have different parsers and therefore need different
-# structured-output contracts. Sharing T053's combined shape with the two
-# single-purpose validators produces valid JSON that their parsers ignore.
+# T051 and T052 have different parsers and therefore need different
+# structured-output contracts.
 _T051_AC_VALIDATION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -475,6 +471,7 @@ _T051_AC_VALIDATION_SCHEMA = {
                     "items": {
                         "type": "object",
                         "properties": {
+                            "row": {"type": "integer"},
                             "item_name": {"type": "string"},
                             "item_type": {"type": "string"},
                             "equipped": {"type": "boolean"},
@@ -493,9 +490,10 @@ _T051_AC_VALIDATION_SCHEMA = {
             "type": "object",
             "properties": {
                 "base_armor": {"type": "string"},
-                "dex_modifier": {"type": "string"},
-                "shield_bonus": {"type": "string"},
-                "fighting_style_bonus": {"type": "string"},
+                "base_ac": {"type": "integer"},
+                "dex_modifier": {"type": "integer"},
+                "shield_bonus": {"type": "integer"},
+                "fighting_style_bonus": {"type": "integer"},
                 "total_ac": {"type": "integer"},
             },
         },
@@ -511,7 +509,7 @@ _T052_INVENTORY_VALIDATION_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "item_name": {"type": "string"},
+                    "row": {"type": "integer"},
                     "item_type": {"type": "string"},
                 },
             },
@@ -519,114 +517,23 @@ _T052_INVENTORY_VALIDATION_SCHEMA = {
     },
 }
 
-_T053_COMBINED_VALIDATION_SCHEMA = {
+_T054_AMMUNITION_CONSOLIDATION_SCHEMA = {
     "type": "object",
     "properties": {
-        "ac_validation": {
-            "type": "object",
-            "properties": {
-                "current_ac": {"type": "integer"},
-                "calculated_ac": {"type": "integer"},
-                "correction_needed": {"type": "boolean"},
-                "breakdown": {"type": "string"},
-                "corrections": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-        "inventory_corrections": {
-            "type": "object",
-            "properties": {
-                "corrections_made": {"type": "array", "items": {"type": "string"}},
-                "equipment": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "item_name": {"type": "string"},
-                            "item_type": {"type": "string"},
-                        },
-                    },
-                },
-            },
-        },
-        "currency_consolidation": {
-            "type": "object",
-            "properties": {
-                "corrections_made": {"type": "array", "items": {"type": "string"}},
-                "currency": {
-                    "type": "object",
-                    "properties": {
-                        "platinum": {"type": "integer"},
-                        "gold": {"type": "integer"},
-                        "electrum": {"type": "integer"},
-                        "silver": {"type": "integer"},
-                        "copper": {"type": "integer"},
-                    },
-                },
-                "items_to_remove": {"type": "array", "items": {"type": "string"}},
-                "ammunition": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "quantity": {"type": "integer"},
-                        },
-                    },
-                },
-                "ammo_items_to_remove": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-        "class_feature_validation": {
-            "type": "object",
-            "properties": {
-                "duplicates_found": {"type": "array", "items": {"type": "string"}},
-                "corrections_made": {"type": "array", "items": {"type": "string"}},
-                "features_to_remove": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-    },
-}
-
-_T054_CURRENCY_CONSOLIDATION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "currency": {
-            "type": "object",
-            "properties": {
-                "platinum": {"type": "integer"},
-                "gold": {"type": "integer"},
-                "electrum": {"type": "integer"},
-                "silver": {"type": "integer"},
-                "copper": {"type": "integer"},
-            },
-        },
-        "ammunition": {
+        "rows": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
-                    "quantity": {"type": "integer"},
+                    "row": {"type": "integer"},
+                    "action": {"type": "string", "enum": ["merge", "duplicate", "keep"]},
+                    "ammunition": {"type": "string"},
                 },
+                "required": ["row", "action"],
             },
-        },
-        "equipment": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "item_name": {"type": "string"},
-                    "new_item_name": {"type": "string"},
-                    "_remove": {"type": "boolean"},
-                    "_update": {"type": "boolean"},
-                },
-            },
-        },
-        "consolidations_made": {
-            "type": "array",
-            "items": {"type": "string"},
         },
     },
+    "required": ["rows"],
 }
 CHAR_VALIDATOR_T051_GEMINI_FLASH_LOW = {
     "model": "gemini-3-flash-preview",
@@ -638,16 +545,11 @@ CHAR_VALIDATOR_T052_GEMINI_FLASH_LOW = {
     "thinking_level": "low",
     "response_schema": convert_to_gemini_schema(_T052_INVENTORY_VALIDATION_SCHEMA),
 }
-CHAR_VALIDATOR_T053_GEMINI_FLASH_LOW = {
-    "model": "gemini-3-flash-preview",
-    "thinking_level": "low",
-    "response_schema": convert_to_gemini_schema(_T053_COMBINED_VALIDATION_SCHEMA),
-}
 CHAR_VALIDATOR_T054_GEMINI_FLASH_LOW = {
     "model": "gemini-3-flash-preview",
     "thinking_level": "low",
     "response_schema": convert_to_gemini_schema(
-        _T054_CURRENCY_CONSOLIDATION_SCHEMA
+        _T054_AMMUNITION_CONSOLIDATION_SCHEMA
     ),
 }
 
@@ -657,7 +559,7 @@ CHAR_VALIDATOR_LEGACY = {"model": "gpt-4.1-2025-04-14"}
 # LM Studio (local passthrough)
 CHAR_VALIDATOR_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
-# ----- T050 Effects Gemini Config -----
+# ----- Validator Gemini config without a response schema (T125) -----
 # T054 has a dedicated schema-bearing config above.
 CHAR_VALIDATOR_GEMINI_FLASH_LOW = {"model": "gemini-3-flash-preview", "thinking_level": "low"}
 
@@ -727,15 +629,6 @@ ENCOUNTER_UPD_GEMINI_FLASH_LOW = {"model": "gemini-3-flash-preview", "thinking_l
 ENCOUNTER_UPD_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 ENCOUNTER_UPD_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
-# ----- T077 Plot Update -----
-# Updates plot progression after game events.
-# Mini-tier callsite, temperature=0.7, JSON output.
-# GPT-5.4 reviewer: all models 2/2 pass. gpt-5.2|none = 5.0/5 avg.
-PLOT_UPD_GPT52_NONE = {"model": "gpt-5.2", "reasoning_effort": "none"}
-PLOT_UPD_GEMINI_FLASH_LOW = {"model": "gemini-3-flash-preview", "thinking_level": "low"}
-PLOT_UPD_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
-PLOT_UPD_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
-
 # ----- T021 Transition Validation -----
 # Validates location transitions (path blocking, encounter checks).
 # Mini-tier callsite, temperature from TRANSITION_VALIDATOR_TEMPERATURE (0.3), JSON output.
@@ -745,57 +638,19 @@ TRANSITION_VAL_GEMINI_FLASH_LOW = {"model": "gemini-3-flash-preview", "thinking_
 TRANSITION_VAL_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 TRANSITION_VAL_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
-# ----- T048 Level Up Validation -----
-# Validates AI-generated level-up actions against 5e rules.
-# Full-tier callsite, temperature=0.2, JSON output.
-# 8/8 perfect on expanded synthetic tests (v4 prompt + leveling_info.txt).
-# Uses gemini-3-PRO (not flash -- flash missed Barbarian wrong-die edge case)
-LEVELUP_VAL_GPT52_NONE = {"model": "gpt-5.2", "reasoning_effort": "none"}
-LEVELUP_VAL_GEMINI_PRO_LOW = {"model": "gemini-3.1-pro-preview", "thinking_level": "low"}
-LEVELUP_VAL_LEGACY = {"model": "gpt-4.1-2025-04-14"}
-LEVELUP_VAL_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
-
-# --- T047: Level-Up Conversation (interactive interview, temp=0.7) ---
-# v3 prompt tested: 100% pass rate across 24 synthetic tests (8 scenarios x 3 models).
-# gpt-5.2|none: 3.6s avg, best narrative. gemini-flash|low: 1.9s avg, best HP math.
-# gpt-5-mini DISQUALIFIED (no temperature support, interview needs temp=0.7).
+# --- Level-up conversation configs (T121 table-driven session, T086 NPC auto-level) ---
 LEVELUP_CONV_GPT52_NONE = {"model": "gpt-5.2", "reasoning_effort": "none"}
 LEVELUP_CONV_GEMINI_FLASH_LOW = {"model": "gemini-3-flash-preview", "thinking_level": "low"}
 LEVELUP_CONV_LEGACY = {"model": "gpt-4.1-2025-04-14"}
 LEVELUP_CONV_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
 # --- T086: NPC Auto-Level-Up (single-shot JSON, temp=0.3) ---
-# Same model selections as T047 -- simpler task, all models pass easily.
+# The level-up conversation configs; a single-shot task, all models pass easily.
 # Uses same LEVELUP_CONV configs (no separate dicts needed -- same models work).
 
-# --- T014/T091: NPC Info Updates (movement decisions + monster reconciliation) ---
-# 40/40 synthetic tests passed. Mini-tier callsite (NPC_INFO_UPDATE_MODEL).
-# T014: NPC movement decision, temp=0.7, JSON object output.
-# T091: Monster reconciliation, temp=0.2, JSON ARRAY output (response_format=None).
-NPC_INFO_GPT54MINI_NONE = {"model": "gpt-5.4-mini", "reasoning_effort": "none"}
-NPC_INFO_GEMINI_FLASH_LOW = {"model": "gemini-3-flash-preview", "thinking_level": "low"}
-NPC_INFO_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
-
-# T014 (NPC movement decision) needs its OWN Gemini config with response_schema.
-# It must NOT reuse NPC_INFO_GEMINI_FLASH_LOW above: that config is shared with
-# T091 (utils/reconcile_location_state.py), which outputs a top-level JSON ARRAY --
-# attaching this object schema there would corrupt T091's monster reconciliation.
-_T014_NPC_MOVEMENT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "action": {"type": "string"},
-        "reasoning": {"type": "string"},
-        "newDescription": {"type": "string"},
-        "newAttitude": {"type": "string"},
-        "newLocation": {"type": "string"},
-        "locationUpdate": {"type": "string"},
-    },
-}
-NPC_MOVEMENT_T014_GEMINI_FLASH_LOW = {"model": "gemini-3-flash-preview", "thinking_level": "low", "response_schema": convert_to_gemini_schema(_T014_NPC_MOVEMENT_SCHEMA)}
-NPC_INFO_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
-
-# T091 uses response_format=None at the callsite (JSON array output, not object).
-# T014 uses default JSON mode (JSON object output).
+# (T014, the background NPC movement decision, and T091, the location monster
+# reconciliation, were retired in P4-e/P4-f: the rules engine's occupant
+# record is the roster, written by typed combat-end and DM actions.)
 
 # --- T041: Combat Dialogue Summary (narrative summary of combat encounters) ---
 # 10/10 on v2 prompt (5 scenarios x 2 models). Mini-tier (COMBAT_DIALOGUE_SUMMARY_MODEL).
@@ -806,12 +661,11 @@ COMBAT_SUMMARY_GEMINI_FLASH_LOW = {"model": "gemini-3-flash-preview", "thinking_
 COMBAT_SUMMARY_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 COMBAT_SUMMARY_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
-# --- T030/T032/T033/T038/T066: DM Summarization (parsing, narration, safety, summaries) ---
+# --- T030/T032/T033/T038: DM Summarization (parsing, narration, safety, summaries) ---
 # 24/24 synthetic tests passed. Mini-tier (DM_SUMMARIZATION_MODEL).
 # T030: narrative parsing (JSON, temp=0.3). T032: travel narration (JSON, temp=0.8).
 # T033: content safety (JSON, temp=0.1). T038: campaign saga (plain text, temp=0.6).
-# T066: transition summary (plain text, temp=0.7).
-# T038/T066 use response_format=None at callsite (plain text, not JSON).
+# T038 uses response_format=None at callsite (plain text, not JSON).
 DM_SUMM_GPT54MINI_NONE = {"model": "gpt-5.4-mini", "reasoning_effort": "none"}
 DM_SUMM_GEMINI_FLASH_LOW = {"model": "gemini-3-flash-preview", "thinking_level": "low"}
 DM_SUMM_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
@@ -982,14 +836,26 @@ DM_MAIN_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
 # at reasoning > none, so the callsite passes temperature uniformly like every sibling.
 # Reusable GPT-5.6 profiles.  Task-specific names below are detached compatibility
 # aliases for older imports; canonical callsite selection lives in CALLSITE_BINDINGS.
-OPENAI_GPT56_LUNA_NONE = {"model": "gpt-5.6-luna", "reasoning_effort": "none"}
-OPENAI_GPT56_LUNA_LOW = {"model": "gpt-5.6-luna", "reasoning_effort": "low"}
-OPENAI_GPT56_LUNA_MEDIUM = {"model": "gpt-5.6-luna", "reasoning_effort": "medium"}
-OPENAI_GPT56_LUNA_HIGH = {"model": "gpt-5.6-luna", "reasoning_effort": "high"}
+OPENAI_GPT56_LUNA_NONE = {"model": "gpt-6-luna", "reasoning_effort": "none"}
+OPENAI_GPT56_LUNA_LOW = {"model": "gpt-6-luna", "reasoning_effort": "low"}
+OPENAI_GPT56_LUNA_MEDIUM = {"model": "gpt-6-luna", "reasoning_effort": "medium"}
+OPENAI_GPT56_LUNA_HIGH = {"model": "gpt-6-luna", "reasoning_effort": "high"}
 OPENAI_GPT56_TERRA_NONE = {"model": "gpt-5.6-terra", "reasoning_effort": "none"}
 OPENAI_GPT56_TERRA_LOW = {"model": "gpt-5.6-terra", "reasoning_effort": "low"}
 OPENAI_GPT56_TERRA_MEDIUM = {"model": "gpt-5.6-terra", "reasoning_effort": "medium"}
 OPENAI_GPT56_TERRA_HIGH = {"model": "gpt-5.6-terra", "reasoning_effort": "high"}
+# T124 on OpenAI (D-CREATE-COST-2 amendment 4): the real gpt-5.6-luna; the OPENAI_GPT56_LUNA_* profiles above send gpt-6-luna.
+# Effort low, so the provider guard strips the caller temperature (gpt-5.6-luna rejects temperature != 1 above none).
+STARTUP_REVIEW_T124_GPT_5_6_LUNA_LOW = {"model": "gpt-5.6-luna", "reasoning_effort": "low"}
+# D-CREATE-COST-5 (Q1 option 1): every startup interview takes the one engine path, and the engine builds
+# the sheet from the typed intent. This selects only the review: "engine" (no model review; the engine is the
+# only gate, D-ALLCLASS-4) or "whole" (#1278's T124 review over the engine-built sheet), the rollback.
+# "sectioned", the COST-4 name, reads as "engine".
+STARTUP_REVIEW_MODE = "engine"
+# D-COST-8 (#193): "merged" has T079 return the typed effect object itself (effectChange as
+# T078's {operation, effect, remove} contract), one call per effect-bearing update; "separate" is the
+# rollback, T079 flags effectChange: true and T078 classifies.
+EFFECTS_CLASSIFIER_MODE = "merged"
 OPENAI_GPT56_SOL_NONE = {"model": "gpt-5.6-sol", "reasoning_effort": "none"}
 OPENAI_GPT56_SOL_LOW = {"model": "gpt-5.6-sol", "reasoning_effort": "low"}
 
@@ -1010,6 +876,24 @@ NPC_COHERENCE_T104_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none
 # `from model_config import *`, regardless of whether an existing config.py copy has
 # it. ON: the pass is fail-closed + heal-forward so shipping enabled is safe.
 ENABLE_NPC_COHERENCE_REPAIR = True
+
+# T122 (typing a module that joins without a module declaration, N4): one
+# structured call over the module's NPC entries, typing each occurrence's
+# disposition and the occurrences that are one being. Bound like T104 (the same
+# kind of NPC identity decision); its own names so the two can diverge.
+NPC_TYPING_T122_GPT56LUNA_NONE = copy.deepcopy(OPENAI_GPT56_LUNA_NONE)
+NPC_TYPING_T122_GEMINI_PRO_LOW = copy.deepcopy(NPC_COHERENCE_T104_GEMINI_PRO_LOW)
+NPC_TYPING_T122_LEGACY = copy.deepcopy(NPC_COHERENCE_T104_LEGACY)
+NPC_TYPING_T122_LMSTUDIO = copy.deepcopy(NPC_COHERENCE_T104_LMSTUDIO)
+
+# T123 (timing a built module's links, N5): one structured call over the
+# module's links, giving the minutes each takes at SRD normal pace. Bound like
+# T122 (a module-level structural typing call); its own names so they can
+# diverge.
+ROUTE_TIMING_T123_GPT56LUNA_NONE = copy.deepcopy(OPENAI_GPT56_LUNA_NONE)
+ROUTE_TIMING_T123_GEMINI_PRO_LOW = copy.deepcopy(NPC_COHERENCE_T104_GEMINI_PRO_LOW)
+ROUTE_TIMING_T123_LEGACY = copy.deepcopy(NPC_COHERENCE_T104_LEGACY)
+ROUTE_TIMING_T123_LMSTUDIO = copy.deepcopy(NPC_COHERENCE_T104_LMSTUDIO)
 
 # ----- T105 NPC Voice (+ isolated affinity classifier) & T107 NPC Profile Seed -----
 # Per-NPC "voice" micro-model agents (always on). These are per-NPC,
@@ -1062,7 +946,7 @@ NPC_BACKFILL_T113_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 NPC_BACKFILL_T113_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
 # --- Model Routing Settings ---
-ENABLE_INTELLIGENT_ROUTING = True                        # Enable/disable action-based model routing
+ENABLE_INTELLIGENT_ROUTING = False                       # Legacy T082 routing; off by D-COST-1 (T067 binding decides)
 MAX_VALIDATION_RETRIES = 1                              # Retry with full model after this many validation failures
 
 # --- Model Provider Selection ---

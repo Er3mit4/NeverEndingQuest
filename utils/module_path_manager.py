@@ -15,7 +15,8 @@ See LICENSE file for full terms.
 
 import json
 import os
-from .enhanced_logger import debug, info, warning, error, set_script_name
+from .enhanced_logger import info, warning, set_script_name
+from .transient_filesystem import retry_transient_filesystem
 
 # Set script name for logging
 set_script_name(__name__)
@@ -60,6 +61,10 @@ set_script_name(__name__)
 # and maintainable while supporting seamless legacy migration.
 # ============================================================================
 
+class ActiveModuleUnavailable(RuntimeError):
+    """The active module could not be read; no other module is substituted (#448)."""
+
+
 class ModulePathManager:
     """Manages file paths for module-specific resources"""
     
@@ -74,20 +79,38 @@ class ModulePathManager:
         self.module_dir = f"modules/{self.module_name}"
         
     def _get_active_module(self):
-        """Read the active module from party_tracker.json"""
+        """Read the active module from party_tracker.json; never substitute another (#448)"""
+        def read_tracker():
+            # A plain read, so a retried sharing violation prints nothing
+            try:
+                with open("party_tracker.json", "r", encoding="utf-8") as file:
+                    return json.load(file)
+            except FileNotFoundError:
+                return None
+
         try:
-            with open("party_tracker.json", 'r', encoding='utf-8') as file:
-                data = json.load(file)
-                module = data.get("module", "Keep_of_Doom")
-                # Only log if module changes or on first load
-                if ModulePathManager._last_module_logged != module:
-                    info(f"INITIALIZATION: Switched to module '{module}'", category="module_loading")
-                    ModulePathManager._last_module_logged = module
-                return module
+            data = retry_transient_filesystem(read_tracker)
         except Exception as e:
-            error(f"FILE_OP: Could not load party_tracker.json", exception=e, category="file_operations")
-            debug("INITIALIZATION: Using default module 'Keep_of_Doom'", category="module_loading")
-            return "Keep_of_Doom"  # Default fallback
+            raise ActiveModuleUnavailable(
+                f"No active module: party_tracker.json could not be read ({e})"
+            ) from e
+        if data is None:
+            raise ActiveModuleUnavailable("No active module: party_tracker.json is missing")
+        if not isinstance(data, dict):
+            raise ActiveModuleUnavailable(
+                "No active module: party_tracker.json could not be read (not an object)"
+            )
+        if "module" not in data:
+            raise ActiveModuleUnavailable("No active module: party_tracker.json has no 'module'")
+        module = data["module"]
+        if not isinstance(module, str) or not module.strip():
+            raise ActiveModuleUnavailable("No active module: party_tracker.json has an empty 'module'")
+        module = module.strip()
+        # Only log if module changes or on first load
+        if ModulePathManager._last_module_logged != module:
+            info(f"INITIALIZATION: Switched to module '{module}'", category="module_loading")
+            ModulePathManager._last_module_logged = module
+        return module
     
     def format_filename(self, name):
         """Convert a name to a filesystem-safe filename format
@@ -201,13 +224,31 @@ class ModulePathManager:
         """Get the path to a player character file (legacy support)"""
         return f"{self.module_dir}/{self.format_filename(player_name)}.json"
     
+    def _character_file(self, character_name):
+        """characters/<stem>.json; a pre-#894 sheet at characters/.json keeps its file."""
+        stem = self.format_filename(character_name)
+        path = f"characters/{stem}.json"
+        if stem.isascii() or os.path.exists(path):
+            return path
+        legacy = "characters/.json"
+        if not os.path.exists(legacy):
+            return path
+        try:
+            with open(legacy, "r", encoding="utf-8") as handle:
+                legacy_name = json.load(handle).get("name")
+        except (OSError, ValueError, AttributeError):
+            return legacy  # never fork an existing sheet on a failed read
+        if isinstance(legacy_name, str) and self.format_filename(legacy_name) == stem:
+            return legacy
+        return path
+
     # Unified character paths with fallback support
     def get_character_path(self, character_name):
         """
         Get the path to a character file - now using root characters directory for all characters
         """
         # All characters are now stored in the root characters directory
-        return f"characters/{self.format_filename(character_name)}.json"
+        return self._character_file(character_name)
     
     def _determine_character_role(self, character_name):
         """Determine character role from party_tracker.json"""
@@ -230,7 +271,7 @@ class ModulePathManager:
     
     def get_character_unified_path(self, character_name):
         """Get the unified path (whether file exists or not) - now using root characters directory"""
-        return f"characters/{self.format_filename(character_name)}.json"
+        return self._character_file(character_name)
     
     def get_character_legacy_path(self, character_name, character_role=None):
         """Get the legacy path for a character based on role"""

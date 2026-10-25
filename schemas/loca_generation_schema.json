@@ -45,9 +45,14 @@
               "properties": {
                 "name": { "type": "string" },
                 "description": { "type": "string" },
-                "attitude": { "type": "string" }
+                "attitude": { "type": "string" },
+                "disposition": {
+                  "type": "string",
+                  "enum": ["friendly", "indifferent", "hostile"],
+                  "description": "How this NPC first treats the party: friendly, indifferent or hostile. attitude stays free text."
+                }
               },
-              "required": ["name", "description", "attitude"]
+              "required": ["name", "description", "attitude", "disposition"]
             },
             "description": "List of NPCs present in the location."
           },
@@ -134,7 +139,7 @@
             "items": {
               "type": "string",
               "description": "A string representing a DC check in the format: 'SkillName DC XX: Description of the check.'",
-              "pattern": "^(Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma|Acrobatics|Animal Handling|Arcana|Athletics|Deception|History|Insight|Intimidation|Investigation|Medicine|Nature|Perception|Performance|Persuasion|Religion|Sleight of Hand|Stealth|Survival) DC [0-9]+: .+$"
+              "pattern": "^((Strength|Dexterity|Constitution|Intelligence|Wisdom|Charisma)( \\((Acrobatics|Animal Handling|Arcana|Athletics|Deception|History|Insight|Intimidation|Investigation|Medicine|Nature|Perception|Performance|Persuasion|Religion|Sleight of Hand|Stealth|Survival)\\))?|Acrobatics|Animal Handling|Arcana|Athletics|Deception|History|Insight|Intimidation|Investigation|Medicine|Nature|Perception|Performance|Persuasion|Religion|Sleight of Hand|Stealth|Survival) DC [0-9]+: .+$"
             },
             "examples": [
               "Perception DC 15: Notice signs of recent activity in the room.",
