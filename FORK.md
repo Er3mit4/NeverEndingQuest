@@ -35,13 +35,17 @@ still require their separate API services.
 Full architecture and setup:
 [docs/architecture/codex-gpt6-provider.md](docs/architecture/codex-gpt6-provider.md).
 
-### 2. OpenCode Go provider — `opencodego` (DeepSeek V4.1 Flash)
+### 2. OpenCode Go provider — `opencodego` (the plan's models)
 
 A first-class AI provider that routes **every** call site (DM turns, combat
 refereeing, validation, summaries, module generation, NPC systems…) through
-[OpenCode Go](https://opencode.ai/en/docs/go) — OpenCode's $10/month
-subscription that serves open models behind an OpenAI-compatible endpoint —
-running **`deepseek-v4.1-flash`** everywhere.
+[OpenCode Go](https://opencode.ai/en/docs/go) — OpenCode's low-cost
+subscription that serves open models behind one relay — running the plan
+model chosen in Settings. The whole catalogue is discovered from the relay's
+`/v1/models` when the service starts (cached for 6 hours and refreshed by a
+Settings button), so new plan models appear without a release. The default
+stays `deepseek-v4.1-flash`; each model travels on the wire the plan
+publishes for it (Chat Completions, OpenAI Responses or Anthropic Messages).
 
 - **Why this endpoint is interesting as a test bed**: OpenCode Go is an
   OpenAI-compatible *gateway* with gateway-specific requirements (session
@@ -121,9 +125,8 @@ touch code, UI and docs only.
 
 Ideas queued for this playground, not yet implemented:
 
-- **More third-party endpoints** via the OpenCode Go adapter pattern:
-  DeepSeek V4 Pro, GLM-5.x, Kimi K2.x, Qwen3.x, MiniMax — all served by the
-  same Go gateway, selectable per call-site tier.
+- **Per-callsite tiers inside one Go plan**, instead of one model for every
+  call site, once the effort-tier evaluation below has data.
 - **Per-callsite model routing across Go gateway models** (e.g. a cheaper
   flash model for utility calls and a stronger open model for the DM loop),
   measured against the current GPT-6 task matrix.

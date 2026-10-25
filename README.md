@@ -153,9 +153,10 @@ Open **Settings → AI Provider** and choose one of these modes:
 - **Legacy (GPT-4.1)**: The previous stable baseline, kept as a one-click toggle.
   Requires an OpenAI API key.
 - **Gemini 3.1**: Uses Gemini models selected per call site. Requires a Google AI API key.
-- **OpenCode Go (DeepSeek V4.1 Flash)** *(custom fork)*: Every call site runs on
-  DeepSeek V4.1 Flash through OpenCode Go's OpenAI-compatible endpoint
-  ($10/month subscription). Uses your opencode-go key — auto-detected from the
+- **OpenCode Go** *(custom fork)*: Every call site runs on the plan model you
+  pick — the whole plan catalogue (DeepSeek, GLM, Kimi, MiniMax, Qwen, MiMo,
+  GPT, Grok, Claude, Muse Spark, ...) is listed in Settings, refreshed from the
+  relay when the game starts. Uses your opencode-go key — auto-detected from the
   OpenCode CLI when present, or paste it in Settings. See
   [docs/architecture/opencode-go-provider.md](docs/architecture/opencode-go-provider.md).
 - **Local / Custom Server**: Connects to an OpenAI-compatible endpoint such as

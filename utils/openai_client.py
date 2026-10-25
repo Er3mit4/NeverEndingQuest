@@ -45,6 +45,9 @@ PROVIDER_SOCKET_OPTIONS = tuple(_provider_socket_options())
 # deepseek-v4.1-flash and the other Go models live at
 # https://opencode.ai/zen/go/v1/chat/completions (Bearer auth).
 DEFAULT_OPENCODEGO_BASE_URL = "https://opencode.ai/zen/go/v1"
+# The same relay serves the Anthropic wire one level up: the SDK appends
+# /v1/messages, so this base must not carry /v1 (OpenCode Go docs, 2026-10-25).
+OPENCODEGO_ANTHROPIC_BASE_URL = "https://opencode.ai/zen/go"
 
 def _opencodego_session_id():
     """Return the game-owned identity inherited by subprocess generations."""
@@ -59,8 +62,13 @@ def _provider_http_client():
     )
 
 
-def compatible_connection(provider, endpoint_override=None):
-    """Resolve one OpenAI-compatible endpoint without mixing credentials."""
+def compatible_connection(provider, endpoint_override=None, model=None):
+    """Resolve one OpenAI-compatible endpoint without mixing credentials.
+
+    For OpenCode Go the player's chosen model decides both the model id and the
+    wire transport (Chat Completions, Responses or Anthropic Messages), because
+    the plan serves different protocols per model behind one relay.
+    """
     import model_config
     if provider == "lmstudio":
         ep = endpoint_override if endpoint_override is not None else model_config.get_local_endpoint()
@@ -70,17 +78,25 @@ def compatible_connection(provider, endpoint_override=None):
             "model": ep.get("model") or "",
             "json_object": False,
             "headers": {},
+            "transport": "chat",
         }
     if provider == "opencodego":
+        from utils.opencodego_models import transport_for
+        selected = (model or "").strip()
+        if not selected:
+            selected = model_config.get_opencodego_model() or model_config.DEFAULT_OPENCODEGO_MODEL
+        transport = transport_for(selected)
         return {
-            "base_url": DEFAULT_OPENCODEGO_BASE_URL,
+            "base_url": (OPENCODEGO_ANTHROPIC_BASE_URL if transport == "anthropic"
+                         else DEFAULT_OPENCODEGO_BASE_URL),
             "api_key": model_config.get_opencodego_key() or "not-needed",
-            "model": "deepseek-v4.1-flash",
-            "json_object": True,
+            "model": selected,
+            "json_object": transport != "anthropic",
             "headers": {
                 "x-opencode-session": _opencodego_session_id(),
                 "User-Agent": "NeverEndingQuest/1.0",
             },
+            "transport": transport,
         }
     raise ValueError("Unsupported compatible endpoint: %s" % provider)
 

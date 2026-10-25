@@ -2,8 +2,8 @@
 
 Custom provider added to this fork on 2026-09-22. It routes every AI call
 through [OpenCode Go](https://opencode.ai/en/docs/go) — OpenCode's low-cost
-subscription ($10/month) that serves open models behind an OpenAI-compatible
-endpoint — using **`deepseek-v4.1-flash`** as the model for all call sites.
+subscription that serves open models behind one relay — using the model the
+player picks from the plan's catalogue (default **`deepseek-v4.1-flash`**).
 
 > This is a **custom fork feature**, not part of upstream NeverEndingQuest.
 > Upstream supports `openai`, `gemini`, `legacy` and `lmstudio`; this fork adds
@@ -20,9 +20,14 @@ NeverEndingQuest ──(OpenAI SDK, Chat Completions streaming)──▶
 
 - **Provider id**: `opencodego` (`MODEL_PROVIDER` option, switchable in
   Settings → AI Provider on both players; persists in `user_settings.json`)
-- **Model**: `deepseek-v4.1-flash` for every call site — $0.15/$0.60 per 1M
-  in/out off-peak ($0.30/$1.20 peak; DeepSeek peak hours are 01:00–04:00 and
-  06:00–10:00 UTC Mon–Fri), cached read $0.003, $60/month usage limit.
+- **Model**: one per player choice, applied to every call site (a plan
+  subscription, not per-task billing). The default is
+  `deepseek-v4.1-flash` ($0.15/$0.60 per 1M in/out off-peak, $0.30/$1.20
+  peak; DeepSeek peak hours are 01:00–04:00 and 06:00–10:00 UTC Mon–Fri).
+- **Catalogue**: discovered from `GET /zen/go/v1/models` when the service
+  starts, cached in `user_settings.json` for 6 hours and refreshed by the
+  Settings button. Without a usable key the plan's published list is shown
+  instead, so the picker is never empty.
 - **Transport**: streaming Chat Completions via the standard `openai` SDK
   (`_chat_stream_completion`). The Go endpoint has **no** Responses surface for
   this model, so the provider never uses the OpenAI Responses path.
@@ -56,24 +61,35 @@ Without the session header the gateway rejects the request with
 The key is read live per call, so a Settings change applies on the next
 request without a restart.
 
+## Wire protocols per model
+
+The relay publishes three protocols behind one base URL, so the model id
+decides how a request travels (`utils/opencodego_models.transport_for`):
+
+| Models | Wire | Base URL |
+|---|---|---|
+| `gpt-*`, `grok-*`, `muse-spark*` | OpenAI Responses | `/zen/go/v1` |
+| `claude-*`, `qwen*`, `minimax-m3` | Anthropic Messages (`core/ai/anthropic_wire.py`) | `/zen/go` (SDK adds `/v1/messages`) |
+| `gemini-*` | Google generateContent | not sent (unsupported here) |
+| everything else | Chat Completions | `/zen/go/v1` |
+
 ## Reasoning-effort mapping
 
-DeepSeek V4.1 Flash supports reasoning efforts **`low | high | max` only**
-(no `none`). The Go ladder is now explicit and independent of the OpenAI/Codex
-GPT-6 matrix. The earlier effective choices were preserved:
+Only the contracts the relay documents are used, because one unsupported
+level is a 400 on every call for that provider:
 
-| Task | Go ladder |
+| Model family | Sent effort |
 |---|---|
-| Most call sites | `low` |
-| T017 | `high` |
-| T026 | `max` |
-| T097 retries | `low`, `low`, `high` |
+| `deepseek-v4*` | `low | high | max` (`none` becomes `low`) |
+| `glm-5.2` | `high` or `max` (`low` is raised to `high`) |
+| everything else | omitted — the relay's own default |
 
 `_enforce_provider_constraints` still rewrites a stray
 `reasoning_effort: "none"` to `low` for older compatibility profiles.
 Temperature is accepted at every effort level and passes through like the
 legacy/lmstudio providers. JSON mode follows the same default-ON contract as
-the legacy path (opt-out with `response_format=None`).
+the legacy path (opt-out with `response_format=None`); on the Anthropic wire,
+which has no JSON flag, the contract is stated in the system prompt.
 
 ## Key files
 
@@ -81,13 +97,15 @@ the legacy path (opt-out with `response_format=None`).
 |---|---|
 | `model_registry.py` | `opencodego` in `SUPPORTED_PROVIDERS`, independent `_GO_SPECIAL_LADDERS`, `deepseek-v4.1-flash` catalog entry |
 | `model_config.py` | Go profiles and independent key persistence/detection helpers |
-| `utils/openai_client.py` | Shared Local/Custom and Go compatible endpoint configuration; Go supplies its own URL, credential, JSON policy and headers |
+| `utils/openai_client.py` | Shared Local/Custom and Go compatible endpoint configuration; Go supplies its own URL, credential, JSON policy, headers and the transport for the chosen model |
+| `utils/opencodego_models.py` | Plan catalogue discovery (`/zen/go/v1/models`), per-model transport routing, effort clamp, 6 h cache and the offline floor |
+| `core/ai/anthropic_wire.py` | Anthropic Messages transport for the Go models that only exist on that wire |
 | `utils/conversation_identity.py` | Conversation UUID created by the game owner and propagated to provider children |
-| `core/ai/api_client.py` | Routes `opencodego` through the Chat Completions adapter (`_opencodego_call_kwargs`), none→low effort constraint |
+| `core/ai/api_client.py` | Routes `opencodego` per model transport (chat / Responses / Anthropic), none→low effort constraint |
 | `utils/provider_errors.py` | Player-facing display name "OpenCode Go" |
 | `utils/openai_usage_tracker.py` | Known-provider telemetry set |
 | `utils/startup_wizard.py`, `core/ai/effects_agent.py`, `core/npc/voice_service.py`, `core/npc/profile_service.py`, `core/generators/story_first/settings.py`, `core/generators/module_builder.py`, `utils/capture/live_provider_call.py`, `web/web_interface.py` | Explicit provider branches (config selection, key handlers, credentials check, T104/T105/T107 payload shapes) |
-| `web/templates/game_interface.html`, `web/frontend/src/*` | Provider dropdown option, hint text, API-key section + socket contract (`get/set_opencodego_key`, `opencodego_key_status`) |
+| `web/templates/game_interface.html`, `web/frontend/src/*` | Provider dropdown option, hint text, API-key section, plan model picker + socket contract (`get/set_opencodego_key`, `get_opencodego_models`, `refresh_opencodego_models`, `set_opencodego_model`) |
 | `config.py` / `config_template.py` | `OPENCODEGO_API_KEY` placeholder |
 
 ## Validation performed (2026-09-22)

@@ -105,6 +105,9 @@ export interface ClientEvents {
   get_gemini_key: undefined;
   get_opencodego_key: undefined;
   set_opencodego_key: { api_key?: string };
+  get_opencodego_models: undefined;
+  refresh_opencodego_models: undefined;
+  set_opencodego_model: { model: string };
   set_gemini_key: { api_key: string };
   test_local_endpoint: { base_url: string; api_key?: string; model?: string };
   // --- operator/toolkit scope: NOT bound in the player app (toolkit page owns these) ---
@@ -154,6 +157,9 @@ export const CLIENT_EVENT_ARITY = {
   set_gemini_key: 1,
   get_opencodego_key: 0,
   set_opencodego_key: 1,
+  get_opencodego_models: 0,
+  refresh_opencodego_models: 0,
+  set_opencodego_model: 1,
   test_local_endpoint: 1,
   start_build: 1,
   cancel_build: 0,
@@ -255,6 +261,19 @@ export interface ServerEvents {
   };
   gemini_key_status: { has_key: boolean };
   opencodego_key_status: { has_key: boolean };
+  /** The OpenCode Go plan's models: one per transport, `supported` = this client can send it. */
+  opencodego_models: {
+    models: Array<{
+      id: string; label: string;
+      transport: 'chat' | 'responses' | 'anthropic' | 'google';
+      transport_label: string; supported: boolean;
+    }>;
+    selected: string;
+    source: 'live' | 'cache' | 'fallback' | 'none';
+    fetched_at: string | null;
+    error: string | null;
+  };
+  opencodego_model_changed: { model: string };
   local_endpoint_test_result: { ok: boolean; detail: string };
   image_generated: { image_url: string; prompt: string; request_id?: string; source_message_id?: string };
   image_generation_error: { message: string; request_id?: string; source_message_id?: string };

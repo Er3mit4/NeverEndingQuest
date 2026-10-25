@@ -289,6 +289,8 @@ on('openai_key_status', (p) => useDialogs.getState().setOpenaiKeyStatus(p))
 on('openai_key_check', (p) => useDialogs.getState().setOpenaiKeyCheck(p))
 on('gemini_key_status', (p) => useDialogs.getState().setGeminiKeyStatus(p))
 on('opencodego_key_status', (p) => useDialogs.getState().setOpencodegoKeyStatus(p))
+on('opencodego_models', (p) => useDialogs.getState().setOpencodegoModels(p))
+on('opencodego_model_changed', (p) => useDialogs.getState().setOpencodegoModel(p))
 on('local_endpoint_test_result', (p) => useDialogs.getState().setEndpointTestResult(p))
 
 // Toolkit/operator-scope events (module_creation_progress, generation_progress,

@@ -16,7 +16,7 @@ const PROVIDER_OPTIONS: Array<{ value: ProviderValue; label: string }> = [
   { value: 'openai', label: 'OpenAI API (GPT-6) - Uses an API key' },
   { value: 'codex', label: 'Codex (GPT-6) - Uses your ChatGPT subscription' },
   { value: 'gemini', label: 'Gemini 3.1 - Alternative provider, tested per task' },
-  { value: 'opencodego', label: 'OpenCode Go (DeepSeek V4.1 Flash) - Low-cost subscription' },
+  { value: 'opencodego', label: 'OpenCode Go - Low-cost subscription (plan models)' },
   { value: 'lmstudio', label: 'Local / Custom Server (LM Studio, Ollama, OpenRouter...)' },
 ]
 
@@ -26,7 +26,7 @@ const PROVIDER_HINTS: Record<ProviderValue, string> = {
   codex: 'Codex (GPT-6): uses the official Codex login and your ChatGPT service quota.',
   gemini: 'Gemini 3.1: alternative cloud provider, tested per task. Requires a Google API key.',
   opencodego:
-    'OpenCode Go: low-cost subscription serving DeepSeek V4.1 Flash. Uses your opencode-go key (auto-detected from the OpenCode CLI when present).',
+    'OpenCode Go: low-cost subscription serving the current plan models. Pick one below. Uses your opencode-go key (auto-detected from the OpenCode CLI when present).',
   lmstudio:
     'Local / Custom Server: point at any OpenAI-compatible server below. Zero cost when local.',
 }
@@ -59,6 +59,7 @@ function LocalProviderPanelBody() {
     emitC('get_openai_key', undefined)
     emitC('get_gemini_key', undefined)
     emitC('get_opencodego_key', undefined)
+    emitC('get_opencodego_models', undefined)
     emitC('get_codex_status', undefined)
   }, [])
 
@@ -169,10 +170,21 @@ function LocalProviderPanelBody() {
   const saveOpencodegoKey = () => {
     emitC('set_opencodego_key', { api_key: opencodegoKey })
     setOpencodegoKey('')
+    // A fresh key may unlock models, so re-read the plan list.
+    window.setTimeout(() => emitC('refresh_opencodego_models', undefined), 500)
   }
 
   const keyStatusText = (hasKey: boolean | null) =>
     hasKey === null ? '' : hasKey ? ' (a key is set)' : ' (no key set)'
+
+  const goCatalogue = settings.opencodegoModels
+  const goModels = goCatalogue?.models ?? []
+  const selectedGoModel = goCatalogue?.selected ?? 'deepseek-v4.1-flash'
+  const goModelsStatus = goCatalogue
+    ? ` ${goModels.length} model(s), ${goCatalogue.source}`
+      + (goCatalogue.fetched_at ? ` -- updated ${goCatalogue.fetched_at}` : '')
+    : ' Loading...'
+  const goModelsError = goCatalogue?.error ?? null
 
   return (
     <div>
@@ -396,9 +408,9 @@ function LocalProviderPanelBody() {
         <div className={sectionClass}>
           <div className={sectionTitleClass}>OpenCode Go API Key</div>
           <p className="neq-settings-help-parity">
-            Needed for the OpenCode Go provider (DeepSeek V4.1 Flash). If you use the OpenCode
-            CLI with a Go subscription on this machine, your saved key is detected automatically
-            -- no need to paste it. Otherwise get a key at https://opencode.ai/auth
+            Needed for the OpenCode Go provider. If you use the OpenCode CLI with a Go
+            subscription on this machine, your saved key is detected automatically --
+            no need to paste it. Otherwise get a key at https://opencode.ai/auth
             <span>{keyStatusText(settings.opencodegoHasKey)}</span>
           </p>
           <div className="neq-settings-item neq-settings-stack-parity"><input
@@ -413,6 +425,38 @@ function LocalProviderPanelBody() {
           <button type="button" className={smallButtonClass} onClick={saveOpencodegoKey}>
             Save Key
           </button></div>
+
+          <div className={sectionTitleClass}>Model</div>
+          <p className="neq-settings-help-parity">
+            One model serves every task on this subscription. The list is the plan's
+            current catalogue, refreshed when the game starts.
+            {goModelsStatus}
+          </p>
+          <select
+            aria-label="OpenCode Go model"
+            className={inputClass}
+            value={selectedGoModel}
+            onChange={(e) => emitC('set_opencodego_model', { model: e.target.value })}
+            disabled={goModels.length === 0}
+          >
+            {goModels.length === 0 && <option value={selectedGoModel}>{selectedGoModel}</option>}
+            {goModels.map((item) => (
+              <option key={item.id} value={item.id} disabled={!item.supported}>
+                {item.label}
+                {item.supported ? '' : ` -- ${item.transport_label} (not supported yet)`}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className={smallButtonClass}
+            onClick={() => emitC('refresh_opencodego_models', undefined)}
+          >
+            Refresh list
+          </button>
+          {goModelsError && (
+            <p className="neq-settings-help-parity" role="status">{goModelsError}</p>
+          )}
         </div>
       )}
     </div>

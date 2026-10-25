@@ -1430,6 +1430,55 @@ def apply_persisted_opencodego_key():
         setattr(sys.modules["config"], "OPENCODEGO_API_KEY", key)
 
 
+DEFAULT_OPENCODEGO_MODEL = "deepseek-v4.1-flash"
+
+
+def get_opencodego_model():
+    """The OpenCode Go model every call uses (player choice, else the default).
+
+    One model serves every callsite: the relay's plan is a subscription, so the
+    player picks the model once in Settings -> AI Provider instead of per task.
+    """
+    value = _load_user_settings().get("opencodego_model")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return DEFAULT_OPENCODEGO_MODEL
+
+
+def persist_opencodego_model(model_id):
+    """Save the OpenCode Go model choice; returns the value now in effect."""
+    value = model_id.strip() if isinstance(model_id, str) else ""
+    if not value:
+        raise ValueError("Choose an OpenCode Go model.")
+    if len(value) > 80 or not all(ch.isalnum() or ch in "._:-/" for ch in value):
+        raise ValueError("That is not a valid OpenCode Go model id.")
+    settings = _load_user_settings()
+    if value == DEFAULT_OPENCODEGO_MODEL:
+        settings.pop("opencodego_model", None)
+    else:
+        settings["opencodego_model"] = value
+    _save_user_settings(settings)
+    return value
+
+
+def get_opencodego_models_cache():
+    """The last catalogue fetched from the relay ({"models", "fetched_at"})."""
+    cache = _load_user_settings().get("opencodego_models_cache")
+    return cache if isinstance(cache, dict) else {}
+
+
+def persist_opencodego_models_cache(cache):
+    """Store the catalogue so the picker is filled before the first fetch."""
+    if not isinstance(cache, dict):
+        raise TypeError("OpenCode Go model cache must be a dict")
+    settings = _load_user_settings()
+    settings["opencodego_models_cache"] = {
+        "models": cache.get("models") if isinstance(cache.get("models"), list) else [],
+        "fetched_at": cache.get("fetched_at"),
+    }
+    _save_user_settings(settings)
+
+
 def has_gemini_key():
     """True if a real (non-placeholder) Gemini key is stored. Never returns the key."""
     key = _read_credential("gemini_api_key")

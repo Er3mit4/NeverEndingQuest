@@ -974,6 +974,7 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
     # WITHOUT touching any of the 67 per-callsite model dicts. Empty => keep the
     # callsite's own model string. Scoped to lmstudio only; no other provider or
     # param is affected (create_completion remains a thin router).
+    connection = None
     if provider in ("lmstudio", "opencodego"):
         connection = compatible_connection(provider, endpoint_override)
         if connection["model"]:
@@ -986,11 +987,19 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
         # and production parsers/retries, so omit only this unsupported mode at
         # the provider adapter. Preserve an explicit json_schema for endpoints
         # that support it, and leave OpenAI/legacy behavior unchanged.
-        if not connection["json_object"] and (response_format is _UNSET or (
-            isinstance(response_format, dict)
-            and response_format.get("type") == "json_object"
-        )):
+        if (connection.get("transport") != "anthropic"
+                and not connection["json_object"] and (response_format is _UNSET or (
+                    isinstance(response_format, dict)
+                    and response_format.get("type") == "json_object"
+                ))):
             response_format = None
+
+    if provider == "opencodego":
+        _open_code_go_model = model
+        kwargs["reasoning_effort"] = _opencodego_effort(
+            _open_code_go_model, kwargs.get("reasoning_effort"))
+        if kwargs["reasoning_effort"] is None:
+            kwargs.pop("reasoning_effort")
 
     # Pop internal flags
     strip_temp = kwargs.pop("_strip_temperature", False)
@@ -1001,7 +1010,7 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
     # a timed-out request, and a local model that was just disconnected at the
     # deadline is immediately asked to generate again, up to two more times.
     # A caller that sets a deadline owns its retry policy; the deadline is a
-    # TRUE end-to-end bound. Callers that pass no timeout are untouched.
+    # TRUE end-to-end bound. Callers that pass no deadline are untouched.
     request_timeout = kwargs.pop("timeout", None)
     if request_timeout is not None:
         client = client.with_options(timeout=request_timeout, max_retries=0)
@@ -1016,11 +1025,72 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
             phase_emit, output_ceiling=output_ceiling, **kwargs,
         )
 
+    transport = (connection or {}).get("transport", "chat")
+    if provider == "opencodego" and transport == "responses":
+        # OpenCode Go serves gpt-*, grok-* and muse-spark* only on /responses.
+        return _responses_stream_completion(
+            client, messages, model, temperature, strip_temp, response_format,
+            phase_emit, output_ceiling=output_ceiling, **kwargs,
+        )
+    if provider == "opencodego" and transport == "anthropic":
+        # ... and claude-*, minimax-* and qwen* only on the Anthropic wire.
+        return _anthropic_completion(
+            connection, messages, model, temperature, response_format, phase_emit,
+            timeout=request_timeout, **kwargs,
+        )
+
     call_kwargs = _compatible_chat_kwargs(
         messages, model, temperature, response_format, strip_temp, **kwargs,
     )
 
     return _chat_stream_completion(client, call_kwargs, phase_emit, output_ceiling=output_ceiling)
+
+
+def _opencodego_effort(model, effort):
+    """The reasoning level OpenCode Go accepts for this model, or None."""
+    from utils.opencodego_models import adjust_reasoning_effort
+    return adjust_reasoning_effort(model, effort)
+
+
+def _anthropic_completion(connection, messages, model, temperature, response_format,
+                          phase_emit, timeout=None, **kwargs):
+    """One Anthropic-wire generation (OpenCode Go), shaped like the others."""
+    from core.ai.anthropic_wire import stream_message
+
+    json_mode = not (response_format is None)
+    max_tokens = kwargs.pop("max_tokens", None)
+    kwargs.pop("reasoning_effort", None)
+    kwargs.pop("_strip_temperature", None)
+    if kwargs:
+        # Same posture as the Codex transport: an option the wire does not
+        # implement fails loudly instead of being silently dropped.
+        raise ValueError("Unsupported Anthropic-wire options: %s" % ", ".join(sorted(kwargs)))
+    result = stream_message(
+        base_url=connection["base_url"],
+        api_key=connection["api_key"],
+        headers=connection.get("headers") or {},
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        json_mode=json_mode,
+        max_tokens=max_tokens or 8192,
+        timeout=timeout,
+        phase_emit=phase_emit,
+    )
+    usage = result.get("usage") or {}
+    return _AssembledCompletion(
+        result.get("text") or "",
+        result.get("finish_reason") or "stop",
+        _Usage(
+            _integer_token_count(usage.get("prompt_tokens", 0)),
+            _integer_token_count(usage.get("completion_tokens", 0)),
+            _integer_token_count(usage.get("total_tokens", 0)),
+            cached_tokens=_integer_token_count(usage.get("cached_tokens", 0)),
+            reasoning_tokens=0,
+        ),
+        str(result.get("id") or ""),
+        str(result.get("model") or model),
+    )
 
 
 # ---------------------------------------------------------------------------

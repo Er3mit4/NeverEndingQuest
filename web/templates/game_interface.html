@@ -4473,7 +4473,7 @@
                                     <option value="openai">OpenAI API (GPT-6) - Uses an API key</option>
                                     <option value="codex">Codex (GPT-6) - Uses your ChatGPT subscription</option>
                                     <option value="gemini">Gemini 3.1 - Alternative provider, tested per task</option>
-                                    <option value="opencodego">OpenCode Go (DeepSeek V4.1 Flash) - Low-cost subscription</option>
+                                    <option value="opencodego">OpenCode Go - Low-cost subscription (plan models)</option>
                                     <option value="lmstudio">Local / Custom Server (LM Studio, Ollama, OpenRouter...)</option>
                                 </select>
                             </div>
@@ -4567,7 +4567,7 @@
                     <div class="settings-section" id="opencodego-key-settings" style="display:none;">
                         <div class="settings-section-title">OpenCode Go API Key</div>
                         <div class="settings-help">
-                            Needed for the OpenCode Go provider (DeepSeek V4.1 Flash). If you use the
+                            Needed for the OpenCode Go provider. If you use the
                             OpenCode CLI with a Go subscription on this machine, your saved key is
                             detected automatically -- no need to paste it. Otherwise get a key at
                             https://opencode.ai/auth
@@ -4577,6 +4577,20 @@
                             <input class="settings-select" type="password" id="opencodego-key-input"
                                    style="width:100%;" placeholder="sk-...">
                             <button class="settings-btn" id="opencodego-key-save-btn">Save Key</button>
+                        </div>
+                        <div class="settings-section-title">Model</div>
+                        <div class="settings-help">
+                            One model serves every task on this subscription. The list is the plan's
+                            current catalogue, refreshed when the game starts.
+                            <span id="opencodego-models-status-text"></span>
+                        </div>
+                        <div class="settings-item" style="flex-direction:column; align-items:stretch; gap:6px;">
+                            <select class="settings-select" id="opencodego-model-select"
+                                    style="width:100%;" disabled>
+                                <option value="">Loading models...</option>
+                            </select>
+                            <button class="settings-btn" id="opencodego-models-refresh-btn">Refresh list</button>
+                            <div class="settings-help" id="opencodego-models-error" style="display:none;"></div>
                         </div>
                     </div>
                 </div>
@@ -7435,7 +7449,7 @@
                 openai:   'OpenAI API (GPT-6): uses your OpenAI API key and API billing.',
                 codex:    'Codex (GPT-6): uses the official Codex login and your ChatGPT service quota.',
                 gemini:   'Gemini 3.1: alternative cloud provider, tested per task. Requires a Google API key.',
-                opencodego: 'OpenCode Go: low-cost subscription serving DeepSeek V4.1 Flash. Uses your opencode-go key (auto-detected from the OpenCode CLI when present).',
+                opencodego: 'OpenCode Go: low-cost subscription serving the current plan models. Pick one below. Uses your opencode-go key (auto-detected from the OpenCode CLI when present).',
                 lmstudio: 'Local / Custom Server: point at any OpenAI-compatible server below. Zero cost when local.'
             };
             function updateProviderHint(p) {
@@ -7602,6 +7616,59 @@
                     var inp = document.getElementById('opencodego-key-input');
                     socket.emit('set_opencodego_key', { api_key: inp ? inp.value : '' });
                     if (inp) inp.value = '';  // do not keep the secret in the field
+                    // A fresh key may unlock models, so re-read the plan list.
+                    window.setTimeout(function () {
+                        socket.emit('refresh_opencodego_models');
+                    }, 500);
+                });
+            })();
+
+            // OpenCode Go plan model picker (list refreshed when the server starts)
+            socket.emit('get_opencodego_models');
+            socket.on('opencodego_models', function (d) {
+                var select = document.getElementById('opencodego-model-select');
+                var status = document.getElementById('opencodego-models-status-text');
+                var errBox = document.getElementById('opencodego-models-error');
+                if (!select || !d) return;
+                var models = d.models || [];
+                var selected = d.selected || 'deepseek-v4.1-flash';
+                select.innerHTML = '';
+                if (!models.length) {
+                    var placeholder = document.createElement('option');
+                    placeholder.value = selected;
+                    placeholder.textContent = selected;
+                    select.appendChild(placeholder);
+                }
+                models.forEach(function (m) {
+                    var option = document.createElement('option');
+                    option.value = m.id;
+                    option.textContent = m.label + (m.supported ? '' : ' -- ' + m.transport_label + ' (not supported yet)');
+                    option.disabled = !m.supported;
+                    if (m.id === selected) option.selected = true;
+                    select.appendChild(option);
+                });
+                select.disabled = models.length === 0;
+                if (status) {
+                    status.textContent = ' ' + models.length + ' model(s), ' + d.source +
+                        (d.fetched_at ? ' -- updated ' + d.fetched_at : '');
+                }
+                if (errBox) {
+                    errBox.textContent = d.error || '';
+                    errBox.style.display = d.error ? 'block' : 'none';
+                }
+            });
+            socket.on('opencodego_model_changed', function (d) {
+                var select = document.getElementById('opencodego-model-select');
+                if (select && d && d.model) { select.value = d.model; }
+            });
+            (function () {
+                var select = document.getElementById('opencodego-model-select');
+                if (select) select.addEventListener('change', function () {
+                    socket.emit('set_opencodego_model', { model: this.value });
+                });
+                var refresh = document.getElementById('opencodego-models-refresh-btn');
+                if (refresh) refresh.addEventListener('click', function () {
+                    socket.emit('refresh_opencodego_models');
                 });
             })();
 

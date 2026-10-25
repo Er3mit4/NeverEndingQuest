@@ -4721,6 +4721,45 @@ def handle_set_opencodego_key(data):
         error(f"Error setting opencodego key: {e}", exception=e, category="web_interface")
         emit('error', {'message': "Failed to set OpenCode Go API key"})  # generic: no key leak
 
+@socketio.on('get_opencodego_models')
+def handle_get_opencodego_models():
+    """List the OpenCode Go plan models: live when the key works, else the cache
+    or the plan's published floor. Refreshes when the cached list is stale."""
+    try:
+        from utils.opencodego_models import payload
+        emit('opencodego_models', payload(refresh_if_stale=True))
+    except Exception as e:
+        error(f"Error listing OpenCode Go models: {e}", exception=e, category="web_interface")
+        emit('opencodego_models', {
+            'models': [], 'selected': '', 'source': 'none', 'fetched_at': None,
+            'error': 'The OpenCode Go model list could not be read.',
+        })
+
+@socketio.on('refresh_opencodego_models')
+def handle_refresh_opencodego_models():
+    """Re-fetch the plan's model list now (the Settings Refresh button)."""
+    try:
+        from utils.opencodego_models import payload, refresh
+        refresh(force=True)
+        emit('opencodego_models', payload(), broadcast=True)
+    except Exception as e:
+        error(f"Error refreshing OpenCode Go models: {e}", exception=e, category="web_interface")
+        emit('error', {'message': 'Failed to refresh the OpenCode Go model list'})
+
+@socketio.on('set_opencodego_model')
+def handle_set_opencodego_model(data):
+    """Save the OpenCode Go model used by every call (plan subscription = one model)."""
+    try:
+        import model_config
+        selected = model_config.persist_opencodego_model((data or {}).get('model'))
+        debug(f"OpenCode Go model set to: {selected}", category="web_interface")
+        emit('opencodego_model_changed', {'model': selected}, broadcast=True)
+    except (ValueError, TypeError) as e:
+        emit('error', {'message': str(e)})
+    except Exception as e:
+        error(f"Error setting OpenCode Go model: {e}", exception=e, category="web_interface")
+        emit('error', {'message': 'Failed to set the OpenCode Go model'})
+
 @socketio.on('test_local_endpoint')
 def handle_test_local_endpoint(data):
     """Isolated liveness probe for the Local/Custom endpoint. Tests POSTED values
@@ -7175,7 +7214,15 @@ if __name__ == '__main__':
         port = 8357
     start_path = _web_start_path()
     print(f"Opening browser at http://localhost:{port}{start_path}")
-    
+
+    # Warm the OpenCode Go plan catalogue off-thread (no key = no request), so
+    # the Settings picker opens with the current list instead of a placeholder.
+    try:
+        from utils.opencodego_models import start_background_refresh
+        start_background_refresh()
+    except Exception:
+        pass
+
     # Run the Flask app with SocketIO
     socketio.run(app,
                 host=WEB_HOST,

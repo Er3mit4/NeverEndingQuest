@@ -63,6 +63,8 @@ export interface ProviderSettings {
   keyCheck: ServerEvents['openai_key_check'] | null
   geminiHasKey: boolean | null
   opencodegoHasKey: boolean | null
+  /** The OpenCode Go plan's model list and the player's choice. */
+  opencodegoModels: ServerEvents['opencodego_models'] | null
   codexStatus: ServerEvents['codex_status'] | null
   codexLogin: ServerEvents['codex_login'] | null
   endpointTest: ServerEvents['local_endpoint_test_result'] | null
@@ -103,6 +105,8 @@ export interface DialogsState {
   setKeyGate: (gate: 'start' | 'load' | null) => void
   setGeminiKeyStatus: (payload: ServerEvents['gemini_key_status']) => void
   setOpencodegoKeyStatus: (payload: ServerEvents['opencodego_key_status']) => void
+  setOpencodegoModels: (payload: ServerEvents['opencodego_models']) => void
+  setOpencodegoModel: (payload: ServerEvents['opencodego_model_changed']) => void
   setCodexStatus: (payload: ServerEvents['codex_status']) => void
   setCodexLogin: (payload: ServerEvents['codex_login']) => void
   setCodexModel: (payload: ServerEvents['codex_model_changed']) => void
@@ -142,6 +146,7 @@ export const useDialogs = create<DialogsState>((set) => ({
     keyCheck: null,
     geminiHasKey: null,
     opencodegoHasKey: null,
+    opencodegoModels: null,
     codexStatus: null,
     codexLogin: null,
     endpointTest: null,
@@ -240,6 +245,11 @@ export const useDialogs = create<DialogsState>((set) => ({
     set((s) => ({ settings: { ...s.settings, geminiHasKey: payload.has_key } })),
   setOpencodegoKeyStatus: (payload) =>
     set((s) => ({ settings: { ...s.settings, opencodegoHasKey: payload.has_key } })),
+  setOpencodegoModels: (payload) =>
+    set((s) => ({ settings: { ...s.settings, opencodegoModels: payload } })),
+  setOpencodegoModel: (payload) =>
+    set((s) => ({ settings: { ...s.settings, opencodegoModels: s.settings.opencodegoModels
+      ? { ...s.settings.opencodegoModels, selected: payload.model } : null } })),
   setCodexStatus: (payload) =>
     set((s) => ({ settings: { ...s.settings, codexStatus: payload } })),
   setCodexLogin: (payload) =>

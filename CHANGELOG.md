@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Custom Fork: OpenCode Go plan model picker (2026-10-25)
+
+- The OpenCode Go provider now offers the plan's whole catalogue instead of only
+  `deepseek-v4.1-flash`. The list is discovered from the relay's
+  `GET /zen/go/v1/models` when the service starts, cached in `user_settings.json`
+  for 6 hours, and refreshed on demand from Settings ("Refresh list") and after
+  a new key is saved. Without a usable key the plan's published list is shown, so
+  the picker is never empty; a refused key is reported without the secret.
+- Each model is sent on the wire the plan publishes for it: Chat Completions for
+  most, OpenAI Responses for `gpt-*`/`grok-*`/`muse-spark*`, and Anthropic
+  Messages for `claude-*`/`qwen*`/`minimax-m3` through the new
+  `core/ai/anthropic_wire.py`. Gemini 4 Argon is listed and disabled until a
+  Google-wire client is added.
+- Reasoning effort is only sent where the relay documents it (DeepSeek V4:
+  `low|high|max`; GLM-5.2: `high|max`). Every other model keeps the relay's own
+  default, because one unsupported level would fail every call for the provider.
+- New socket events `get_opencodego_models`, `refresh_opencodego_models` and
+  `set_opencodego_model` in both players; the choice persists as
+  `opencodego_model` in `user_settings.json` and the default stays
+  `deepseek-v4.1-flash`. `tests/test_opencodego_models.py` covers the catalogue,
+  the fallbacks, the effort clamp and the Anthropic wire.
+
 ### Custom Fork: upstream sync (2026-10-25)
 
 - Merged upstream `MoonlightByte/NeverEndingQuest` main up to `a2c6f324`
