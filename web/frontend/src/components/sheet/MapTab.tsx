@@ -16,6 +16,7 @@ import { useWorld } from '../../stores'
 import { useSettings } from '../../stores/settings'
 import { ExplorerNotes } from './ExplorerNotes'
 import { MapModal } from './MapModal'
+import { useT } from '../../i18n'
 import {
   FULL_VB,
   applyCurrentMarker,
@@ -32,6 +33,7 @@ import {
 import './MapTab.css'
 
 export function MapTab() {
+  const t = useT()
   const mapData = useWorld((s) => s.mapData)
   const mapDataError = useWorld((s) => s.mapDataError)
   const currentAreaId = useWorld((s) => s.location?.currentAreaId ?? null)
@@ -68,7 +70,7 @@ export function MapTab() {
   const warning =
     mapDataError ??
     (mapData && currentAreaId && mapData.areaId !== currentAreaId
-      ? `Map is showing ${mapData.areaId}; you are in ${currentAreaId}`
+      ? t('Map is showing {mapArea}; you are in {currentArea}', { mapArea: mapData.areaId, currentArea: currentAreaId })
       : null)
 
   // Shared by wheel-zoom/drag-pan (wirePanZoom's onChange) and an Explorer's
@@ -268,26 +270,26 @@ export function MapTab() {
           type="button"
           className="neq-map-btn"
           aria-pressed={mapTheme === 'night'}
-          title={mapTheme === 'night' ? 'Parchment' : 'Night ink'}
+          title={mapTheme === 'night' ? t('Parchment') : t('Night ink')}
           onClick={() => setMapTheme(mapTheme === 'night' ? 'day' : 'night')}
         >
-          {mapTheme === 'night' ? '☾ night' : '☀ day'}
+          {mapTheme === 'night' ? t('☾ night') : t('☀ day')}
         </button>
         <span className="neq-map-zoom">{zoomPct}%</span>
-        <button type="button" className="neq-map-btn" disabled={!mapData} onClick={handleFit}>⊙ fit</button>
-        <button type="button" className="neq-map-btn" disabled={!mapData} onClick={handleWhole}>▭ whole</button>
-        <button type="button" className="neq-map-btn" disabled={!mapData} onClick={() => setExpanded(true)}>⤢ expand</button>
+        <button type="button" className="neq-map-btn" disabled={!mapData} onClick={handleFit}>{t('⊙ fit')}</button>
+        <button type="button" className="neq-map-btn" disabled={!mapData} onClick={handleWhole}>{t('▭ whole')}</button>
+        <button type="button" className="neq-map-btn" disabled={!mapData} onClick={() => setExpanded(true)}>{t('⤢ expand')}</button>
       </div>
       <div className={`neq-map-stage-wrap${mapData ? '' : ' neq-map-stage-wrap--empty'}`}>
         <div ref={stageRef} className="neq-map-stage" />
-        {!mapData && <div className="neq-map-placeholder">The map is blank&hellip;</div>}
+        {!mapData && <div className="neq-map-placeholder">{t('The map is blank…')}</div>}
         {/* Only honest when the marker it explains is actually on the map:
             the marker is suppressed for an unrevealed current room (spoiler
             guard), so the legend must be too. */}
         {mapData && currentIsRevealed && (
           <span className="neq-map-here-pill">
             <i aria-hidden="true" />
-            You are here
+            {t('You are here')}
           </span>
         )}
       </div>

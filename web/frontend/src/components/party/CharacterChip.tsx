@@ -15,6 +15,7 @@ import './party-parity.css'
 import { useEmberDesktop } from '../layout/EmberPresentation'
 import { EmberInspection } from '../sheet/EmberInspection'
 import { PartyVitals } from './PartyVitals'
+import { useT } from '../../i18n'
 
 export type ChipVariant =
   | 'party-player'
@@ -90,6 +91,7 @@ export function CharacterChip({
   showVitals = false,
 }: CharacterChipProps) {
   const ember = useEmberDesktop()
+  const t = useT()
   const mediaRevision = useMediaRevision()
   const requestId = useRef(0)
   const chipRef = useRef<HTMLButtonElement>(null)
@@ -176,7 +178,7 @@ export function CharacterChip({
   const variantStyle = VARIANT_STYLE[variant]
   const isActive = active === true
   const isDown = down === true
-  const downLabel = isDown ? <small className="ember-turn-label neq-down-label">Unconscious</small> : null
+  const downLabel = isDown ? <small className="ember-turn-label neq-down-label">{t('Unconscious')}</small> : null
   const isPartyHover = hovered && (variant === 'party-player' || variant === 'party-npc')
   const isLocationHover = hovered && variant === 'location-npc'
   const isEnemyMediaHover = hovered && variant === 'init-enemy' && clickMedia !== undefined
@@ -200,19 +202,19 @@ export function CharacterChip({
     }
     return <div className="ember-person-entry ember-person-card">
       {onOpenDetails
-        ? <button type="button" className="ember-card-bio" aria-label={`${displayName} full character details`} onClick={openDetails} />
-        : <EmberInspection label={`${displayName} statistics`} triggerContent={<span className="sr-only">{displayName} statistics</span>} className="ember-card-bio"><StatsTooltip stats={stats} anchor={null} inline /></EmberInspection>}
+        ? <button type="button" className="ember-card-bio" aria-label={t('{name} full character details', { name: displayName })} onClick={openDetails} />
+        : <EmberInspection label={t('{name} statistics', { name: displayName })} triggerContent={<span className="sr-only">{t('{name} statistics', { name: displayName })}</span>} className="ember-card-bio"><StatsTooltip stats={stats} anchor={null} inline /></EmberInspection>}
       <div className="neq-character-chip" data-chip={variant} data-name={name} data-active={isActive ? 'true' : 'false'} data-down={isDown ? 'true' : undefined}>
-        <button ref={chipRef} type="button" className="ember-card-portrait" aria-label={`${displayName} portrait`} aria-busy={mediaPending} disabled={!clickMedia} onClick={handleClick}>
+        <button ref={chipRef} type="button" className="ember-card-portrait" aria-label={t('{name} portrait', { name: displayName })} aria-busy={mediaPending} disabled={!clickMedia} onClick={handleClick}>
           <span className="ember-chip-portrait" aria-hidden="true" style={thumb ? { backgroundImage: cssImageUrl(thumb) } : undefined}>{!thumb && displayName.slice(0, 1)}</span>
         </button>
         <span className="ember-card-summary">
           {displayName}
           <PartyVitals stats={stats} down={isDown} />
           {downLabel}
-          {isActive && <small className="ember-turn-label">Your turn</small>}
-          {mediaPending && <small className="ember-turn-label" role="status">Loading media…</small>}
-          {mediaMissing && <small className="ember-turn-label" role="status">No media available</small>}
+          {isActive && <small className="ember-turn-label">{t('Your turn')}</small>}
+          {mediaPending && <small className="ember-turn-label" role="status">{t('Loading media…')}</small>}
+          {mediaMissing && <small className="ember-turn-label" role="status">{t('No media available')}</small>}
         </span>
       </div>
     </div>
@@ -223,7 +225,7 @@ export function CharacterChip({
       <button
         ref={chipRef}
         type="button"
-        aria-label={isDown ? `${displayName}, unconscious` : displayName}
+        aria-label={isDown ? t('{name}, unconscious', { name: displayName }) : displayName}
         aria-busy={mediaPending}
         aria-current={ember && isActive ? 'step' : undefined}
         data-chip={variant}
@@ -276,12 +278,12 @@ export function CharacterChip({
           {displayName}
           {ember && showVitals && <PartyVitals stats={stats} down={isDown} />}
           {downLabel}
-          {ember && isActive && <small className="ember-turn-label">Your turn</small>}
-          {mediaPending && <small className="ember-turn-label" role="status">Loading media…</small>}
-          {mediaMissing && <small className="ember-turn-label" role="status">No media available</small>}
+          {ember && isActive && <small className="ember-turn-label">{t('Your turn')}</small>}
+          {mediaPending && <small className="ember-turn-label" role="status">{t('Loading media…')}</small>}
+          {mediaMissing && <small className="ember-turn-label" role="status">{t('No media available')}</small>}
         </span>
       </button>
-      {ember && (onOpenDetails ? <button type="button" className="ember-person-details" aria-label={`${displayName} full character details`} onClick={() => { window.dispatchEvent(new CustomEvent('neq:media-request')); setHovered(false); if (showTimer.current !== null) window.clearTimeout(showTimer.current); onOpenDetails() }}>Details</button> : <EmberInspection label={`${displayName} statistics`} triggerContent="Details" className="ember-person-details"><StatsTooltip stats={stats} anchor={null} inline /></EmberInspection>)}
+      {ember && (onOpenDetails ? <button type="button" className="ember-person-details" aria-label={t('{name} full character details', { name: displayName })} onClick={() => { window.dispatchEvent(new CustomEvent('neq:media-request')); setHovered(false); if (showTimer.current !== null) window.clearTimeout(showTimer.current); onOpenDetails() }}>{t('Details')}</button> : <EmberInspection label={t('{name} statistics', { name: displayName })} triggerContent={t('Details')} className="ember-person-details"><StatsTooltip stats={stats} anchor={null} inline /></EmberInspection>)}
       {hovered && <StatsTooltip stats={stats} anchor={chipRef.current} />}
     </div>
   )

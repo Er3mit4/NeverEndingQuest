@@ -5,6 +5,7 @@
  */
 import { useEffect, useRef } from 'react'
 import { useLog } from '../../stores'
+import { formatNumber, useT } from '../../i18n'
 import './DebugTab.css'
 
 function formatTimestamp(timestamp: string): string {
@@ -12,6 +13,7 @@ function formatTimestamp(timestamp: string): string {
 }
 
 export function DebugTab() {
+  const t = useT()
   const debug = useLog((s) => s.debug)
   const tokens = useLog((s) => s.tokens)
   const scrollRef = useRef<HTMLDivElement | null>(null)
@@ -26,11 +28,11 @@ export function DebugTab() {
     <div className="neq-debug-tab">
       <div className="neq-token-usage-header">
         <div className="neq-token-stats">
-          <span className="neq-token-label">TPM:</span> <span className="neq-token-value">{tokens.tpm.toLocaleString()}</span>
+          <span className="neq-token-label">TPM:</span> <span className="neq-token-value">{formatNumber(tokens.tpm)}</span>
           <span className="neq-token-separator">|</span>
-          <span className="neq-token-label">RPM:</span> <span className="neq-token-value">{tokens.rpm.toLocaleString()}</span>
+          <span className="neq-token-label">RPM:</span> <span className="neq-token-value">{formatNumber(tokens.rpm)}</span>
           <span className="neq-token-separator">|</span>
-          <span className="neq-token-label">Total:</span> <span className="neq-token-value">{tokens.total_tokens.toLocaleString()}</span>
+          <span className="neq-token-label">{t('Total:')}</span> <span className="neq-token-value">{formatNumber(tokens.total_tokens)}</span>
         </div>
       </div>
       <div ref={scrollRef} className="neq-debug-scrollable">

@@ -7,24 +7,27 @@ import { SettingsMenu } from '../settings/SettingsMenu'
 import { useUiMode } from '../../modes/useUiMode'
 import { SpendLine } from './SpendLine'
 import { needsOpenaiKey } from '../settings/keySetupText'
+import { useT } from '../../i18n'
 
 const injectedVersion = document
   .querySelector<HTMLMetaElement>('meta[name="neq-version"]')
   ?.content.replace('__NEQ_VERSION__', '') || undefined
 
 function ShimmerTitle({ version, updateAvailable, onUpdate }: { version?: string | undefined; updateAvailable: boolean; onUpdate: () => void }) {
+  const t = useT()
   return (
     <h1 className="neq-shimmer-title whitespace-nowrap">
       Never<span>Ending</span>Quest{' '}{version && <small className="neq-version">{`v${version}`}</small>}
-      {updateAvailable && <button type="button" onClick={onUpdate} className="neq-update-button-parity">[UPDATE] Update Available</button>}
+      {updateAvailable && <button type="button" onClick={onUpdate} className="neq-update-button-parity">{t('[UPDATE] Update Available')}</button>}
     </h1>
   )
 }
 
 function ConnectionDot() {
+  const t = useT()
   const connected = useSession((s) => s.connected)
-  const label = connected ? 'Connected' : 'Disconnected'
-  return <div className="neq-connection flex items-center"><span>{label}</span><span title={connected ? 'Connected' : 'Disconnected'} aria-label={connected ? 'Connected' : 'Disconnected'} className="inline-block h-[10px] w-[10px] rounded-full" style={{ backgroundColor: connected ? 'var(--accent)' : '#555' }} /></div>
+  const label = connected ? t('Connected') : t('Disconnected')
+  return <div className="neq-connection flex items-center"><span>{label}</span><span title={label} aria-label={label} className="inline-block h-[10px] w-[10px] rounded-full" style={{ backgroundColor: connected ? 'var(--accent)' : '#555' }} /></div>
 }
 
 const buttonClass =
@@ -34,6 +37,7 @@ const buttonClass =
 export const EXIT_SAFE_MESSAGE = 'You can now safely close this browser tab.'
 
 export function HeaderBar() {
+  const t = useT()
   const ember = useEmberViewport()
   const [confirmExit, setConfirmExit] = useState(false)
   const exitSubmitted = useRef(false)
@@ -101,12 +105,12 @@ export function HeaderBar() {
   // Legacy changes the initial connected/pre-start label to "New Game" until
   // the first successful start records neq_hasPlayed. Subsequent fresh starts
   // retain the normal "Start Game" wording.
-  const startLabel = connected && !localStorage.getItem('neq_hasPlayed') ? 'New Game' : 'Start Game'
+  const startLabel = connected && !localStorage.getItem('neq_hasPlayed') ? t('New Game') : t('Start Game')
   const locationName = location
     ? `${location.currentLocation} (${location.currentArea})`
     : ''
   const locationDetails = location
-    ? `${location.time ? `${location.day} ${location.month} ${location.year} - ${location.time}` : 'Time Unknown'} ${location.currentLocationId ? `[${location.currentAreaId}:${location.currentLocationId}]` : ''}`
+    ? `${location.time ? `${location.day} ${location.month} ${location.year} - ${location.time}` : t('Time Unknown')} ${location.currentLocationId ? `[${location.currentAreaId}:${location.currentLocationId}]` : ''}`
     : ''
 
   return (
@@ -119,9 +123,9 @@ export function HeaderBar() {
         {location ? (
           <><div className="neq-location-name truncate font-log text-sm font-bold text-accent">{locationName}</div><div className="neq-location-details truncate font-log text-xs text-secondary">{locationDetails}</div></>
         ) : locationError ? (
-          <div className="neq-location-name truncate font-log text-sm font-bold">Location Unknown</div>
+          <div className="neq-location-name truncate font-log text-sm font-bold">{t('Location Unknown')}</div>
         ) : (
-          <div className="neq-location-name truncate font-log text-sm font-bold">Loading location...</div>
+          <div className="neq-location-name truncate font-log text-sm font-bold">{t('Loading location...')}</div>
         )}
       </div>
 
@@ -131,34 +135,34 @@ export function HeaderBar() {
         <button type="button" className={buttonClass} onClick={handleStart}
           disabled={!connected || isStarting || gameReady || recoveryRequired || restorePending}
           style={{ backgroundColor: isStarting ? '#1976d2' : '#2196f3', borderRadius: '3px', color: 'white', fontWeight: 700 }}>
-          {gameReady ? 'Game Running' : isStarting ? 'Starting...' : startLabel}
+          {gameReady ? t('Game Running') : isStarting ? t('Starting...') : startLabel}
         </button>
         <button type="button" className={buttonClass} onClick={handleSave} disabled={resetPending || !connected || !lifecycleAvailable}
           style={{ backgroundColor: lifecycleAvailable ? '#ff9800' : '#555', color: 'white' }}>
-          Save
+          {t('Save')}
         </button>
         <button type="button" className={buttonClass} onClick={handleLoad} disabled={resetPending || !connected || !recoveryControlsAvailable}
           style={{ backgroundColor: recoveryControlsAvailable ? '#9c27b0' : '#555', color: 'white' }}>
-          Load
+          {t('Load')}
         </button>
         <button type="button" className={buttonClass} onClick={handleReset} disabled={resetPending || !connected || !recoveryControlsAvailable}
           style={{ backgroundColor: recoveryControlsAvailable ? '#f44336' : '#555', color: 'white' }}>
-          Reset
+          {t('Reset')}
         </button>
         {isLocalEdition && <SettingsMenu />}
-        <button type="button" className={`${buttonClass} neq-toolkit-button`} onClick={handleToolkit} title="Open Module Toolkit">
+        <button type="button" className={`${buttonClass} neq-toolkit-button`} onClick={handleToolkit} title={t('Open Module Toolkit')}>
           <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M22,2V8H20V4H17V2H22M2,8V2H7V4H4V8H2M20,13.09A2.5,2.5 0 0,0 22.5,15.59C22.5,16.9 21.4,18 20,18H4C2.6,18 1.5,16.9 1.5,15.59C1.5,14.09 2.59,12.83 4,12.5V10H20V13.09M20,16H4A1,1 0 0,1 3,15A1,1 0 0,1 4,14H20A1,1 0 0,1 21,15A1,1 0 0,1 20,16Z" /></svg>
-          <span>Toolkit</span>
+          <span>{t('Toolkit')}</span>
         </button>
         <button type="button" className={`${buttonClass} neq-exit-button`} onClick={() => {
           exitSubmitted.current = false
           if (ember) setConfirmExit(true)
-          else if (window.confirm('Are you sure you want to exit the game?')) handleExit()
+          else if (window.confirm(t('Are you sure you want to exit the game?'))) handleExit()
         }} style={{ color: 'white', fontWeight: 700 }}>
-          × Exit
+          {t('× Exit')}
         </button>
       </div>
-      {confirmExit && <ConfirmDialog title="Exit Game" message="Are you sure you want to exit the game?" confirmLabel="Exit Game" onCancel={() => setConfirmExit(false)} onConfirm={handleExit} />}
+      {confirmExit && <ConfirmDialog title={t('Exit Game')} message={t('Are you sure you want to exit the game?')} confirmLabel={t('Exit Game')} onCancel={() => setConfirmExit(false)} onConfirm={handleExit} />}
     </div>
   )
 }

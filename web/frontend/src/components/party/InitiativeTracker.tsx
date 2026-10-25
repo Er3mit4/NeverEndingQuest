@@ -31,8 +31,10 @@ import { useEmberDesktop } from '../layout/EmberPresentation'
 import { matchingNpc, partySummary } from './partyData'
 import { NpcCardDialog } from './NpcCardDialog'
 import { PlayerCardDialog } from './PlayerCardDialog'
+import { useT } from '../../i18n'
 
 export function InitiativeTracker() {
+  const t = useT()
   const ember = useEmberDesktop()
   const npcs = usePlayer((s) => s.npcs)
   const npcError = usePlayer((s) => s.dataErrors.npcs)
@@ -116,7 +118,7 @@ export function InitiativeTracker() {
         {initiative.recovery.message}
       </div>
     ) : null}
-    <HorizontalChipRail label="Initiative order" itemCount={initiative.combatants.length}>
+    <HorizontalChipRail label={t('Initiative order')} itemCount={initiative.combatants.length}>
       {initiative.combatants.map(renderCombatant)}
     </HorizontalChipRail>
     <MediaPopup media={media} onClose={() => setMedia(null)} />

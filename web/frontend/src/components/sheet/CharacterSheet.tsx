@@ -34,19 +34,29 @@ import { invalidateMediaCaches, useMediaRevision } from '../party/media'
 import { EmberInspection } from './EmberInspection'
 import { EmberIcon } from '../layout/EmberIcon'
 import { CharacterSheetIdentity } from './CharacterSheetIdentity'
+import { useT, useV, type MessageKey } from '../../i18n'
 
 // ASCII-only source: proficiency dots as escapes (filled / open circle).
 const PROFICIENT_DOT = '\u25CF'
 const UNPROFICIENT_DOT = '\u25CB'
 
-function SheetSection({ title, items, empty, accentItems = false, rightSuffix = false, splitSuffix = false, tooltips = true }: { title: string; items: Array<{ name: string; detail?: string; suffix?: string }>; empty?: string; accentItems?: boolean; rightSuffix?: boolean; splitSuffix?: boolean; tooltips?: boolean }) {
+/** Biography field labels, keyed by the raw character-file field name. */
+const BIO_LABELS = {
+  personality_traits: 'Personality Traits',
+  ideals: 'Ideals',
+  bonds: 'Bonds',
+  flaws: 'Flaws',
+} as const
+
+function SheetSection({ title, items, empty, accentItems = false, rightSuffix = false, splitSuffix = false, tooltips = true }: { title: MessageKey; items: Array<{ name: string; detail?: string; suffix?: string }>; empty?: MessageKey; accentItems?: boolean; rightSuffix?: boolean; splitSuffix?: boolean; tooltips?: boolean }) {
+  const t = useT()
   const ember = useEmberDesktop()
   const [hovered, setHovered] = useState<{ item: { name: string; detail?: string }; anchor: HTMLElement } | null>(null)
   return <>
     <section className="neq-sheet-section mt-1 rounded border border-card bg-panel">
-      <h4 className="border-b border-card px-2 py-1 font-display text-sm uppercase text-[#ffa500]">{title}</h4>
+      <h4 className="border-b border-card px-2 py-1 font-display text-sm uppercase text-[#ffa500]">{t(title)}</h4>
       <div className="neq-sheet-section-content px-2 py-1">
-        {items.length === 0 ? <div className="text-sm text-secondary">{empty}</div> : items.map((item, index) => (
+        {items.length === 0 ? <div className="text-sm text-secondary">{empty ? t(empty) : null}</div> : items.map((item, index) => (
           <div
             key={`${item.name}-${index}`}
             data-has-tooltip={tooltips ? 'true' : 'false'}
@@ -54,7 +64,7 @@ function SheetSection({ title, items, empty, accentItems = false, rightSuffix = 
             onMouseLeave={!ember && tooltips ? () => setHovered(null) : undefined}
             className={`neq-feature-item text-sm ${rightSuffix ? 'flex justify-between' : ''} ${accentItems ? 'text-accent' : 'text-[#aaa]'}`}
           >
-            <span className={splitSuffix ? 'neq-ammo-name' : ''}>{ember && tooltips ? <EmberInspection label={item.name}><p style={{ whiteSpace: 'pre-wrap' }}>{item.detail || 'No description available.'}</p></EmberInspection> : item.name}</span>{item.suffix && (() => {
+            <span className={splitSuffix ? 'neq-ammo-name' : ''}>{ember && tooltips ? <EmberInspection label={item.name}><p style={{ whiteSpace: 'pre-wrap' }}>{item.detail || t('No description available.')}</p></EmberInspection> : item.name}</span>{item.suffix && (() => {
               const usage = title === 'Class Features' ? item.suffix.match(/^\s*(\d+\/\d+)(?:\s+\((.+)\))?$/) : null
               if (usage) return <><span className="neq-usage-counter">{usage[1]}</span>{usage[2] && <span className="neq-feature-refresh">({usage[2]})</span>}</>
               return <span className={rightSuffix ? 'neq-feature-suffix' : splitSuffix ? 'neq-ammo-quantity' : ''}>{rightSuffix && <span className="sr-only"> — </span>}{rightSuffix ? item.suffix.replace(/^\s*—\s*/, '') : item.suffix}</span>
@@ -63,11 +73,12 @@ function SheetSection({ title, items, empty, accentItems = false, rightSuffix = 
         ))}
       </div>
     </section>
-    {hovered && <GenericFeatureTooltip anchor={hovered.anchor} title={hovered.item.name} content={hovered.item.detail || 'No description available.'} />}
+    {hovered && <GenericFeatureTooltip anchor={hovered.anchor} title={hovered.item.name} content={hovered.item.detail || t('No description available.')} />}
   </>
 }
 
 export function Portrait({ name }: { name: string }) {
+  const t = useT()
   const revision = useMediaRevision()
   const [failed, setFailed] = useState(false)
   const [cacheBust, setCacheBust] = useState('')
@@ -81,35 +92,37 @@ export function Portrait({ name }: { name: string }) {
   const upload = async (file: File | undefined) => {
     if (!file || uploading) return
     if (!file.type.startsWith('image/')) {
-      useLog.getState().append({ type: 'error', content: 'Upload failed: select an image file.' })
+      useLog.getState().append({ type: 'error', content: t('Upload failed: select an image file.') })
       return
     }
     setUploading(true)
-    useLog.getState().append({ type: 'system', content: 'Uploading and processing portrait...' })
+    useLog.getState().append({ type: 'system', content: t('Uploading and processing portrait...') })
     const body = new FormData(); body.append('portrait', file); body.append('characterName', slug)
     try {
       const response = await fetch('/upload-portrait', { method: 'POST', body })
       const result = await response.json() as { success?: boolean; message?: string }
-      if (!response.ok || !result.success) throw new Error(result.message || 'Upload failed')
+      if (!response.ok || !result.success) throw new Error(result.message || t('Upload failed'))
       setFailed(false); setCacheBust(`?v=${Date.now()}`)
       invalidateMediaCaches(name, true)
-      useLog.getState().append({ type: 'system', content: 'Portrait updated successfully!' })
+      useLog.getState().append({ type: 'system', content: t('Portrait updated successfully!') })
     } catch (error) {
-      useLog.getState().append({ type: 'error', content: `Upload failed: ${error instanceof Error ? error.message : String(error)}` })
+      useLog.getState().append({ type: 'error', content: t('Upload failed: {error}', { error: error instanceof Error ? error.message : String(error) }) })
     } finally {
       setUploading(false); if (inputRef.current) inputRef.current.value = ''
     }
   }
   return (
     <div className="neq-character-portrait group relative h-[150px] w-[150px] shrink-0 overflow-hidden rounded border-2 border-card bg-page">
-      <img src={src} alt={`Portrait of ${name}`} onError={() => setFailed(true)} className="h-full w-full object-cover" />
-      <button type="button" disabled={uploading} onClick={() => inputRef.current?.click()} className="absolute inset-0 flex cursor-pointer items-center justify-center border-0 bg-black/70 px-2 text-center text-sm font-bold text-white opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100">{uploading ? 'Uploading...' : 'Upload Portrait'}</button>
-      <input ref={inputRef} type="file" accept="image/*" className="hidden" aria-label="Choose portrait image" onChange={(event) => void upload(event.target.files?.[0])} />
+      <img src={src} alt={t('Portrait of {name}', { name })} onError={() => setFailed(true)} className="h-full w-full object-cover" />
+      <button type="button" disabled={uploading} onClick={() => inputRef.current?.click()} className="absolute inset-0 flex cursor-pointer items-center justify-center border-0 bg-black/70 px-2 text-center text-sm font-bold text-white opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100">{uploading ? t('Uploading...') : t('Upload Portrait')}</button>
+      <input ref={inputRef} type="file" accept="image/*" className="hidden" aria-label={t('Choose portrait image')} onChange={(event) => void upload(event.target.files?.[0])} />
     </div>
   )
 }
 
 export function CharacterSheet({ expanded = false, hideIdentity = false }: { expanded?: boolean; hideIdentity?: boolean } = {}) {
+  const t = useT()
+  const v = useV()
   const ember = useEmberDesktop()
   const stats = usePlayer((s) => s.stats)
   const error = usePlayer((s) => s.dataErrors.stats)
@@ -123,7 +136,7 @@ export function CharacterSheet({ expanded = false, hideIdentity = false }: { exp
     return <p role={ember ? 'status' : undefined} data-state="notice" className="ember-sheet-status p-4 font-body text-sm text-secondary">{notice}</p>
   }
   if (!stats) {
-    return <p role={ember ? 'status' : undefined} data-state="loading" className="ember-sheet-status neq-character-loading-parity">Loading character stats...</p>
+    return <p role={ember ? 'status' : undefined} data-state="loading" className="ember-sheet-status neq-character-loading-parity">{t('Loading character stats...')}</p>
   }
 
   const name = str(stats['name'], 'Unknown Adventurer')
@@ -138,7 +151,7 @@ export function CharacterSheet({ expanded = false, hideIdentity = false }: { exp
   const currency = currencyOf(stats)
   const attacks = arr(stats['attacksAndSpellcasting']).map(rec).filter((item): item is Record<string, unknown> => item !== null).map((weapon) => {
     const damage = str(weapon['damage']) || `${str(weapon['damageDice'], '1d4')}+${num(weapon['damageBonus'])}`
-    return { name: str(weapon['name'], 'Unknown weapon'), suffix: ` (${damage})`, detail: str(weapon['description']) }
+    return { name: str(weapon['name'], t('Unknown weapon')), suffix: ` (${damage})`, detail: str(weapon['description']) }
   })
   const ammunition = arr(stats['ammunition']).map(rec).filter((item): item is Record<string, unknown> => item !== null).map((ammo) => ({ name: str(ammo['name'], 'Unknown'), suffix: `×${num(ammo['quantity'])}` }))
   const featureItems = (key: string) => arr(stats[key]).map(rec).filter((item): item is Record<string, unknown> => item !== null).map((item) => {
@@ -150,7 +163,7 @@ export function CharacterSheet({ expanded = false, hideIdentity = false }: { exp
   })
   const racialTraits = featureItems('racialTraits').filter((trait) => !['Ability Score Increase', 'Languages', 'Extra Language'].includes(trait.name))
   // #1276: the typed languages field, shown as written (the trait filter above drops its prose restatement).
-  const languages = arr(stats['languages']).filter((name): name is string => typeof name === 'string' && name.trim() !== '').map((name) => ({ name }))
+  const languages = arr(stats['languages']).filter((name): name is string => typeof name === 'string' && name.trim() !== '').map((name) => ({ name: v('language', name) }))
   const background = rec(stats['backgroundFeature'])
 
   return (
@@ -163,23 +176,23 @@ export function CharacterSheet({ expanded = false, hideIdentity = false }: { exp
           <div className="neq-character-name font-display">{name}</div>
           <div className="neq-character-details mt-1 space-y-0.5 text-sm text-[#ccc]">
             <div>
-              <span className="text-accent">Level {num(stats['level'], 1)}</span>{' '}
+              <span className="text-accent">{t('Level {level}', { level: num(stats['level'], 1) })}</span>{' '}
               <span className="text-primary">
-                {str(stats['race'], 'Unknown')} {str(stats['class'], 'Adventurer')}
+                {str(stats['race'], t('Unknown'))} {v('className', str(stats['class'], t('Adventurer')))}
               </span>
             </div>
             <div className="ember-xp-line">
-              <span className="text-accent">XP:</span> {num(stats['experience_points'])} /{' '}
+              <span className="text-accent">{t('XP:')}</span> {num(stats['experience_points'])} /{' '}
               {num(stats['exp_required_for_next_level'])}
             </div>
-            {ember && <div className="ember-xp-track" role="progressbar" aria-label="Experience" aria-valuemin={0} aria-valuemax={num(stats['exp_required_for_next_level']) || 1} aria-valuenow={num(stats['experience_points'])}><span style={{ width: `${Math.max(0, Math.min(100, num(stats['experience_points']) / (num(stats['exp_required_for_next_level']) || 1) * 100))}%` }} /></div>}
+            {ember && <div className="ember-xp-track" role="progressbar" aria-label={t('Experience')} aria-valuemin={0} aria-valuemax={num(stats['exp_required_for_next_level']) || 1} aria-valuenow={num(stats['experience_points'])}><span style={{ width: `${Math.max(0, Math.min(100, num(stats['experience_points']) / (num(stats['exp_required_for_next_level']) || 1) * 100))}%` }} /></div>}
             <div className="ember-profession">
-              <span className="text-accent">Profession:</span>{' '}
-              {str(stats['background'], 'Adventurer')}
+              <span className="text-accent">{t('Profession:')}</span>{' '}
+              {str(stats['background'], t('Adventurer'))}
             </div>
             <div className="ember-alignment">
-              <span className="text-accent">Alignment:</span>{' '}
-              {capitalizeWords(str(stats['alignment'], 'Neutral'))}
+              <span className="text-accent">{t('Alignment:')}</span>{' '}
+              {v('alignment', capitalizeWords(str(stats['alignment'], 'Neutral')))}
             </div>
           </div>
         </div>
@@ -187,26 +200,26 @@ export function CharacterSheet({ expanded = false, hideIdentity = false }: { exp
 
       {/* ability grid with hover skill tooltips */}
       <div className="neq-abilities-row mt-3 grid grid-cols-6 gap-1">
-        {expanded && <h4 className="tps-section-label">Abilities</h4>}
+        {expanded && <h4 className="tps-section-label">{t('Abilities')}</h4>}
         {ABILITIES.map((ability) => {
           const score = scores[ability]
           const abilityLabel = capitalize(ability)
           const abilitySkills = SKILL_MAP[abilityLabel] ?? []
           if (ember && abilitySkills.length > 0) return <div key={ability} className="neq-ability-score relative rounded border-2 border-card bg-panel py-1 text-center">
-            <EmberInspection label={`${abilityLabel} ${score}, modifier ${formatModifier(abilityModifier(score))}`} className="ember-ability-inspection" triggerContent={<>
-              <span className="neq-ability-name block font-display text-[10px] text-secondary">{expanded ? abilityLabel : ability.slice(0, 3).toUpperCase()}</span>
+            <EmberInspection label={t('{ability} {score}, modifier {modifier}', { ability: v('ability', abilityLabel), score, modifier: formatModifier(abilityModifier(score)) })} className="ember-ability-inspection" triggerContent={<>
+              <span className="neq-ability-name block font-display text-[10px] text-secondary">{expanded ? v('ability', abilityLabel) : v('ability', ability).slice(0, 3).toUpperCase()}</span>
               <span className="neq-ability-value block text-base leading-tight text-primary">{score}</span>
               <span className="neq-ability-modifier block text-xs text-accent">{formatModifier(abilityModifier(score))}</span>
             </>}>
-              <h4>{abilityLabel} Skills</h4>
-              <dl>{abilitySkills.map(skill => <div className="ember-inspection-meta" key={skill}><dt>{skills.includes(skill) ? PROFICIENT_DOT : UNPROFICIENT_DOT} {skill}</dt><dd>{formatModifier(abilityModifier(score) + (skills.includes(skill) ? num(stats['proficiencyBonus'], 2) : 0))}</dd></div>)}</dl>
+              <h4>{t('{ability} Skills', { ability: v('ability', abilityLabel) })}</h4>
+              <dl>{abilitySkills.map(skill => <div className="ember-inspection-meta" key={skill}><dt>{skills.includes(skill) ? PROFICIENT_DOT : UNPROFICIENT_DOT} {v('skill', skill)}</dt><dd>{formatModifier(abilityModifier(score) + (skills.includes(skill) ? num(stats['proficiencyBonus'], 2) : 0))}</dd></div>)}</dl>
             </EmberInspection>
           </div>
           return (
             <div
               key={ability}
               tabIndex={ember && abilitySkills.length > 0 ? 0 : undefined}
-              aria-label={ember ? `${abilityLabel} ${score}, modifier ${formatModifier(abilityModifier(score))}` : undefined}
+              aria-label={ember ? t('{ability} {score}, modifier {modifier}', { ability: v('ability', abilityLabel), score, modifier: formatModifier(abilityModifier(score)) }) : undefined}
               onFocus={ember && abilitySkills.length > 0 ? (event) => setSkillHover({ ability, anchor: event.currentTarget }) : undefined}
               onBlur={ember ? () => setSkillHover(null) : undefined}
               onMouseEnter={abilitySkills.length > 0 ? (event) => setSkillHover({ ability, anchor: event.currentTarget }) : undefined}
@@ -214,7 +227,7 @@ export function CharacterSheet({ expanded = false, hideIdentity = false }: { exp
               className="neq-ability-score relative rounded border-2 border-card bg-panel py-1 text-center"
             >
               <div className="neq-ability-name font-display text-[10px] text-secondary">
-                {expanded ? abilityLabel : ability.slice(0, 3).toUpperCase()}
+                {expanded ? v('ability', abilityLabel) : v('ability', ability).slice(0, 3).toUpperCase()}
               </div>
               <div className="neq-ability-value text-base leading-tight text-primary">{score}</div>
               <div className="neq-ability-modifier text-xs text-accent">{formatModifier(abilityModifier(score))}</div>
@@ -227,16 +240,16 @@ export function CharacterSheet({ expanded = false, hideIdentity = false }: { exp
         const mod = abilityModifier(scores[skillHover.ability])
         const rows = (SKILL_MAP[label] ?? []).map((skill) => {
           const proficient = skills.includes(skill)
-          return { name: skill, proficient, bonus: mod + (proficient ? num(stats['proficiencyBonus'], 2) : 0) }
+          return { name: v('skill', skill), proficient, bonus: mod + (proficient ? num(stats['proficiencyBonus'], 2) : 0) }
         })
-        return <SkillTooltip anchor={skillHover.anchor} ability={label} rows={rows} />
+        return <SkillTooltip anchor={skillHover.anchor} ability={v('ability', label)} rows={rows} />
       })()}
 
       {/* HP / AC / INIT / currency */}
       <div className="neq-combat-stats mt-3 grid grid-cols-6 gap-1">
-        {expanded && <h4 className="tps-section-label">Combat</h4>}
+        {expanded && <h4 className="tps-section-label">{t('Combat')}</h4>}
         <div className="neq-combat-stat rounded border border-accent bg-panel p-2 text-center">
-          <div className="neq-combat-label font-display text-[10px] text-secondary">{ember && <EmberIcon name="heart" />}HP</div>
+          <div className="neq-combat-label font-display text-[10px] text-secondary">{ember && <EmberIcon name="heart" />}{t('HP')}</div>
           <div className="neq-combat-value text-base text-accent">
             {hp}/{maxHp}
           </div>
@@ -248,18 +261,18 @@ export function CharacterSheet({ expanded = false, hideIdentity = false }: { exp
           </div>
         </div>
         <div className="neq-combat-stat rounded border border-accent bg-panel p-2 text-center">
-          <div className="neq-combat-label font-display text-[10px] text-secondary">{ember && <EmberIcon name="shield" />}AC</div>
+          <div className="neq-combat-label font-display text-[10px] text-secondary">{ember && <EmberIcon name="shield" />}{t('AC')}</div>
           <div className="neq-combat-value text-base text-accent">{num(stats['armorClass'], 10)}</div>
         </div>
         <div className="neq-combat-stat rounded border border-accent bg-panel p-2 text-center">
-          <div className="neq-combat-label font-display text-[10px] text-secondary">{ember && <EmberIcon name="boot" />}INIT</div>
+          <div className="neq-combat-label font-display text-[10px] text-secondary">{ember && <EmberIcon name="boot" />}{t('INIT')}</div>
           <div className="neq-combat-value text-base text-accent">
             {formatModifier(num(stats['initiative']))}
           </div>
         </div>
-        {!ember && [['GP', currency.gold], ['SP', currency.silver], ['CP', currency.copper]].map(([label, value]) => (
+        {!ember && ([['GP', currency.gold], ['SP', currency.silver], ['CP', currency.copper]] as const).map(([label, value]) => (
           <div key={label} className="neq-combat-stat neq-currency rounded border border-[#b8860b] bg-panel p-2 text-center">
-            <div className="neq-combat-label font-display text-[10px] text-secondary">{label}</div>
+            <div className="neq-combat-label font-display text-[10px] text-secondary">{v('coin', label)}</div>
             <div className="neq-combat-value text-base text-accent">{value}</div>
           </div>
         ))}
@@ -272,31 +285,37 @@ export function CharacterSheet({ expanded = false, hideIdentity = false }: { exp
 
       {/* saving throws */}
       {hasSavingThrows && <div className="neq-saving-throws mt-3 rounded border border-card bg-panel p-2">
-        <h4 className="font-display text-xs text-[#ffa500]">Saving Throws</h4>
+        <h4 className="font-display text-xs text-[#ffa500]">{t('Saving Throws')}</h4>
         <div className="neq-saving-throws-grid mt-1 grid grid-cols-2 gap-x-4 gap-y-1">
-          {saves.map((save) => (
-            <div key={save.name} className="flex justify-between text-sm" aria-label={ember ? `${save.name} ${formatModifier(save.bonus)}${save.proficient ? ', proficient' : ''}` : undefined} title={`${save.name}${save.proficient ? ' — proficient' : ''}`}>
+          {saves.map((save) => {
+            const name = v('ability', save.name)
+            return (
+            <div key={save.name} className="flex justify-between text-sm" aria-label={ember ? `${name} ${formatModifier(save.bonus)}${save.proficient ? t(', proficient') : ''}` : undefined} title={`${name}${save.proficient ? t(' — proficient') : ''}`}>
               <span className={save.proficient ? 'text-primary' : 'text-secondary'}>
-                {expanded && <span aria-hidden="true">{save.proficient ? PROFICIENT_DOT : UNPROFICIENT_DOT} </span>}{ember ? save.name.slice(0, 3).toUpperCase() : save.name} {!ember && (save.proficient ? PROFICIENT_DOT : UNPROFICIENT_DOT)}
+                {expanded && <span aria-hidden="true">{save.proficient ? PROFICIENT_DOT : UNPROFICIENT_DOT} </span>}{ember ? name.slice(0, 3).toUpperCase() : name} {!ember && (save.proficient ? PROFICIENT_DOT : UNPROFICIENT_DOT)}
               </span>
               <span className="text-accent">{formatModifier(save.bonus)}</span>
             </div>
-          ))}
+            )
+          })}
         </div>
       </div>}
 
       {/* every skill with its bonus; proficient ones are marked */}
       {!expanded && <div className="neq-saving-throws neq-skills mt-3 rounded border border-card bg-panel p-2">
-        <h4 className="font-display text-xs text-[#ffa500]">Skills</h4>
+        <h4 className="font-display text-xs text-[#ffa500]">{t('Skills')}</h4>
         <div className="neq-saving-throws-grid neq-skills-grid mt-1 grid grid-cols-2 gap-x-4 gap-y-1">
-          {allSkillRows(stats).map((skill) => (
-            <div key={skill.name} data-proficient={skill.proficient} className="flex justify-between text-sm" aria-label={`${skill.name} ${formatModifier(skill.bonus)}${skill.proficient ? ', proficient' : ''}`} title={`${skill.name}${skill.proficient ? ' — proficient' : ''}`}>
+          {allSkillRows(stats).map((skill) => {
+            const name = v('skill', skill.name)
+            return (
+            <div key={skill.name} data-proficient={skill.proficient} className="flex justify-between text-sm" aria-label={`${name} ${formatModifier(skill.bonus)}${skill.proficient ? t(', proficient') : ''}`} title={`${name}${skill.proficient ? t(' — proficient') : ''}`}>
               <span className={skill.proficient ? 'text-primary' : 'text-secondary'}>
-                <span aria-hidden="true">{skill.proficient ? PROFICIENT_DOT : UNPROFICIENT_DOT} </span>{skill.name}
+                <span aria-hidden="true">{skill.proficient ? PROFICIENT_DOT : UNPROFICIENT_DOT} </span>{name}
               </span>
               <span className="text-accent">{formatModifier(skill.bonus)}</span>
             </div>
-          ))}
+            )
+          })}
         </div>
       </div>}
       <div className="neq-abilities-grid">
@@ -306,7 +325,7 @@ export function CharacterSheet({ expanded = false, hideIdentity = false }: { exp
       {languages.length > 0 && <SheetSection title="Languages" items={languages} tooltips={false} />}
       {background?.['name'] !== undefined && <SheetSection title="Background" items={[{ name: str(background['name']), detail: str(background['description']) }]} />}
       {arr(stats['feats']).length > 0 && <SheetSection title="Feats" items={featureItems('feats')} />}
-      {expanded && (['personality_traits', 'ideals', 'bonds', 'flaws'] as const).some(key => str(stats[key])) && <section className="tcs-biography"><h4>Personality & bonds</h4><dl>{(['personality_traits', 'ideals', 'bonds', 'flaws'] as const).map(key => str(stats[key]) ? <div key={key}><dt>{capitalizeWords(key.replace(/_/g, ' '))}</dt><dd>{str(stats[key])}</dd></div> : null)}</dl></section>}
+      {expanded && (['personality_traits', 'ideals', 'bonds', 'flaws'] as const).some(key => str(stats[key])) && <section className="tcs-biography"><h4>{t('Personality & bonds')}</h4><dl>{(['personality_traits', 'ideals', 'bonds', 'flaws'] as const).map(key => str(stats[key]) ? <div key={key}><dt>{t(BIO_LABELS[key])}</dt><dd>{str(stats[key])}</dd></div> : null)}</dl></section>}
       </div>
       {ember && !expanded && <EmberCurrency currency={currency} />}
       </div>

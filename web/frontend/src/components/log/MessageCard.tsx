@@ -17,6 +17,7 @@ import { EmberIcon } from '../layout/EmberIcon'
 import dragonAvatar from '../../assets/dm-bronze-dragon.png'
 import { SceneImage } from './SceneImage'
 import { NarrationText } from './NarrationText'
+import { useT } from '../../i18n'
 
 export interface MessageCardProps {
   message: GameMessage
@@ -25,6 +26,7 @@ export interface MessageCardProps {
 }
 
 function InlineImages({ images }: { images: GeneratedImage[] }) {
+  const t = useT()
   const ember = useEmberDesktop()
   if (images.length === 0) return null
   return (
@@ -36,12 +38,13 @@ function InlineImages({ images }: { images: GeneratedImage[] }) {
           className={ember ? '' : 'max-w-full rounded-lg border-2 border-card'}
         />
       ))}
-      {ember && <span className="ember-image-caption">Generated image · attached to this message</span>}
+      {ember && <span className="ember-image-caption">{t('Generated image · attached to this message')}</span>}
     </div>
   )
 }
 
 export function MessageCard({ message, images = [] }: MessageCardProps) {
+  const t = useT()
   const ember = useEmberDesktop()
   const aiImages = useSettings((s) => s.aiImages)
   const autoplay = useSettings((s) => s.autoplay)
@@ -59,13 +62,13 @@ export function MessageCard({ message, images = [] }: MessageCardProps) {
           <div className="neq-message-content min-w-0 flex-1">
             <div className="neq-message-header mb-1 flex items-center gap-2">
               <span className="neq-message-author text-base font-bold" style={{ color: '#ffb347' }}>
-                Dungeon Master
+                {t('Dungeon Master')}
               </span>
               {!ember && <span
                 className="inline-flex h-[22px] items-center rounded px-1.5 font-chrome text-[11px] font-bold text-white"
                 style={{ backgroundColor: '#4a90e2' }}
               >
-                DM
+                {t('DM')}
               </span>}
               <TtsButton content={message.content} autoplay={autoplay} />
               {aiImages && <GenerateImageButton content={message.content} messageId={message.message_id} />}
@@ -95,7 +98,7 @@ export function MessageCard({ message, images = [] }: MessageCardProps) {
           <div className="neq-message-content min-w-0 flex-1">
             <div className="neq-message-header mb-1">
               <span className="neq-message-author font-chrome text-base font-bold" style={{ color: '#4a90e2' }}>
-                You
+                {t('You')}
               </span>
             </div>
             <div

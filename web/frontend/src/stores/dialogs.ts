@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { ServerEvents } from '../contract/events'
+import { t } from '../i18n'
 
 /** Which modal is open; null = none. MODAL overlays are orthogonal to UiMode. */
 export type DialogName =
@@ -226,7 +227,7 @@ export const useDialogs = create<DialogsState>((set) => ({
         total: payload.total,
         message: payload.message,
         result: null,
-        error: payload.stage === 'error' ? payload.message || 'Companion memory recovery failed' : null,
+        error: payload.stage === 'error' ? payload.message || t('Companion memory recovery failed') : null,
       },
     })),
   setProvider: (payload) =>
@@ -259,7 +260,7 @@ export const useDialogs = create<DialogsState>((set) => ({
       ? { ...s.settings.codexStatus, model_choice: payload.model } : null } })),
   setEndpointTestResult: (payload) =>
     set((s) => ({ settings: { ...s.settings, endpointTest: payload } })),
-  updateStarted: () => set({ update: { running: true, log: ['Starting update...'], error: null, complete: null } }),
+  updateStarted: () => set({ update: { running: true, log: [t('Starting update...')], error: null, complete: null } }),
   updateLog: (payload) => set((s) => ({ update: { ...s.update, log: [...s.update.log, payload.message] } })),
   updateError: (payload) => set((s) => ({ update: { ...s.update, running: false, error: payload.error } })),
   updateComplete: (payload) => set((s) => ({ update: { ...s.update, running: false, complete: payload.message } })),
@@ -313,10 +314,10 @@ export const useDialogs = create<DialogsState>((set) => ({
           completed: Number(compression['completed'] ?? 0),
           total: Number(compression['total'] ?? 0),
           message,
-          error: terminal && compression['stage'] === 'error' ? message || 'Companion memory recovery failed' : null,
+          error: terminal && compression['stage'] === 'error' ? message || t('Companion memory recovery failed') : null,
         }
       } else if (event === 'compression_error') {
-        next.compression = { ...s.compression, kind: 'chronicle', running: false, terminal: true, result: null, error: String(compression['error'] ?? 'Compression failed') }
+        next.compression = { ...s.compression, kind: 'chronicle', running: false, terminal: true, result: null, error: String(compression['error'] ?? t('Compression failed')) }
       } else if (event === 'compression_complete') {
         next.compression = {
           ...s.compression,

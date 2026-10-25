@@ -4,6 +4,7 @@ import { useDialogs, useWorld } from '../../stores'
 import './dialog-parity.css'
 import { DialogShell } from './DialogShell'
 import { useEmberViewport } from '../layout/useEmberViewport'
+import { t, useT } from '../../i18n'
 
 interface StorageItem {
   name: string
@@ -20,12 +21,12 @@ function toContainer(raw: unknown): StorageContainer {
   const r = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
   const contentsRaw = Array.isArray(r['contents']) ? (r['contents'] as unknown[]) : []
   return {
-    name: typeof r['name'] === 'string' ? r['name'] : 'Unknown container',
+    name: typeof r['name'] === 'string' ? r['name'] : t('Unknown container'),
     location: typeof r['location'] === 'string' ? r['location'] : '',
     contents: contentsRaw.map((item) => {
       const ir = typeof item === 'object' && item !== null ? (item as Record<string, unknown>) : {}
       return {
-        name: typeof ir['item_name'] === 'string' ? ir['item_name'] : 'Unknown item',
+        name: typeof ir['item_name'] === 'string' ? ir['item_name'] : t('Unknown item'),
         quantity: typeof ir['quantity'] === 'number' ? ir['quantity'] : 1,
       }
     }),
@@ -34,6 +35,7 @@ function toContainer(raw: unknown): StorageContainer {
 
 function StorageModalBody() {
   const ember = useEmberViewport()
+  const t = useT()
   const closeDialog = useDialogs((s) => s.closeDialog)
   const storage = useWorld((s) => s.storage)
   const storageError = useWorld((s) => s.storageError)
@@ -45,16 +47,16 @@ function StorageModalBody() {
 
   let body
   if (storageError) {
-    body = <p role={ember ? 'alert' : undefined} className="p-8 text-center font-body text-secondary">{ember ? 'Could not load storage data. Close and reopen storage to retry.' : 'No player storage found.'}</p>
+    body = <p role={ember ? 'alert' : undefined} className="p-8 text-center font-body text-secondary">{ember ? t('Could not load storage data. Close and reopen storage to retry.') : t('No player storage found.')}</p>
   } else if (storage === null) {
-    body = <p role={ember ? 'status' : undefined} className="p-8 text-center font-body italic text-secondary">Fetching storage data...</p>
+    body = <p role={ember ? 'status' : undefined} className="p-8 text-center font-body italic text-secondary">{t('Fetching storage data...')}</p>
   } else {
     const success = storage['success'] === true
     const containers = (Array.isArray(storage['storage']) ? (storage['storage'] as unknown[]) : []).map(
       toContainer,
     )
     if (!success || containers.length === 0) {
-      body = <p className="p-8 text-center font-body text-secondary">No player storage found.</p>
+      body = <p className="p-8 text-center font-body text-secondary">{t('No player storage found.')}</p>
     } else {
       body = (
         <div>
@@ -70,7 +72,7 @@ function StorageModalBody() {
               </div>
               <ul className="neq-storage-list-parity">
                 {container.contents.length === 0 ? (
-                  <li className="neq-storage-item-parity">This container is empty.</li>
+                  <li className="neq-storage-item-parity">{t('This container is empty.')}</li>
                 ) : (
                   container.contents.map((item, j) => (
                     <li key={`${item.name}-${j}`} className="neq-storage-item-parity">
@@ -87,7 +89,7 @@ function StorageModalBody() {
     }
   }
 
-  if (ember) return <DialogShell title="Player Storage" onClose={closeDialog} maxWidth="760px">{body}</DialogShell>
+  if (ember) return <DialogShell title={t('Player Storage')} onClose={closeDialog} maxWidth="760px">{body}</DialogShell>
   return (
     <div
       className="neq-storage-overlay-parity"
@@ -98,8 +100,8 @@ function StorageModalBody() {
     >
       <div className="neq-storage-modal-parity">
         <div className="neq-storage-header-parity">
-          <h3 id="player-storage-title" className="neq-storage-title-parity">Player Storage</h3>
-          <button type="button" onClick={closeDialog} aria-label="Close" className="neq-storage-close-parity">&times;</button>
+          <h3 id="player-storage-title" className="neq-storage-title-parity">{t('Player Storage')}</h3>
+          <button type="button" onClick={closeDialog} aria-label={t('Close')} className="neq-storage-close-parity">&times;</button>
         </div>
         <div className="neq-storage-body-parity">{body}</div>
       </div>

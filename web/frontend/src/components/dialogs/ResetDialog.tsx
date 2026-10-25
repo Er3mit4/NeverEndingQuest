@@ -4,13 +4,14 @@ import { useDialogs, useLog, useSession } from '../../stores'
 import { DialogShell, dialogButtonDanger, dialogButtonSecondary } from './DialogShell'
 import { prepareForServerRestart, reloadWhenServerReady } from '../../services/restart'
 import { useEmberViewport } from '../layout/useEmberViewport'
+import { useT, type MessageKey } from '../../i18n'
 
 /** Legacy-compatible five-digit confirmation code (10000-99999). */
 export function generateResetCode(): string {
   return String(Math.floor(10000 + Math.random() * 90000))
 }
 
-const RESET_ACTIONS = [
+const RESET_ACTIONS: MessageKey[] = [
   'Creates timestamped backup of your current progress',
   'Deletes all characters, conversations, and game state',
   'Restores modules from clean system templates',
@@ -21,6 +22,7 @@ const RESET_ACTIONS = [
 /** Body unmounts on close, so every open generates a fresh confirmation code. */
 function ResetDialogBody() {
   const ember = useEmberViewport()
+  const t = useT()
   const closeDialog = useDialogs((s) => s.closeDialog)
   const [code] = useState(() => generateResetCode())
   const [typed, setTyped] = useState('')
@@ -39,10 +41,10 @@ function ResetDialogBody() {
       busy.current = false
       setResetting(false)
       setTyped('')
-      setErrorMessage('Disconnected. Reconnect and re-enter the confirmation code to reset.')
+      setErrorMessage(t('Disconnected. Reconnect and re-enter the confirmation code to reset.'))
     } else setErrorMessage('')
     return () => { generation.current++; busy.current = false }
-  }, [connected])
+  }, [connected, t])
 
   const requestClose = () => {
     // The existing pending UI disables Cancel; Escape and backdrop must agree.
@@ -73,10 +75,11 @@ function ResetDialogBody() {
       closeDialog()
     } catch (error) {
       if (!isCurrent()) return
-      setErrorMessage(`Campaign reset could not start: ${error instanceof Error ? error.message : String(error)}`)
+      const reason = error instanceof Error ? error.message : String(error)
+      setErrorMessage(t('Campaign reset could not start: {error}', { error: reason }))
       useLog.getState().append({
         type: 'error',
-        content: `Campaign reset could not start: ${error instanceof Error ? error.message : String(error)}`,
+        content: `Campaign reset could not start: ${reason}`,
       })
       setResetting(false)
       busy.current = false
@@ -84,35 +87,34 @@ function ResetDialogBody() {
   }
 
   return (
-    <DialogShell title={ember ? 'Campaign Reset' : <><span className="text-[#f44336]">⚠️</span> CAMPAIGN RESET <span className="text-[#f44336]">⚠️</span></>} onClose={requestClose} maxWidth="750px" legacy className="neq-reset-dialog-parity" initialFocusRef={inputRef}>
+    <DialogShell title={ember ? t('Campaign Reset') : <><span className="text-[#f44336]">⚠️</span> {t('CAMPAIGN RESET')} <span className="text-[#f44336]">⚠️</span></>} onClose={requestClose} maxWidth="750px" legacy className="neq-reset-dialog-parity" initialFocusRef={inputRef}>
       <div>
         <div className="neq-reset-warning-container-parity">
           <div className="neq-reset-warning-box-parity">
-            <strong>{!ember && '🔥 '}WARNING: Complete Campaign Wipe</strong>
+            <strong>{!ember && '🔥 '}{t('WARNING: Complete Campaign Wipe')}</strong>
             <p>
-            This will permanently delete your current game progress and return to a fresh
-            campaign start.
+              {t('This will permanently delete your current game progress and return to a fresh campaign start.')}
             </p>
           </div>
 
           <div className="neq-reset-info-box-parity">
-            <h4>{!ember && '📋 '}What This Reset Does:</h4>
+            <h4>{!ember && '📋 '}{t('What This Reset Does:')}</h4>
             <ul className="neq-reset-action-list-parity">
               {RESET_ACTIONS.map((line, index) => (
-                <li key={line}>{`${ember ? '•' : ['✅','🗑️','🔄','🏁','🔒'][index]} ${line}`}</li>
+                <li key={line}>{`${ember ? '•' : ['✅','🗑️','🔄','🏁','🔒'][index]} ${t(line)}`}</li>
               ))}
             </ul>
           </div>
 
           <div className="neq-reset-note-box-parity">
-            <strong>{!ember && '💡 '}Note:</strong> Your current progress will be backed up to{' '}
+            <strong>{!ember && '💡 '}{t('Note:')}</strong> {t('Your current progress will be backed up to')}{' '}
             <code>modules/backups/campaign_backup_[timestamp]</code>{' '}
-            before reset. Module restore points (BU files) are protected and remain intact.
+            {t('before reset. Module restore points (BU files) are protected and remain intact.')}
           </div>
         </div>
 
         <div className="neq-reset-confirmation-parity">
-          <p>To confirm, please type the following code into the box below:</p>
+          <p>{t('To confirm, please type the following code into the box below:')}</p>
           <p
             data-testid="reset-code"
             className="neq-reset-code-parity"
@@ -126,18 +128,18 @@ function ResetDialogBody() {
             onChange={(e) => setTyped(e.target.value.replace(/\D/g, '').slice(0, 5))}
             disabled={resetting}
             inputMode="numeric"
-            placeholder="Enter code here"
-            aria-label="Reset confirmation code"
+            placeholder={t('Enter code here')}
+            aria-label={t('Reset confirmation code')}
             autoComplete="off"
             className="neq-reset-input-parity"
           />
         </div>
 
-        {resetting && <p role="status">Preparing server restart...</p>}
+        {resetting && <p role="status">{t('Preparing server restart...')}</p>}
         {errorMessage && <p role="alert">{errorMessage}</p>}
         <div className="neq-dialog-buttons-parity">
           <button type="button" className={dialogButtonSecondary} onClick={requestClose} disabled={resetting}>
-            Cancel
+            {t('Cancel')}
           </button>
           <button
             type="button"
@@ -145,7 +147,7 @@ function ResetDialogBody() {
             onClick={() => void performReset()}
             disabled={!confirmed || resetting || !connected}
           >
-            Confirm Reset
+            {t('Confirm Reset')}
           </button>
         </div>
       </div>

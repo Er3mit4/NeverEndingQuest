@@ -1,31 +1,31 @@
 import { useEffect, useRef } from 'react'
 import type { ServerEvents } from '../../contract/events'
 import { useLog, useSession } from '../../stores'
+import { t } from '../../i18n'
 
-const STARTUP_FAILURE_MESSAGE =
-  'Startup handoff failed. You can use recovery from settings.'
+const STARTUP_FAILURE_MESSAGE = 'Startup handoff failed. You can use recovery from settings.'
 
 function startupRecoveryMessage(
   recovery: ServerEvents['startup_recovery_response'],
 ): { type: 'system' | 'error'; content: string } {
   const status = recovery.status || 'failed'
   if (status === 'recovered') {
-    return { type: 'system', content: 'Startup recovery completed. Adventure flow resumed.' }
+    return { type: 'system', content: t('Startup recovery completed. Adventure flow resumed.') }
   }
   if (status === 'already_ready') {
-    return { type: 'system', content: 'Startup is already complete.' }
+    return { type: 'system', content: t('Startup is already complete.') }
   }
   if (status === 'in_progress') {
-    return { type: 'system', content: 'Startup recovery is already in progress.' }
+    return { type: 'system', content: t('Startup recovery is already in progress.') }
   }
   if (status === 'not_recoverable') {
-    return { type: 'error', content: 'Startup recovery not allowed in current state.' }
+    return { type: 'error', content: t('Startup recovery not allowed in current state.') }
   }
   const reason = recovery.error ? ` (${recovery.error})` : ''
   const retryHint = recovery.retryAfterSeconds
-    ? ` Retry in ${recovery.retryAfterSeconds}s.`
+    ? ` ${t('Retry in {seconds}s.', { seconds: recovery.retryAfterSeconds })}`
     : ''
-  return { type: 'error', content: `Startup recovery failed${reason}.${retryHint}` }
+  return { type: 'error', content: t('Startup recovery failed{reason}.{retryHint}', { reason, retryHint }) }
 }
 
 /**
@@ -49,7 +49,7 @@ export function StartingPanel() {
 
     append({
       type: 'error',
-      content: STARTUP_FAILURE_MESSAGE,
+      content: t(STARTUP_FAILURE_MESSAGE),
       message_id: `startup-failure-${startupAttemptId || 'current'}`,
     })
   }, [append, startupAttemptId, startupStatus])

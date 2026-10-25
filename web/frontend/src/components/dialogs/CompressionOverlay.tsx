@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
 import { useDialogs } from '../../stores'
+import { useT, type MessageKey } from '../../i18n'
 
 /** DM-themed flavor lines shown while the chronicle compresses (legacy parity). */
-const FLAVOR_MESSAGES = [
+const FLAVOR_MESSAGES: MessageKey[] = [
   'The Dungeon Master carefully inscribes your deeds into the eternal chronicle...',
   'Ancient magics compress your adventures into mystical runes...',
   'The scribes work tirelessly to record your legendary journey...',
@@ -19,8 +20,9 @@ const HIDE_DELAY_MS = 2000
  */
 export function CompressionOverlay() {
   const compression = useDialogs((s) => s.compression)
+  const t = useT()
   const [visible, setVisible] = useState(false)
-  const [flavor, setFlavor] = useState(FLAVOR_MESSAGES[0])
+  const [flavor, setFlavor] = useState<MessageKey>(FLAVOR_MESSAGES[0])
   const hasCompleted = compression.terminal || compression.error !== null
 
   // A new run starts: show the banner and pick a fresh flavor line.
@@ -55,22 +57,22 @@ export function CompressionOverlay() {
 
   let statusText: string
   if (kind === 'memory' && compression.error !== null) {
-    statusText = `Companion memory recovery failed: ${compression.error}`
+    statusText = t('Companion memory recovery failed: {error}', { error: compression.error })
   } else if (kind === 'memory' && complete) {
-    statusText = message || 'Companion memory recovery complete.'
+    statusText = message || t('Companion memory recovery complete.')
   } else if (kind === 'memory') {
     const count = total > 0 ? ` (${completed}/${total})` : ''
-    statusText = `${message || 'Recovering companion memories...'}${count}`
+    statusText = `${message || t('Recovering companion memories...')}${count}`
   } else if (compression.error !== null) {
-    statusText = `Chronicle compression failed: ${compression.error}`
+    statusText = t('Chronicle compression failed: {error}', { error: compression.error })
   } else if (result !== null) {
-    statusText = `Chronicle compression complete! Reduced by ${result.reduction_percentage}%`
+    statusText = t('Chronicle compression complete! Reduced by {percent}%', { percent: result.reduction_percentage })
   } else if (total > 0) {
     statusText = fromCache
-      ? `Section ${completed} of ${total} (retrieved from memory)`
-      : `Compressing section ${completed} of ${total}...`
+      ? t('Section {completed} of {total} (retrieved from memory)', { completed, total })
+      : t('Compressing section {completed} of {total}...', { completed, total })
   } else {
-    statusText = `Compressing ${totalSections} chronicle sections...`
+    statusText = t('Compressing {count} chronicle sections...', { count: totalSections })
   }
 
   return (
@@ -80,10 +82,10 @@ export function CompressionOverlay() {
       aria-live="polite"
     >
       <div className="neq-compression-title-parity">
-        {kind === 'memory' ? 'Companion Memory Recovery' : 'Chronicle Compression'}
+        {kind === 'memory' ? t('Companion Memory Recovery') : t('Chronicle Compression')}
       </div>
       <div className="neq-compression-text-parity">
-        {kind === 'memory' ? 'Reweaving the companions\' shared journey...' : flavor}
+        {kind === 'memory' ? t("Reweaving the companions' shared journey...") : t(flavor)}
       </div>
       <div className="neq-compression-bar-track-parity">
         <div

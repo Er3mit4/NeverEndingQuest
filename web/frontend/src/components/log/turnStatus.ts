@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react'
 import { useSession } from '../../stores'
 import type { WaitRecord } from '../../contract/events'
+import { t, useT, type MessageKey } from '../../i18n'
 
 /** Presentation only: never changes turn gates, provider calls or retries.
  * #1271: the status text is never read. A model call is rendered from its
  * typed `wait` record; any other busy status is shown exactly as the server
  * wrote it. */
 
-const PURPOSE: Record<string, string> = {
+const PURPOSE: Record<string, MessageKey> = {
   character_setup: 'Setting up your character',
   adventure_choice: 'Preparing your adventure choices',
   starting_location: 'Choosing your starting location',
@@ -29,31 +30,35 @@ function duration(ms: number): string {
   return `${Math.floor(total / 60)} min ${String(total % 60).padStart(2, '0')} s`
 }
 
+function providerName(wait: WaitRecord): string {
+  return wait.providerName || t('the AI provider')
+}
+
 function phaseText(wait: WaitRecord, sinceReceiptMs: number): string {
-  const provider = wait.providerName || 'the AI provider'
+  const provider = providerName(wait)
   switch (wait.phase) {
     case 'spawned':
     case 'payload_read':
     case 'connecting':
-      return `connecting to ${provider}`
+      return t('connecting to {provider}', { provider })
     case 'connected':
     case 'secured':
-      return `connected to ${provider}, sending your request`
+      return t('connected to {provider}, sending your request', { provider })
     case 'sent':
-      return `request sent, waiting for ${provider} to start`
+      return t('request sent, waiting for {provider} to start', { provider })
     case 'acknowledged':
     case 'working':
       return wait.lastActivityMs === null
-        ? `${provider} is working`
-        : `${provider} is working (last activity ${seconds(wait.lastActivityMs + sinceReceiptMs)} s ago)`
+        ? t('{provider} is working', { provider })
+        : t('{provider} is working (last activity {seconds} s ago)', { provider, seconds: seconds(wait.lastActivityMs + sinceReceiptMs) })
     case 'receiving':
-      return `answer arriving from ${provider}`
+      return t('answer arriving from {provider}', { provider })
     case 'done':
-      return 'answer received, finishing'
+      return t('answer received, finishing')
     case 'failed':
-      return `connection to ${provider} failed`
+      return t('connection to {provider} failed', { provider })
     default:
-      return `waiting for ${provider}`
+      return t('waiting for {provider}', { provider })
   }
 }
 
@@ -61,22 +66,28 @@ function phaseText(wait: WaitRecord, sinceReceiptMs: number): string {
  * monotonic time since the record arrived; the server's heartbeat re-bases it. */
 export function waitStatusText(wait: WaitRecord, sinceReceiptMs: number): string {
   const elapsed = wait.elapsedMs + sinceReceiptMs
-  const purpose = PURPOSE[wait.purpose] ?? `Waiting for ${wait.providerName || 'the AI provider'}`
+  const purpose = PURPOSE[wait.purpose] !== undefined
+    ? t(PURPOSE[wait.purpose])
+    : t('Waiting for {provider}', { provider: providerName(wait) })
   let detail: string
   if (wait.retryInMs !== null) {
-    const of = wait.maxAttempts !== null ? ` of ${wait.maxAttempts}` : ''
     const left = Math.ceil(Math.max(0, wait.retryInMs - sinceReceiptMs) / 1000)
-    detail = `attempt ${wait.attempt - 1}${of} failed; attempt ${wait.attempt} in ${left} s`
+    const previous = wait.attempt - 1
+    detail = wait.maxAttempts !== null
+      ? t('attempt {previous} of {max} failed; attempt {attempt} in {left} s', { previous, max: wait.maxAttempts, attempt: wait.attempt, left })
+      : t('attempt {previous} failed; attempt {attempt} in {left} s', { previous, attempt: wait.attempt, left })
   } else {
     detail = phaseText(wait, sinceReceiptMs)
   }
   const line = `${purpose} (${duration(elapsed)}): ${detail}.`
   return elapsed >= LONG_WAIT_MS
-    ? `${line} This can take a few minutes. Your turn is safe; there's no need to send it again.`
+    ? `${line} ${t("This can take a few minutes. Your turn is safe; there's no need to send it again.")}`
     : line
 }
 
 export function useTurnStatus(): string | null {
+  // Re-render on a language switch while a turn is in flight.
+  useT()
   const busy = useSession((s) => s.isProcessing)
   const message = useSession((s) => s.statusMessage)
   const recovery = useSession((s) => s.restoreRecoveryRequired)
@@ -92,11 +103,11 @@ export function useTurnStatus(): string | null {
     const id = setInterval(() => setNow(performance.now()), 1000)
     return () => clearInterval(id)
   }, [busy, wait])
-  if (recovery) return message || 'Gameplay is paused. Use the recovery controls to continue.'
+  if (recovery) return message || t('Gameplay is paused. Use the recovery controls to continue.')
   if (busy && wait) return waitStatusText(wait, Math.max(0, now - receivedAt))
-  if (busy) return message || 'Working…'
+  if (busy) return message || t('Working…')
   if (welcome) return openingScene
-    ? `${welcome} Anything you type now happens right after it.`
-    : `${welcome} You can act anytime.`
+    ? t('{welcome} Anything you type now happens right after it.', { welcome })
+    : t('{welcome} You can act anytime.', { welcome })
   return null
 }

@@ -20,6 +20,7 @@ import type { MapTheme } from '../../stores'
 import type { MapDataPayload } from '../../types/map'
 import { DialogShell } from '../dialogs/DialogShell'
 import { ExplorerNotes } from './ExplorerNotes'
+import { useT } from '../../i18n'
 import {
   FULL_VB,
   applyCurrentMarker,
@@ -39,6 +40,7 @@ export interface MapModalProps {
 }
 
 export function MapModal({ mapData, theme, onClose }: MapModalProps) {
+  const t = useT()
   const stageRef = useRef<HTMLDivElement>(null)
   const handleRef = useRef<MapperHandle | null>(null)
   const keyRef = useRef('')
@@ -149,16 +151,16 @@ export function MapModal({ mapData, theme, onClose }: MapModalProps) {
         <div className="neq-map-modal-main">
           <div className="neq-map-toolbar">
             <span className="neq-map-zoom">{zoomPct}%</span>
-            <button type="button" className="neq-map-btn" onClick={handleFit}>⊙ fit</button>
-            <button type="button" className="neq-map-btn" onClick={() => view(FULL_VB)}>▭ whole</button>
-            <button type="button" className="neq-map-btn" onClick={onClose}>✕ close</button>
+            <button type="button" className="neq-map-btn" onClick={handleFit}>{t('⊙ fit')}</button>
+            <button type="button" className="neq-map-btn" onClick={() => view(FULL_VB)}>{t('▭ whole')}</button>
+            <button type="button" className="neq-map-btn" onClick={onClose}>{t('✕ close')}</button>
           </div>
           <div className="neq-map-stage-wrap">
             <div ref={stageRef} className="neq-map-stage" />
             {currentIsRevealed && (
               <span className="neq-map-here-pill">
                 <i aria-hidden="true" />
-                You are here
+                {t('You are here')}
               </span>
             )}
           </div>

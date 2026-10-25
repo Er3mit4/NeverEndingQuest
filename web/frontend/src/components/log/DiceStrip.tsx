@@ -14,6 +14,7 @@ import { useComposerGating } from '../../modes/useComposerGating'
 import { useRulesRoll } from '../../stores/rulesRoll'
 import { EmberDieIcon } from '../layout/EmberDieIcon'
 import { RulesRollActions } from './RulesRollPanel'
+import { useT } from '../../i18n'
 
 const DICE_SIDES = [20, 12, 10, 8, 6, 4] as const
 
@@ -61,6 +62,7 @@ export function useDiceRolls() {
 }
 
 export function DiceStrip({ state, onInsertRoll }: { state?: ReturnType<typeof useDiceRolls>; onInsertRoll?: (text: string) => void }) {
+  const t = useT()
   const gating = useComposerGating()
   const requestedCheck = useRulesRoll((s) => s.prompt)
   const ember = useEmberDesktop()
@@ -102,8 +104,8 @@ export function DiceStrip({ state, onInsertRoll }: { state?: ReturnType<typeof u
 
   const damageTotal = damageRolls.reduce((sum, r) => sum + r.result, 0)
   const hasResults = d20Rolls.length > 0 || damageRolls.length > 0
-  const clearButton = <button type="button" title="Clear results" onClick={clear} className={clearButtonClass}>
-    {ember && <EmberIcon name="clear" />}Clear
+  const clearButton = <button type="button" title={t('Clear results')} onClick={clear} className={clearButtonClass}>
+    {ember && <EmberIcon name="clear" />}{t('Clear')}
   </button>
 
   const insertRoll = () => {
@@ -124,10 +126,10 @@ export function DiceStrip({ state, onInsertRoll }: { state?: ReturnType<typeof u
           <span className="neq-dice-result-item">
             {damageRolls.map((r) => `d${r.sides}: ${r.result}`).join(', ')}
           </span>
-          <span className="neq-dice-total">Total: {damageTotal}</span>
+          <span className="neq-dice-total">{t('Total: {total}', { total: damageTotal })}</span>
         </>
       )}
-      {onInsertRoll && !requestedCheck && <button type="button" className="neq-insert-roll" disabled={!gating.canSend} onClick={insertRoll}>Insert roll</button>}
+      {onInsertRoll && !requestedCheck && <button type="button" className="neq-insert-roll" disabled={!gating.canSend} onClick={insertRoll}>{t('Insert roll')}</button>}
     </div>
   ) : null
 
@@ -135,15 +137,15 @@ export function DiceStrip({ state, onInsertRoll }: { state?: ReturnType<typeof u
     <>
     <div className="neq-dice-strip flex shrink-0 flex-col items-center">
       <div className="neq-dice-label relative w-full text-center before:absolute before:left-0 before:right-0 before:top-1/2 before:h-px before:bg-[#ffa500]">
-        <span className="neq-dice-label-text relative z-10 inline-block rounded border border-[#ffa500] bg-[#333] px-5 py-0.5 font-chrome text-xs font-bold uppercase tracking-wider text-[#ffa500]">Quick {ember ? 'rolls' : 'Rolls'}</span>
-        {ember && <span className="ember-dice-disclaimer">Roll, then submit requested checks</span>}
+        <span className="neq-dice-label-text relative z-10 inline-block rounded border border-[#ffa500] bg-[#333] px-5 py-0.5 font-chrome text-xs font-bold uppercase tracking-wider text-[#ffa500]">{ember ? t('Quick rolls') : t('Quick Rolls')}</span>
+        {ember && <span className="ember-dice-disclaimer">{t('Roll, then submit requested checks')}</span>}
       </div>
       <div className="neq-dice-buttons flex items-center gap-1.5">
         {DICE_SIDES.map((sides) => (
           <button
             key={sides}
             type="button"
-            title={`Roll D${sides}`}
+            title={t('Roll D{sides}', { sides })}
             onClick={() => roll(sides)}
             className={diceButtonClass}
           >

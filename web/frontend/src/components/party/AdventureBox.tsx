@@ -8,6 +8,7 @@
  */
 import type { CSSProperties } from 'react'
 import { useWorld } from '../../stores'
+import { useT } from '../../i18n'
 
 /** Map an in-game "HH:MM:SS" time to the environment art URL (legacy hour bands). */
 export function timeOfDayImage(time: string | null | undefined): string {
@@ -31,6 +32,7 @@ const recessedBox: CSSProperties = {
 }
 
 export function AdventureBox() {
+  const t = useT()
   const time = useWorld((s) => s.location?.time ?? null)
   const initiative = useWorld((s) => s.initiative)
 
@@ -38,7 +40,7 @@ export function AdventureBox() {
     const round = initiative.round > 0 ? initiative.round : 1
     return (
       <div
-        aria-label={`Combat, round ${round}`}
+        aria-label={t('Combat, round {round}', { round })}
         className="neq-combat-box flex h-[60px] w-[85px] shrink-0 flex-col items-center justify-center rounded-md p-1 text-center"
         style={recessedBox}
       >
@@ -46,13 +48,13 @@ export function AdventureBox() {
           className="ember-combat-caption font-display font-bold"
           style={{ fontSize: 13, color: '#FFA500', letterSpacing: 1, lineHeight: 1 }}
         >
-          COMBAT
+          {t('COMBAT')}
         </div>
         <div
           style={{ width: '80%', height: 1, backgroundColor: 'var(--border-card)', margin: '2px 0' }}
         />
         <div className="ember-round-label" style={{ fontSize: 10, fontWeight: 700, color: '#888', lineHeight: 1 }}>
-          ROUND
+          {t('ROUND')}
         </div>
         <div
           className="ember-round-value font-bold"
@@ -66,7 +68,7 @@ export function AdventureBox() {
 
   return (
     <div
-      aria-label="Time of day"
+      aria-label={t('Time of day')}
       className="neq-adventure-box relative h-[60px] w-[60px] shrink-0 overflow-hidden rounded-md"
       style={recessedBox}
     >

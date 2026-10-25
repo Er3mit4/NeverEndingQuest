@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Custom Fork: Brazilian Portuguese player UI (2026-10-25)
+
+- The React player (`/play/`) can now render its whole interface in Brazilian
+  Portuguese: header, log, dice, turn status, dialogs, settings, character
+  sheet, inventory, spells, NPCs, map, party rail and every accessibility
+  label. The language follows the browser (`pt*` → `pt-BR`) and can be changed
+  in Settings → Language; the choice is remembered per browser.
+- Implemented as a dependency-free layer under `web/frontend/src/i18n/`. The
+  English string is the dictionary key and `pt-BR.ts` (split into per-area
+  fragments) holds the translation, so the English build stays byte-identical
+  and the existing 400+ component tests keep passing in `en`.
+- Controlled game vocabulary is translated only for display (attributes,
+  skills, conditions, damage types, alignments, sizes, item types, spell
+  schools, classes, languages, coins, save modes, seasons, moon phases, quest
+  status, spell levels), with unknown values falling through untouched.
+  Numbers, save dates and coins follow pt-BR (`GP/SP/CP` → `PO/PP/PC`).
+- Deliberately unchanged: DM narration, item/spell/NPC/location/module names,
+  and every message the backend sends verbatim (status, errors, compression,
+  update and module progress). The legacy player (`--ui legacy`) stays English.
+- `src/i18n/i18n.test.ts` covers dictionary completeness, interpolation,
+  plurals, dates, vocabulary fallback and a Portuguese wait-status line.
+  Reference: `docs/architecture/ui-localization.md`.
+
 ### Custom Fork: OpenCode Go plan model picker (2026-10-25)
 
 - The OpenCode Go provider now offers the plan's whole catalogue instead of only

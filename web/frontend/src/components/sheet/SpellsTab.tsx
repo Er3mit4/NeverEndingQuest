@@ -14,11 +14,13 @@ import { spellKey as emberSpellKey } from './spellKey'
 import { useSpellReference } from './useSpellReference'
 import { SpellcastingSummary } from './SpellcastingSummary'
 import { equipmentList, formatModifier, slotTone, spellcastingView, type EquipmentItem, type SpellLevelGroup } from './characterData'
+import { useT, useV, type MessageKey } from '../../i18n'
 
 function SlotBadge({ slots }: { slots: { current: number; max: number } }) {
+  const t = useT()
   return (
     <span className={`neq-spell-slots ${slotTone(slots)}`}>
-      {slots.current}/{slots.max} slots
+      {t('{current}/{max} slots', { current: slots.current, max: slots.max })}
     </span>
   )
 }
@@ -34,6 +36,8 @@ function SpellRow({
   prepared: boolean
   detail?: Record<string, unknown>
 }) {
+  const t = useT()
+  const v = useV()
   const ember = useEmberDesktop()
   const targetRef = useRef<HTMLSpanElement>(null)
   const tooltipRef = useRef<HTMLDivElement>(null)
@@ -60,7 +64,7 @@ function SpellRow({
     >
       <span ref={targetRef} className="neq-spell-name text-primary">{ember ? <EmberInspection label={spell}><SpellDetails detail={detail} fallbackName={spell} /></EmberInspection> : spell}</span>
       {prepared && (
-        <div className="neq-spell-badges"><span className="neq-spell-badge prepared" title="Prepared">{ember ? 'Prepared' : 'P'}</span></div>
+        <div className="neq-spell-badges"><span className="neq-spell-badge prepared" title={t('Prepared')}>{ember ? t('Prepared') : 'P'}</span></div>
       )}
       {hovered && detail && <div
         ref={tooltipRef}
@@ -69,9 +73,9 @@ function SpellRow({
         style={position ?? { left: 0, top: 0, visibility: 'hidden' }}
       >
         <div className="neq-spell-tooltip-header-parity">{String(detail.name ?? spell)}</div>
-        <div className="neq-spell-tooltip-meta-parity">{`${Number(detail.level ?? group.levelIndex) === 0 ? 'Cantrip' : `Level ${String(detail.level ?? group.levelIndex)}`} ${String(detail.school ?? '')} • ${String(detail.casting_time ?? '')} • ${formatComponents(detail.components)}`}</div>
+        <div className="neq-spell-tooltip-meta-parity">{`${Number(detail.level ?? group.levelIndex) === 0 ? v('spellLevel', 'Cantrip') : t('Level {level}', { level: String(detail.level ?? group.levelIndex) })} ${v('school', String(detail.school ?? ''))} • ${String(detail.casting_time ?? '')} • ${formatComponents(detail.components)}`}</div>
         <div className="neq-spell-tooltip-description-parity">{String(detail.description ?? '')}</div>
-        {Array.isArray(detail.classes) && detail.classes.length > 0 && <div className="neq-spell-tooltip-classes-parity">Classes: {detail.classes.map(String).join(', ')}</div>}
+        {Array.isArray(detail.classes) && detail.classes.length > 0 && <div className="neq-spell-tooltip-classes-parity">{t('Classes: {classes}', { classes: detail.classes.map(String).join(', ') })}</div>}
       </div>}
     </div>
   )
@@ -85,19 +89,23 @@ function formatComponents(raw: unknown): string {
 
 function spellKey(name: string): string { return name.toLowerCase().replace(/['\s/-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') }
 
-function MagicCategory({ title, items }: { title: string; items: EquipmentItem[] }) {
+function MagicCategory({ title, items }: { title: MessageKey; items: EquipmentItem[] }) {
+  const t = useT()
+  const v = useV()
   const ember = useEmberDesktop()
   const { data } = useSpellReference()
   if (items.length === 0) return null
-  return <section className="neq-magic-category"><h4>{title}</h4>{items.map((item, index) => <div key={`${item.name}-${index}`} title={ember ? undefined : item.description || 'No description available.'} className="neq-magic-item">
+  return <section className="neq-magic-category"><h4>{t(title)}</h4>{items.map((item, index) => <div key={`${item.name}-${index}`} title={ember ? undefined : item.description || t('No description available.')} className="neq-magic-item">
     <span className="neq-magic-item-name">{ember ? <EmberInspection label={item.name}><EquipmentDetails item={item} />{(item.subtype === 'scroll' || /scroll/i.test(item.type)) && <SpellDetails detail={data[emberSpellKey(item.name.replace(/^scroll\s+(of\s+)?/i, ''))]} fallbackName={item.name} />}</EmberInspection> : item.name}</span>
-    {title === 'Scrolls' && item.spellLevel !== null && <span className="neq-spell-badge">{item.spellLevel === 0 ? 'Cantrip' : `Level ${item.spellLevel}`}</span>}
+    {title === 'Scrolls' && item.spellLevel !== null && <span className="neq-spell-badge">{item.spellLevel === 0 ? v('spellLevel', 'Cantrip') : t('Level {level}', { level: item.spellLevel })}</span>}
     {title !== 'Magic Items' && (item.quantity > 1 ? <span className="neq-magic-item-charges">×{item.quantity}</span> : item.consumable ? <span className="neq-magic-item-charges neq-consumable">[1x]</span> : null)}
     {title === 'Magic Items' && item.charges && <span className={`neq-magic-item-charges ${slotTone(item.charges)}`}>{item.charges.current}/{item.charges.max}</span>}
   </div>)}</section>
 }
 
 export function SpellsTab({ expanded = false }: { expanded?: boolean } = {}) {
+  const t = useT()
+  const v = useV()
   const ember = useEmberDesktop()
   const spells = usePlayer((s) => s.spells)
   const error = usePlayer((s) => s.dataErrors.spells)
@@ -111,7 +119,7 @@ export function SpellsTab({ expanded = false }: { expanded?: boolean } = {}) {
     return <p role={ember ? 'status' : undefined} data-state="notice" className="ember-sheet-status p-4 font-body text-sm text-secondary">{notice}</p>
   }
   if (!spells) {
-    return <p role={ember ? 'status' : undefined} data-state="loading" className="ember-sheet-status p-4 font-body text-sm text-secondary">Loading spells...</p>
+    return <p role={ember ? 'status' : undefined} data-state="loading" className="ember-sheet-status p-4 font-body text-sm text-secondary">{t('Loading spells...')}</p>
   }
 
   const view = spellcastingView(spells)
@@ -124,17 +132,17 @@ export function SpellsTab({ expanded = false }: { expanded?: boolean } = {}) {
 
   return (
     <div className="neq-spells-tab">
-      {referenceStatus === 'error' && <p role="status">Spell reference unavailable. <button type="button" onClick={retry}>Retry details</button></p>}
+      {referenceStatus === 'error' && <p role="status">{t('Spell reference unavailable.')} <button type="button" onClick={retry}>{t('Retry details')}</button></p>}
       <div className="neq-spells-sheet">
-      {view ? <div className="neq-spellcasting-section">{ember && expanded ? <SpellcastingSummary data={spells} casting={view} /> : <h3>SPELLCASTING</h3>}
+      {view ? <div className="neq-spellcasting-section">{ember && expanded ? <SpellcastingSummary data={spells} casting={view} /> : <h3>{t('SPELLCASTING')}</h3>}
       {!(ember && expanded) && (view.saveDC !== null || view.attackBonus !== null) && <div className="neq-spell-stats">
-        {view.saveDC !== null && <span>Save DC: {view.saveDC}</span>}
-        {view.attackBonus !== null && <span>Spell Attack: {formatModifier(view.attackBonus)}</span>}
+        {view.saveDC !== null && <span>{t('Save DC: {dc}', { dc: view.saveDC })}</span>}
+        {view.attackBonus !== null && <span>{t('Spell Attack: {bonus}', { bonus: formatModifier(view.attackBonus) })}</span>}
       </div>}
       {view.levels.map((group) => (
         <div key={group.levelIndex} className="neq-spell-level-group">
           <div className="neq-spell-level-header">
-            <span className="neq-spell-level-name">{group.levelName}</span>
+            <span className="neq-spell-level-name">{v('spellLevel', group.levelName)}</span>
             {group.slots && <SlotBadge slots={group.slots} />}
           </div>
           <div className="neq-spell-list">
@@ -150,12 +158,12 @@ export function SpellsTab({ expanded = false }: { expanded?: boolean } = {}) {
           </div>
         </div>
       ))}
-      </div> : <div role={ember ? 'status' : undefined} data-state="empty" className="neq-no-spells ember-sheet-status">This character does not have spellcasting abilities.</div>}
+      </div> : <div role={ember ? 'status' : undefined} data-state="empty" className="neq-no-spells ember-sheet-status">{t('This character does not have spellcasting abilities.')}</div>}
       <div className="neq-magic-items-section">
         <MagicCategory title="Scrolls" items={scrolls} />
         <MagicCategory title="Potions" items={potions} />
         <MagicCategory title="Magic Items" items={magical} />
-        {scrolls.length === 0 && potions.length === 0 && magical.length === 0 && <section className="neq-magic-category"><h4>MAGIC ITEMS</h4><div className="neq-magic-item"><span className="neq-magic-item-name">No magical items found</span></div></section>}
+        {scrolls.length === 0 && potions.length === 0 && magical.length === 0 && <section className="neq-magic-category"><h4>{t('MAGIC ITEMS')}</h4><div className="neq-magic-item"><span className="neq-magic-item-name">{t('No magical items found')}</span></div></section>}
       </div>
       </div>
     </div>

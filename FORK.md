@@ -75,7 +75,23 @@ deterministic code-level rejection of re-finalizing under a conflicted name.
 Details in the [CHANGELOG](CHANGELOG.md) and
 [startup-boot.md](docs/architecture/startup-boot.md).
 
-### 4. Documentation
+### 4. Brazilian Portuguese player interface
+
+The React player can show its entire interface in pt-BR: header, log, dice,
+turn status, dialogs, settings, character sheet, inventory, spells, NPCs, map
+and the party rail. The language follows the browser and can be changed in
+Settings → Language, remembered per browser. Only the interface is translated:
+the DM's narration, item/spell/NPC names and every message the backend sends
+verbatim stay in English, because the game itself is untouched.
+
+The layer is dependency-free and uses the English string as the dictionary key
+(`web/frontend/src/i18n/`), so future upstream merges stay mechanical and the
+English build remains byte-identical. Controlled data values (attributes,
+skills, conditions, item types, coins, spell levels…) are translated only when
+displayed. Full reference:
+[docs/architecture/ui-localization.md](docs/architecture/ui-localization.md).
+
+### 5. Documentation
 
 - [docs/architecture/opencode-go-provider.md](docs/architecture/opencode-go-provider.md) —
   provider reference (endpoint, headers, key resolution, effort mapping,
@@ -84,6 +100,8 @@ Details in the [CHANGELOG](CHANGELOG.md) and
   ChatGPT login, model selection, quota and troubleshooting
 - [docs/architecture/provider-routing.md](docs/architecture/provider-routing.md) —
   updated routing flow including the Go transport
+- [docs/architecture/ui-localization.md](docs/architecture/ui-localization.md) —
+  pt-BR interface, dictionary layout, scope and merge guidance
 - [CHANGELOG.md](CHANGELOG.md) — full custom-fork change entry
 
 ---

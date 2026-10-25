@@ -13,11 +13,13 @@ import { SceneImage } from './SceneImage'
 import { firstNewNarration, revealStoryStart, softenStoryArrival } from './storyReading'
 import { MessageCard } from './MessageCard'
 import { useEmberDesktop } from '../layout/EmberPresentation'
+import { useT } from '../../i18n'
 
 /** Within this many pixels of the bottom still counts as pinned. */
 const BOTTOM_PIN_THRESHOLD_PX = 48
 
 export function GameLog() {
+  const t = useT()
   const ember = useEmberDesktop()
   const messages = useLog((s) => s.messages)
   const images = useLog((s) => s.images)
@@ -107,14 +109,14 @@ export function GameLog() {
         if (ember && el && pinnedRef.current) el.scrollTop = el.scrollHeight
       }}
       role="log"
-      aria-label="Game log"
+      aria-label={t('Game log')}
       className="neq-game-log h-full min-h-0 overflow-y-auto px-[10px] py-2"
     >
       {messages.length > 0 || orphanImages.length > 0 ? (
         <>
-          {previousSessionCount > 0 && <div className="neq-session-divider mx-auto my-8 max-w-[500px] rounded border border-card py-2 text-center font-log text-sm italic text-secondary">--- Previous Session Messages ---</div>}
-          {messages.map((message, index) => <div key={message.message_id ?? index} data-story-index={message.type === 'narration' ? index : undefined}>{index === previousSessionCount && <div className="neq-session-divider mx-auto my-8 max-w-[500px] rounded border border-card py-2 text-center font-log text-sm italic text-secondary">{ember ? 'Current session' : '--- Current Session ---'}</div>}<MessageCard message={message} images={imagesByMessage.get(index)} /></div>)}
-          {previousSessionCount === messages.length && previousSessionCount > 0 && <div className="neq-session-divider mx-auto my-8 max-w-[500px] rounded border border-card py-2 text-center font-log text-sm italic text-secondary">--- Current Session ---</div>}
+          {previousSessionCount > 0 && <div className="neq-session-divider mx-auto my-8 max-w-[500px] rounded border border-card py-2 text-center font-log text-sm italic text-secondary">{t('--- Previous Session Messages ---')}</div>}
+          {messages.map((message, index) => <div key={message.message_id ?? index} data-story-index={message.type === 'narration' ? index : undefined}>{index === previousSessionCount && <div className="neq-session-divider mx-auto my-8 max-w-[500px] rounded border border-card py-2 text-center font-log text-sm italic text-secondary">{ember ? t('Current session') : t('--- Current Session ---')}</div>}<MessageCard message={message} images={imagesByMessage.get(index)} /></div>)}
+          {previousSessionCount === messages.length && previousSessionCount > 0 && <div className="neq-session-divider mx-auto my-8 max-w-[500px] rounded border border-card py-2 text-center font-log text-sm italic text-secondary">{t('--- Current Session ---')}</div>}
           {orphanImages.map((image, index) => (
             <div key={`${image.image_url}-${index}`} className="my-4 flex justify-center">
               <SceneImage
@@ -127,7 +129,7 @@ export function GameLog() {
             onClick={() => {
               const el = containerRef.current
               if (el && unreadRef.current && el.contains(unreadRef.current)) readFromStart(unreadRef.current)
-            }}>New from the DM ↓</button>}
+            }}>{t('New from the DM ↓')}</button>}
         </>
       ) : null}
     </div>

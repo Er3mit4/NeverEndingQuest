@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { useT, useV } from '../../i18n'
 import './character-tooltips.css'
 
 export interface SkillTooltipRow {
@@ -20,6 +21,8 @@ function signed(value: number): string {
 
 /** Legacy ability tooltip: vertically centered to the right, flipping left. */
 export function SkillTooltip({ anchor, ability, rows }: SkillTooltipProps) {
+  const t = useT()
+  const v = useV()
   const ref = useRef<HTMLDivElement>(null)
   const [position, setPosition] = useState<{ top: number; left: number } | null>(null)
 
@@ -50,11 +53,11 @@ export function SkillTooltip({ anchor, ability, rows }: SkillTooltipProps) {
       className={`neq-skill-tooltip-parity${position ? ' visible' : ''}`}
       style={{ top: position?.top ?? 0, left: position?.left ?? 0 }}
     >
-      <div className="neq-skill-tooltip-header-parity">{ability} Skills</div>
+      <div className="neq-skill-tooltip-header-parity">{t('{ability} Skills', { ability: v('ability', ability) })}</div>
       {rows.map((row) => (
         <div key={row.name} className="neq-skill-tooltip-item-parity">
           <span className="neq-skill-tooltip-name-parity">
-            {row.proficient ? '\u25CF' : '\u25CB'} {row.name}
+            {row.proficient ? '\u25CF' : '\u25CB'} {v('skill', row.name)}
           </span>
           <span className="neq-skill-tooltip-value-parity">{signed(row.bonus)}</span>
         </div>

@@ -3,6 +3,7 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 import { createPortal } from 'react-dom'
 import type { GeneratedImage } from '../../stores'
 import { useModalLayer } from '../dialogs/useModalLayer'
+import { useT } from '../../i18n'
 import './SceneImage.css'
 
 type View = { scale: number; x: number; y: number }
@@ -13,6 +14,7 @@ const midpoint = (a: Point, b: Point) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) /
 const clamp = (value: number, limit: number) => Math.max(-limit, Math.min(limit, value))
 
 export function ScenePreview({ image, onClose }: { image: GeneratedImage; onClose: () => void }) {
+  const t = useT()
   const modal = useRef<HTMLDivElement>(null)
   const stage = useRef<HTMLDivElement>(null)
   const picture = useRef<HTMLImageElement>(null)
@@ -93,35 +95,36 @@ export function ScenePreview({ image, onClose }: { image: GeneratedImage; onClos
   }, [])
 
   return createPortal(
-    <div ref={modal} className="neq-scene-preview" role="dialog" aria-modal="true" aria-label="Scene preview" tabIndex={-1}>
-      <header><span>Scene preview</span><button type="button" onClick={onClose} aria-label="Close scene preview">Close ×</button></header>
-      <div ref={stage} className="neq-scene-stage" aria-label="Zoomable scene"
+    <div ref={modal} className="neq-scene-preview" role="dialog" aria-modal="true" aria-label={t('Scene preview')} tabIndex={-1}>
+      <header><span>{t('Scene preview')}</span><button type="button" onClick={onClose} aria-label={t('Close scene preview')}>{t('Close ×')}</button></header>
+      <div ref={stage} className="neq-scene-stage" aria-label={t('Zoomable scene')}
         onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerEnd}
         onPointerCancel={pointerEnd} onLostPointerCapture={pointerEnd}
         onDoubleClick={(event) => zoom(current.current.scale > 1 ? 1 : 2, localPoint(event.clientX, event.clientY))}>
-        {failed ? <p role="status">This scene could not be loaded. Close the preview and try again.</p> :
-          <img ref={picture} src={image.image_url} alt={`Generated scene: ${image.prompt.slice(0, 80)}`} draggable={false}
+        {failed ? <p role="status">{t('This scene could not be loaded. Close the preview and try again.')}</p> :
+          <img ref={picture} src={image.image_url} alt={t('Generated scene: {prompt}', { prompt: image.prompt.slice(0, 80) })} draggable={false}
             onError={() => setFailed(true)} style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }} />}
       </div>
-      <footer><div className="neq-scene-tools" role="group" aria-label="Image zoom">
-        <button type="button" aria-label="Zoom out" disabled={view.scale <= 1} onClick={() => zoom(view.scale - .5)}>−</button>
-        <output aria-live="polite" aria-label="Zoom level">{Math.round(view.scale * 100)}%</output>
-        <button type="button" aria-label="Zoom in" disabled={view.scale >= 5} onClick={() => zoom(view.scale + .5)}>+</button>
-        <button type="button" onClick={() => update(FIT)}>Fit image</button>
-      </div><p>Pinch to zoom · Drag to explore</p></footer>
+      <footer><div className="neq-scene-tools" role="group" aria-label={t('Image zoom')}>
+        <button type="button" aria-label={t('Zoom out')} disabled={view.scale <= 1} onClick={() => zoom(view.scale - .5)}>−</button>
+        <output aria-live="polite" aria-label={t('Zoom level')}>{Math.round(view.scale * 100)}%</output>
+        <button type="button" aria-label={t('Zoom in')} disabled={view.scale >= 5} onClick={() => zoom(view.scale + .5)}>+</button>
+        <button type="button" onClick={() => update(FIT)}>{t('Fit image')}</button>
+      </div><p>{t('Pinch to zoom · Drag to explore')}</p></footer>
     </div>, document.body,
   )
 }
 
 /** Shared by attached and orphan scenes on both game layouts. */
 export function SceneImage({ image, className = '' }: { image: GeneratedImage; className?: string }) {
+  const t = useT()
   const [open, setOpen] = useState(false)
   const [failed, setFailed] = useState(false)
   return <>
-    {failed ? <div className="ember-image-error" role="status">Scene image unavailable. <button type="button" onClick={() => setFailed(false)}>Retry image</button></div> :
-      <button type="button" className="neq-scene-thumbnail" aria-label={`Open scene preview: ${image.prompt.slice(0, 80)}`} onClick={() => setOpen(true)}>
-        <img src={image.image_url} alt={`Generated scene: ${image.prompt.slice(0, 80)}`} className={className} onError={() => setFailed(true)} />
-        <span className="neq-scene-open-hint" aria-hidden="true">View scene ↗</span>
+    {failed ? <div className="ember-image-error" role="status">{t('Scene image unavailable.')} <button type="button" onClick={() => setFailed(false)}>{t('Retry image')}</button></div> :
+      <button type="button" className="neq-scene-thumbnail" aria-label={t('Open scene preview: {prompt}', { prompt: image.prompt.slice(0, 80) })} onClick={() => setOpen(true)}>
+        <img src={image.image_url} alt={t('Generated scene: {prompt}', { prompt: image.prompt.slice(0, 80) })} className={className} onError={() => setFailed(true)} />
+        <span className="neq-scene-open-hint" aria-hidden="true">{t('View scene ↗')}</span>
       </button>}
     {open && <ScenePreview image={image} onClose={() => setOpen(false)} />}
   </>

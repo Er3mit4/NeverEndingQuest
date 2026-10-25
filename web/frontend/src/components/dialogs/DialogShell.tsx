@@ -3,6 +3,7 @@ import type { KeyboardEvent, ReactNode, RefObject } from 'react'
 import './dialog-parity.css'
 import '../../theme/ember-dialogs.css'
 import { useModalLayer } from './useModalLayer'
+import { useT } from '../../i18n'
 
 /** Shared button styles for dialog footers (matches the HeaderBar chrome). */
 const buttonBase = 'neq-dialog-button-parity'
@@ -33,6 +34,7 @@ export function DialogShell({ title, onClose, children, maxWidth = '32rem', lega
   const dialogRef = useRef<HTMLDivElement>(null)
   const closeButtonRef = useRef<HTMLButtonElement>(null)
   const topmost = useModalLayer(dialogRef, onClose)
+  const t = useT()
 
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement
@@ -102,7 +104,7 @@ export function DialogShell({ title, onClose, children, maxWidth = '32rem', lega
             ref={closeButtonRef}
             type="button"
             onClick={onClose}
-            aria-label="Close"
+            aria-label={t('Close')}
             className={legacy ? 'sr-only ember-dialog-close' : 'ember-dialog-close cursor-pointer border-0 bg-transparent font-chrome text-xl leading-none text-secondary hover:text-primary'}
           >
             &times;

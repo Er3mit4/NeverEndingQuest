@@ -15,8 +15,10 @@ import { ThinkingMist, useDmBusy } from './ThinkingMist'
 import { useComposerGating } from '../../modes/useComposerGating'
 import { useEmberDesktop } from '../layout/EmberPresentation'
 import { EmberIcon } from '../layout/EmberIcon'
+import { useT } from '../../i18n'
 
 export function InputBar({ rollInsertion }: { rollInsertion?: { id: number; text: string } } = {}) {
+  const t = useT()
   const ember = useEmberDesktop()
   const turnStatus = useTurnStatus()
   const dmBusy = useDmBusy()
@@ -75,8 +77,8 @@ export function InputBar({ rollInsertion }: { rollInsertion?: { id: number; text
             if (e.key === 'Enter') send()
           }}
           disabled={gating.locked}
-          placeholder="Enter your command..."
-          aria-label="Player input"
+          placeholder={t('Enter your command...')}
+          aria-label={t('Player input')}
           className="neq-input-field min-w-0 flex-1 rounded border border-card bg-page px-3 py-2 font-log text-sm text-primary"
         />
         <button
@@ -85,7 +87,7 @@ export function InputBar({ rollInsertion }: { rollInsertion?: { id: number; text
           disabled={gating.locked}
           className="neq-send-button cursor-pointer rounded border-0 bg-[#4caf50] px-5 py-2 font-chrome text-sm font-bold text-white hover:bg-[#45a049] disabled:cursor-not-allowed disabled:bg-[#555]"
         >
-          {ember && <EmberIcon name="send" />}Send
+          {ember && <EmberIcon name="send" />}{t('Send')}
         </button>
       </div>
     </div>

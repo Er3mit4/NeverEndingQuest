@@ -10,6 +10,7 @@
  */
 import { useEffect, useMemo, useRef } from 'react'
 import type { MapDataPayload, MapRoom } from '../../types/map'
+import { tn, useT } from '../../i18n'
 
 /** A discovered room: one that has been revealed and so carries a name (see MapRoom's SECURITY NOTE cross-reference in types/map.ts). */
 type DiscoveredRoom = MapRoom & { name: string }
@@ -29,6 +30,7 @@ export interface ExplorerNotesProps {
 }
 
 export function ExplorerNotes({ mapData, focusedRowId, onRowClick, variant }: ExplorerNotesProps) {
+  const t = useT()
   const notesScrollRef = useRef<HTMLDivElement>(null)
   const currentRowRef = useRef<HTMLButtonElement>(null)
 
@@ -78,9 +80,9 @@ export function ExplorerNotes({ mapData, focusedRowId, onRowClick, variant }: Ex
     <div className={`neq-notes-wrap neq-notes-wrap--${variant}`}>
       <div className="neq-notes-card">
         <div className="neq-notes-header">
-          <span className="neq-notes-title">Explorer&rsquo;s Notes</span>
+          <span className="neq-notes-title">{t('Explorer’s Notes')}</span>
           <span className="neq-notes-progress">
-            {discovered.length} of {totalCount} places discovered
+            {t('{discovered} of {total} places discovered', { discovered: discovered.length, total: totalCount })}
           </span>
         </div>
         <div className="neq-notes-scroll" ref={notesScrollRef}>
@@ -109,7 +111,7 @@ export function ExplorerNotes({ mapData, focusedRowId, onRowClick, variant }: Ex
           </div>
           {undiscoveredCount > 0 && (
             <div className="neq-notes-undiscovered">
-              &hellip;and {undiscoveredCount} {undiscoveredCount === 1 ? 'place' : 'places'} yet undiscovered.
+              {tn('…and {count} place yet undiscovered.', '…and {count} places yet undiscovered.', undiscoveredCount)}
             </div>
           )}
           {mapData.area.areaDescription && (

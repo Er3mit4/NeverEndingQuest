@@ -15,8 +15,9 @@ import { MapTab } from './MapTab'
 import { useEmberDesktop } from '../layout/EmberPresentation'
 import { EmberIcon } from '../layout/EmberIcon'
 import { InventoryViewProvider } from './InventoryViewState'
+import { useT, type MessageKey } from '../../i18n'
 
-const TABS: ReadonlyArray<{ id: SheetTab; label: string }> = [
+const TABS: ReadonlyArray<{ id: SheetTab; label: MessageKey }> = [
   { id: 'character', label: 'Character' },
   { id: 'inventory', label: 'Inventory' },
   { id: 'spells', label: 'Spells & Magic' },
@@ -24,6 +25,7 @@ const TABS: ReadonlyArray<{ id: SheetTab; label: string }> = [
 ]
 
 export function RightPanelTabs() {
+  const t = useT()
   const ember = useEmberDesktop()
   const [active, setActive] = useState<SheetTab>('character')
 
@@ -36,7 +38,7 @@ export function RightPanelTabs() {
   return (
     <InventoryViewProvider>
     <div className="neq-rail-panel flex h-full min-h-0 flex-col overflow-hidden">
-      <div role="tablist" aria-label="Party panel" className="neq-tabs flex h-10 shrink-0 bg-[#333]" onKeyDown={ember ? (event) => {
+      <div role="tablist" aria-label={t('Party panel')} className="neq-tabs flex h-10 shrink-0 bg-[#333]" onKeyDown={ember ? (event) => {
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
         const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
         const index = tabs.indexOf(event.target as HTMLButtonElement)
@@ -46,7 +48,7 @@ export function RightPanelTabs() {
         tabs[next]?.focus()
         tabs[next]?.click()
       } : undefined}>
-        {(ember ? [...TABS.filter(tab => tab.id !== 'npcs'), { id: 'map' as const, label: 'Map' }] : TABS).map((tab) => {
+        {(ember ? [...TABS.filter(tab => tab.id !== 'npcs'), { id: 'map' as const, label: 'Map' as const }] : TABS).map((tab) => {
           const selected = active === tab.id
           return (
             <button
@@ -64,13 +66,13 @@ export function RightPanelTabs() {
                   : 'border-card text-secondary hover:text-primary')
               }
             >
-              {tab.label}
+              {t(tab.label)}
             </button>
           )
         })}
-        {!ember && <><button type="button" onClick={() => useDialogs.getState().openDialog('journal')} className="neq-tab-button flex-1 border-b-2 border-r border-card px-1 py-2 font-chrome text-xs font-bold text-secondary hover:text-primary">Journal</button>
-        <button type="button" role="tab" aria-selected={active === 'debug'} onClick={() => setActive('debug')} className={'neq-tab-button flex-1 border-b-2 border-r border-card px-1 py-2 font-chrome text-xs font-bold ' + (active === 'debug' ? 'border-accent bg-panel text-accent' : 'border-card text-secondary hover:text-primary')}>Debug</button>
-        <button type="button" role="tab" aria-selected={active === 'map'} onClick={() => setActive('map')} className={'neq-tab-button flex-1 border-b-2 px-1 py-2 font-chrome text-xs font-bold ' + (active === 'map' ? 'border-accent bg-panel text-accent' : 'border-card text-secondary hover:text-primary')}>Map</button>
+        {!ember && <><button type="button" onClick={() => useDialogs.getState().openDialog('journal')} className="neq-tab-button flex-1 border-b-2 border-r border-card px-1 py-2 font-chrome text-xs font-bold text-secondary hover:text-primary">{t('Journal')}</button>
+        <button type="button" role="tab" aria-selected={active === 'debug'} onClick={() => setActive('debug')} className={'neq-tab-button flex-1 border-b-2 border-r border-card px-1 py-2 font-chrome text-xs font-bold ' + (active === 'debug' ? 'border-accent bg-panel text-accent' : 'border-card text-secondary hover:text-primary')}>{t('Debug')}</button>
+        <button type="button" role="tab" aria-selected={active === 'map'} onClick={() => setActive('map')} className={'neq-tab-button flex-1 border-b-2 px-1 py-2 font-chrome text-xs font-bold ' + (active === 'map' ? 'border-accent bg-panel text-accent' : 'border-card text-secondary hover:text-primary')}>{t('Map')}</button>
         </>}
       </div>
       <div role="tabpanel" id={ember ? 'ember-sheet-panel' : undefined} aria-label={ember ? active : undefined} className="min-h-0 flex-1 overflow-hidden">
@@ -82,8 +84,8 @@ export function RightPanelTabs() {
         {active === 'map' && <MapTab />}
       </div>
       {ember && <div className="ember-sheet-footer">
-        <button type="button" aria-pressed={active === 'debug'} onClick={() => setActive('debug')}><EmberIcon name="bug" />Debug</button>
-        <button type="button" onClick={() => useDialogs.getState().openDialog('journal')}><EmberIcon name="book" />Journal</button>
+        <button type="button" aria-pressed={active === 'debug'} onClick={() => setActive('debug')}><EmberIcon name="bug" />{t('Debug')}</button>
+        <button type="button" onClick={() => useDialogs.getState().openDialog('journal')}><EmberIcon name="book" />{t('Journal')}</button>
       </div>}
     </div>
     </InventoryViewProvider>

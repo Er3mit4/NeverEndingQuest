@@ -3,6 +3,7 @@ import { useLog, useSettings } from '../../stores'
 import { useEmberDesktop } from '../layout/EmberPresentation'
 import { EmberIcon } from '../layout/EmberIcon'
 import { claimAudio, finishAudio as finishPlayback, ownsAudio, stopAudio as stopActive } from '../../services/audioCoordinator'
+import { t, useT } from '../../i18n'
 
 const buttonClass =
   'mr-1.5 inline-flex h-[22px] w-[22px] min-w-[22px] cursor-pointer items-center justify-center rounded ' +
@@ -26,7 +27,7 @@ async function createOpenAiAudio(text: string, voice: string, engine: 'openai' |
     signal,
   })
   if (!response.ok) {
-    let detail = 'TTS generation failed'
+    let detail = t('TTS generation failed')
     try { detail = (await response.json() as { error?: string }).error ?? detail } catch { /* non-JSON */ }
     throw new Error(detail)
   }
@@ -42,6 +43,7 @@ async function createOpenAiAudio(text: string, voice: string, engine: 'openai' |
 }
 
 export function TtsButton({ content, autoplay = false }: { content: string; autoplay?: boolean }) {
+  const t = useT()
   const ember = useEmberDesktop()
   const enabled = useSettings((s) => s.ttsEnabled)
   const engine = useSettings((s) => s.engine)
@@ -72,7 +74,7 @@ export function TtsButton({ content, autoplay = false }: { content: string; auto
 
   const play = async () => {
     if (!enabled) {
-      useLog.getState().append({ type: 'system', content: 'Enable "DM Voice" toggle in Settings to use text-to-speech.' })
+      useLog.getState().append({ type: 'system', content: t('Enable "DM Voice" toggle in Settings to use text-to-speech.') })
       return
     }
     if (state === 'playing' || state === 'loading') { stopActive(); return }
@@ -83,7 +85,7 @@ export function TtsButton({ content, autoplay = false }: { content: string; auto
     claimAudio(owner, () => { playGeneration.current += 1; if (mounted.current) setState('idle') })
     try {
       if (engine === 'browser') {
-        if (!('speechSynthesis' in window)) throw new Error('Your browser does not support text-to-speech.')
+        if (!('speechSynthesis' in window)) throw new Error(t('Your browser does not support text-to-speech.'))
         const utterance = new SpeechSynthesisUtterance(content)
         const selected = window.speechSynthesis.getVoices().find((entry) => entry.name === voice)
         if (selected) utterance.voice = selected
@@ -113,7 +115,7 @@ export function TtsButton({ content, autoplay = false }: { content: string; auto
       if (generation !== playGeneration.current || !ownsAudio(owner)) return
       finishPlayback(owner, () => { if (mounted.current) setState('idle') })
       if (error instanceof DOMException && error.name === 'AbortError') return
-      useLog.getState().append({ type: 'error', content: `Voice generation failed: ${error instanceof Error ? error.message : String(error)}` })
+      useLog.getState().append({ type: 'error', content: t('Voice generation failed: {error}', { error: error instanceof Error ? error.message : String(error) }) })
     }
   }
 
@@ -124,6 +126,6 @@ export function TtsButton({ content, autoplay = false }: { content: string; auto
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  if (ember) return <button type="button" onClick={() => void play()} title={state === 'playing' ? 'Stop playback' : 'Play DM Voice'} className="ember-message-action"><EmberIcon name="sound" />{state === 'loading' ? 'Loading…' : state === 'playing' ? 'Stop' : 'Listen'}</button>
-  return <button type="button" onClick={() => void play()} title={state === 'playing' ? 'Stop playback' : 'Play DM Voice'} className={buttonClass} style={{ backgroundColor: state === 'playing' ? '#e74c3c' : state === 'loading' ? '#ffa500' : autoplay ? '#27ae60' : '#4a4a4a', color: '#ddd' }}>{state === 'loading' ? '...' : state === 'playing' ? '■' : '▶'}</button>
+  if (ember) return <button type="button" onClick={() => void play()} title={state === 'playing' ? t('Stop playback') : t('Play DM Voice')} className="ember-message-action"><EmberIcon name="sound" />{state === 'loading' ? t('Loading…') : state === 'playing' ? t('Stop') : t('Listen')}</button>
+  return <button type="button" onClick={() => void play()} title={state === 'playing' ? t('Stop playback') : t('Play DM Voice')} className={buttonClass} style={{ backgroundColor: state === 'playing' ? '#e74c3c' : state === 'loading' ? '#ffa500' : autoplay ? '#27ae60' : '#4a4a4a', color: '#ddd' }}>{state === 'loading' ? '...' : state === 'playing' ? '■' : '▶'}</button>
 }

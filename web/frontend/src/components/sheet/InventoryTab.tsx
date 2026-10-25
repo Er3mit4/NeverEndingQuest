@@ -18,6 +18,7 @@ import { SpellDetails } from './spellDetails'
 import { spellKey } from './spellKey'
 import { useModalLayer } from '../dialogs/useModalLayer'
 import '../dialogs/dialog-parity.css'
+import { useT, useV, type MessageKey } from '../../i18n'
 import {
   equipmentList,
   currencyOf,
@@ -26,7 +27,7 @@ import {
   type InventorySort,
 } from './characterData'
 
-const SORT_OPTIONS: ReadonlyArray<{ value: InventorySort; label: string }> = [
+const SORT_OPTIONS: ReadonlyArray<{ value: InventorySort; label: MessageKey }> = [
   { value: 'name-asc', label: 'Sort: Name A-Z' },
   { value: 'name-desc', label: 'Sort: Name Z-A' },
   { value: 'type', label: 'Sort: Type' },
@@ -34,17 +35,20 @@ const SORT_OPTIONS: ReadonlyArray<{ value: InventorySort; label: string }> = [
 ]
 
 function InventorySearch({ query, onQuery, onClose }: { query: string; onQuery: (query: string) => void; onClose: () => void }) {
+  const t = useT()
   const panel = useRef<HTMLDivElement>(null)
   useModalLayer(panel, onClose)
   return <div className="neq-search-overlay-parity" onClick={onClose}>
-    <div ref={panel} role="dialog" aria-modal="true" aria-label="Search Inventory" tabIndex={-1} className="neq-search-popup-parity" onClick={event => event.stopPropagation()}>
-      <div className="neq-search-header-parity"><h3 className="neq-search-title-parity">Search Inventory</h3><button type="button" aria-label="Close" onClick={onClose} className="neq-search-close-parity">×</button></div>
-      <input value={query} onChange={event => onQuery(event.target.value)} placeholder="Search items..." aria-label="Search items" className="neq-search-input-parity" />
+    <div ref={panel} role="dialog" aria-modal="true" aria-label={t('Search Inventory')} tabIndex={-1} className="neq-search-popup-parity" onClick={event => event.stopPropagation()}>
+      <div className="neq-search-header-parity"><h3 className="neq-search-title-parity">{t('Search Inventory')}</h3><button type="button" aria-label={t('Close')} onClick={onClose} className="neq-search-close-parity">×</button></div>
+      <input value={query} onChange={event => onQuery(event.target.value)} placeholder={t('Search items...')} aria-label={t('Search items')} className="neq-search-input-parity" />
     </div>
   </div>
 }
 
 export function InventoryTab({ expanded = false }: { expanded?: boolean } = {}) {
+  const t = useT()
+  const v = useV()
   const ember = useEmberDesktop()
   const inventory = usePlayer((s) => s.inventory)
   const error = usePlayer((s) => s.dataErrors.inventory)
@@ -81,7 +85,7 @@ export function InventoryTab({ expanded = false }: { expanded?: boolean } = {}) 
     return <p role={ember ? 'status' : undefined} data-state="notice" className="ember-sheet-status p-4 font-body text-sm text-secondary">{notice}</p>
   }
   if (!inventory) {
-    return <p role={ember ? 'status' : undefined} data-state="loading" className="ember-sheet-status p-4 font-body text-sm text-secondary">Loading inventory...</p>
+    return <p role={ember ? 'status' : undefined} data-state="loading" className="ember-sheet-status p-4 font-body text-sm text-secondary">{t('Loading inventory...')}</p>
   }
 
   const openStorage = () => {
@@ -96,36 +100,36 @@ export function InventoryTab({ expanded = false }: { expanded?: boolean } = {}) 
         onClick={openStorage}
         className="neq-storage-view-button"
       >
-        View Player Storage
+        {t('View Player Storage')}
       </button>}
 
       <div className={ember && expanded ? 'tis-inventory-toolbar' : 'neq-inventory-controls'}>
-        {ember && expanded ? <input value={query} onChange={event => setQuery(event.target.value)} placeholder="Find an item…" aria-label="Search items" /> : <button type="button" onClick={() => setSearchOpen(true)} className="neq-inventory-control">Search</button>}
+        {ember && expanded ? <input value={query} onChange={event => setQuery(event.target.value)} placeholder={t('Find an item…')} aria-label={t('Search items')} /> : <button type="button" onClick={() => setSearchOpen(true)} className="neq-inventory-control">{t('Search')}</button>}
         <select
           value={sort}
           onChange={(e) => { setSort(e.target.value as InventorySort); setSortTouched(true) }}
-          aria-label="Sort inventory"
+          aria-label={t('Sort inventory')}
           className="neq-inventory-control neq-inventory-sort"
         >
           {SORT_OPTIONS.map((opt) => (
             <option key={opt.value} value={opt.value}>
-              {opt.label}
+              {t(opt.label)}
             </option>
           ))}
         </select>
-        <select value={category} onChange={(event) => setCategory(event.target.value)} aria-label="Filter inventory" className="neq-inventory-control neq-filter-dropdown">
-          <option value="">Filter</option><option value="weapon">Weapons</option><option value="armor">Armor</option><option value="consumable">Consumables</option><option value="magical">Magical</option><option value="equipped">Equipped</option>
+        <select value={category} onChange={(event) => setCategory(event.target.value)} aria-label={t('Filter inventory')} className="neq-inventory-control neq-filter-dropdown">
+          <option value="">{t('Filter')}</option><option value="weapon">{t('Weapons')}</option><option value="armor">{t('Armor')}</option><option value="consumable">{t('Consumables')}</option><option value="magical">{t('Magical')}</option><option value="equipped">{t('Equipped')}</option>
         </select>
-        <button type="button" onClick={() => { setQuery(''); setCategory(''); setSort('name-asc'); setSortTouched(false) }} className="neq-inventory-control">Clear</button>
-        {ember && expanded && <button type="button" onClick={openStorage} className="neq-inventory-control">Player storage</button>}
+        <button type="button" onClick={() => { setQuery(''); setCategory(''); setSort('name-asc'); setSortTouched(false) }} className="neq-inventory-control">{t('Clear')}</button>
+        {ember && expanded && <button type="button" onClick={openStorage} className="neq-inventory-control">{t('Player storage')}</button>}
       </div>
 
       {/* equipment list */}
       <section ref={section} className="neq-equipment-section" onScroll={event => { const scrollTop = event.currentTarget.scrollTop; setView(previous => ({ ...previous, scrollTop })) }}>
-        {!(ember && expanded) && <h4>Equipment</h4>}
-        {ember && expanded ? <DesktopInventoryTable items={visible} empty={items.length === 0 ? 'No equipment' : 'No items match the filter'} /> : <div>
+        {!(ember && expanded) && <h4>{t('Equipment')}</h4>}
+        {ember && expanded ? <DesktopInventoryTable items={visible} empty={items.length === 0 ? t('No equipment') : t('No items match the filter')} /> : <div>
           {visible.length === 0 ? (
-            <div className="neq-inventory-item"><span className="neq-feature-bullet">●</span><span className="neq-item-name">{items.length === 0 ? 'No equipment' : 'No items match the filter'}</span></div>
+            <div className="neq-inventory-item"><span className="neq-feature-bullet">●</span><span className="neq-item-name">{items.length === 0 ? t('No equipment') : t('No items match the filter')}</span></div>
           ) : (
             visible.map((item, i) => (
               <div
@@ -134,8 +138,8 @@ export function InventoryTab({ expanded = false }: { expanded?: boolean } = {}) 
               >
                 <span className="neq-feature-bullet">{'\u25CF'}</span>
                 <span className="neq-item-name">{ember ? <EmberInspection label={`${item.name}${item.quantity > 1 ? ` ×${item.quantity}` : ''}`}><EquipmentDetails item={item} />{(item.subtype === 'scroll' || /scroll/i.test(item.type)) && <SpellDetails detail={reference[spellKey(item.name.replace(/^scroll\s+(of\s+)?/i, ''))]} fallbackName={item.name} />}</EmberInspection> : `${item.name}${item.quantity > 1 ? ` ×${item.quantity}` : ''}`}</span>
-                <span className="neq-item-type">{` (${item.type.toLowerCase()})`}</span>
-                {ember && item.equipped && <span className="neq-item-type"> · Equipped</span>}
+                <span className="neq-item-type">{` (${v('itemType', item.type).toLowerCase()})`}</span>
+                {ember && item.equipped && <span className="neq-item-type">{t(' · Equipped')}</span>}
                 {!ember && item.description !== '' && (
                   <div className="pointer-events-none absolute left-2 top-full z-20 hidden w-64 rounded border-2 border-card bg-panel p-2 shadow-lg group-hover:block">
                     <div className="font-display text-xs text-accent">{item.name}</div>

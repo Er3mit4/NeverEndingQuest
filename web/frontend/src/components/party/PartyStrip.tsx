@@ -19,6 +19,7 @@ import './party-parity.css'
 import { matchingNpc, partySummary } from './partyData'
 import { NpcCardDialog } from './NpcCardDialog'
 import { PlayerCardDialog } from './PlayerCardDialog'
+import { useT } from '../../i18n'
 
 interface HorizontalChipRailProps {
   label: string
@@ -28,6 +29,7 @@ interface HorizontalChipRailProps {
 
 /** Shared legacy scroller used by both exploration and initiative rails. */
 export function HorizontalChipRail({ label, itemCount, children }: HorizontalChipRailProps) {
+  const t = useT()
   const ember = useEmberDesktop()
   const railRef = useRef<HTMLDivElement>(null)
   const [arrows, setArrows] = useState({ left: false, right: false })
@@ -67,16 +69,17 @@ export function HorizontalChipRail({ label, itemCount, children }: HorizontalChi
   const lowerLabel = label.toLowerCase()
   return (
     <div className="neq-chip-scroller-wrapper">
-      {arrows.left && <button type="button" aria-label={`Scroll ${lowerLabel} left`} className="neq-chip-scroll-arrow" onClick={() => scroll(-200)}>&lt;</button>}
+      {arrows.left && <button type="button" aria-label={t('Scroll {label} left', { label: lowerLabel })} className="neq-chip-scroll-arrow" onClick={() => scroll(-200)}>&lt;</button>}
       <div ref={railRef} aria-label={label} className="neq-chip-scroller">
         {children}
       </div>
-      {arrows.right && <button type="button" aria-label={`Scroll ${lowerLabel} right`} className="neq-chip-scroll-arrow" onClick={() => scroll(200)}>&gt;</button>}
+      {arrows.right && <button type="button" aria-label={t('Scroll {label} right', { label: lowerLabel })} className="neq-chip-scroll-arrow" onClick={() => scroll(200)}>&gt;</button>}
     </div>
   )
 }
 
 export function PartyStrip() {
+  const t = useT()
   const ember = useEmberDesktop()
   const party = useWorld((s) => s.party)
   const locationNpcs = useWorld((s) => s.locationNpcs)
@@ -120,9 +123,9 @@ export function PartyStrip() {
   }
 
   return <>
-    <HorizontalChipRail label="Party members" itemCount={party.length + locationNpcs.length}>
+    <HorizontalChipRail label={t('Party members')} itemCount={party.length + locationNpcs.length}>
       {party.map((member) => renderMember(member, false))}
-      {ember && locationNpcs.length > 0 && <div className="ember-nearby-label">Nearby</div>}
+      {ember && locationNpcs.length > 0 && <div className="ember-nearby-label">{t('Nearby')}</div>}
       {locationNpcs.map((npc) => renderMember(npc, true))}
     </HorizontalChipRail>
     <MediaPopup media={media} onClose={() => setMedia(null)} />

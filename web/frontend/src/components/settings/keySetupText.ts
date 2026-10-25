@@ -1,5 +1,6 @@
 import type { ServerEvents } from '../../contract/events'
 import type { ProviderSettings } from '../../stores/dialogs'
+import { t, tn } from '../../i18n'
 
 /**
  * #1399: the player's OpenAI key lines, word for word from the audited plan
@@ -21,17 +22,17 @@ export const GUIDE_STEPS = [
   'Get a key: sign in at https://platform.openai.com/api-keys and choose "Create new secret key". Your account needs a little credit at https://platform.openai.com/settings/organization/billing.',
   'Copy the key. It starts with "sk-".',
   'Paste it in the box below and press Save.',
-]
+] as const
 export const GUIDE_FOOTER = 'Your key is saved on this machine and is only ever sent to OpenAI.'
 
 export const START_ADVENTURE = 'Start my adventure'
 
 /** "about 20 seconds", or "about a minute" without a Retry-After. */
 export function waitText(seconds: number | null | undefined): string {
-  if (typeof seconds !== 'number' || seconds <= 0) return 'about a minute'
-  if (seconds < 60) return `about ${seconds} ${seconds === 1 ? 'second' : 'seconds'}`
+  if (typeof seconds !== 'number' || seconds <= 0) return t('about a minute')
+  if (seconds < 60) return tn('about {count} second', 'about {count} seconds', seconds)
   const minutes = Math.round(seconds / 60)
-  return minutes <= 1 ? 'about a minute' : `about ${minutes} minutes`
+  return minutes <= 1 ? t('about a minute') : t('about {count} minutes', { count: minutes })
 }
 
 type KeyCheck = ServerEvents['openai_key_check']
@@ -40,22 +41,22 @@ type KeyCheck = ServerEvents['openai_key_check']
 export function keyCheckText(check: KeyCheck): string | null {
   switch (check.result) {
     case 'checking':
-      return 'Checking your key with OpenAI...'
+      return t('Checking your key with OpenAI...')
     case 'accepted':
-      return 'Key accepted. Your key is saved on this machine and is only ever sent to OpenAI.'
+      return t('Key accepted. Your key is saved on this machine and is only ever sent to OpenAI.')
     case 'rejected':
-      return 'OpenAI did not accept this key. Check that you copied the whole key (it starts with "sk-") and that it has not been revoked, then save it again.'
+      return t('OpenAI did not accept this key. Check that you copied the whole key (it starts with "sk-") and that it has not been revoked, then save it again.')
     case 'rate_limited':
-      return `Your key is saved. OpenAI is limiting how often this account can make requests right now; new accounts start with lower limits that rise as you use them. Wait ${waitText(check.wait_seconds)}, then carry on.`
+      return t('Your key is saved. OpenAI is limiting how often this account can make requests right now; new accounts start with lower limits that rise as you use them. Wait {wait}, then carry on.', { wait: waitText(check.wait_seconds) })
     case 'denied':
-      return 'Your key is saved, but OpenAI refused access for this account. Check your OpenAI project settings at https://platform.openai.com/settings, or use a key from another project.'
+      return t('Your key is saved, but OpenAI refused access for this account. Check your OpenAI project settings at https://platform.openai.com/settings, or use a key from another project.')
     case 'no_quota':
-      return 'OpenAI accepted this key, but the account has no credit left. Add credit to your OpenAI account; the game will use this key once it can.'
+      return t('OpenAI accepted this key, but the account has no credit left. Add credit to your OpenAI account; the game will use this key once it can.')
     case 'unreachable':
-      return 'Could not reach OpenAI to check this key. It has been saved anyway; if it is wrong, the game will say so on your first turn.'
+      return t('Could not reach OpenAI to check this key. It has been saved anyway; if it is wrong, the game will say so on your first turn.')
     case 'no_new_key':
       // With no saved key the guided panel says what to do instead.
-      return check.has_key ? 'No new key entered. Your saved key was kept.' : null
+      return check.has_key ? t('No new key entered. Your saved key was kept.') : null
   }
   return null
 }

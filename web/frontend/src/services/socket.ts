@@ -10,6 +10,7 @@ import { useInputSuggestion } from '../stores/inputSuggestion'
  * store writes (plan Task 4.2).
  */
 import { io, Socket } from 'socket.io-client'
+import { t } from '../i18n'
 import type { ClientEvents, ServerEvents } from '../contract/events'
 import { CLIENT_EVENT_ARITY } from '../contract/events'
 import { useSession, useLog, useWorld, usePlayer, useDialogs } from '../stores'
@@ -256,7 +257,7 @@ on('restore_complete', (p) => {
 })
 on('reset_complete', (p) => {
   useDialogs.getState().setActionResult({ kind: 'reset', message: p.message })
-  useLog.getState().append({ type: 'system', content: 'Campaign has been reset. The page will now reload.' })
+  useLog.getState().append({ type: 'system', content: t('Campaign has been reset. The page will now reload.') })
 })
 on('message_log_cleared', () => useLog.getState().clear())
 on('exit_acknowledged', () => {
@@ -264,7 +265,7 @@ on('exit_acknowledged', () => {
   // transport acknowledgment ("Exit acknowledged") replace that sentence.
   const current = useDialogs.getState().actionResult
   if (current?.kind !== 'exit') {
-    useDialogs.getState().setActionResult({ kind: 'exit', message: 'You can now safely close this browser tab.' })
+    useDialogs.getState().setActionResult({ kind: 'exit', message: t('You can now safely close this browser tab.') })
   }
 })
 on('compression_start', (p) => useDialogs.getState().compressionStart(p))

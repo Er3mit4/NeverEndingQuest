@@ -2,7 +2,8 @@
 
 > **⚠️ This is a custom fork.** Experimental playground maintained by
 > [Er3mit4](https://github.com/Er3mit4) — currently adds **Codex GPT-6 with
-> ChatGPT login**, the **OpenCode Go provider (DeepSeek V4.1 Flash)**, and startup fixes. It is used to
+> ChatGPT login**, the **OpenCode Go provider (DeepSeek V4.1 Flash)**, a
+> **Brazilian Portuguese player interface**, and startup fixes. It is used to
 > test new AI endpoints and mechanics; see [FORK.md](FORK.md) for what is
 > implemented and what is planned. The base game comes from upstream; provider
 > and setup instructions below describe this fork where noted.

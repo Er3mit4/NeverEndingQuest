@@ -9,6 +9,7 @@ import { usePlayer } from '../../stores'
 import { NpcDetailModal, type NpcModalKind } from './NpcDetailModal'
 import { matchingNpc } from '../party/partyData'
 import { NpcTabbedSheet } from './NpcTabbedSheet'
+import { useT, useV } from '../../i18n'
 import {
   ABILITIES,
   abilityModifier,
@@ -27,7 +28,17 @@ interface Selection {
   kind: NpcModalKind
 }
 
+/** Biography field labels, keyed by the raw character-file field name. */
+const BIO_LABELS = {
+  personality_traits: 'Personality Traits',
+  ideals: 'Ideals',
+  bonds: 'Bonds',
+  flaws: 'Flaws',
+} as const
+
 export function NpcsTab({ npcName }: { npcName?: string } = {}) {
+  const t = useT()
+  const v = useV()
   const ember = useEmberDesktop()
   const npcs = usePlayer((state) => state.npcs)
   const error = usePlayer((state) => state.dataErrors.npcs)
@@ -45,9 +56,9 @@ export function NpcsTab({ npcName }: { npcName?: string } = {}) {
   return (
     <div className={`neq-npcs-content h-full overflow-y-auto${ember && npcName ? ' tcs-focused-npc' : ''}`}>
       {visibleNpcs.length === 0 ? (
-        <p role={ember ? 'status' : undefined} data-state="empty" className="ember-sheet-status text-sm italic text-secondary">{npcName ? 'Full character details are not available for this NPC.' : 'No NPC data available'}</p>
+        <p role={ember ? 'status' : undefined} data-state="empty" className="ember-sheet-status text-sm italic text-secondary">{npcName ? t('Full character details are not available for this NPC.') : t('No NPC data available')}</p>
       ) : visibleNpcs.map((npc) => {
-        const name = str(npc['name'], 'Unknown NPC')
+        const name = str(npc['name'], t('Unknown NPC'))
         const hp = num(npc['hitPoints'])
         const maxHp = num(npc['maxHitPoints'])
         const scores = abilityScores(npc)
@@ -55,13 +66,13 @@ export function NpcsTab({ npcName }: { npcName?: string } = {}) {
         const status = str(npc['status'], 'alive')
         const condition = str(npc['condition']) || (Array.isArray(npc['conditions']) ? npc['conditions'].filter((value) => typeof value === 'string').join(', ') : '') || 'none'
         const actions: Array<{ kind: NpcModalKind; label: string; visible: boolean }> = [
-          { kind: 'saves', label: 'Saving Throw', visible: Array.isArray(npc['savingThrows']) && npc['savingThrows'].length > 0 },
-          { kind: 'skills', label: 'Skills', visible: npc['skills'] !== undefined },
-          { kind: 'inventory', label: 'Inventory', visible: Array.isArray(npc['equipment']) && npc['equipment'].length > 0 },
-          { kind: 'features', label: 'Key Abilities', visible: Array.isArray(npc['classFeatures']) && npc['classFeatures'].length > 0 },
-          { kind: 'traits', label: 'Racial Traits', visible: Array.isArray(npc['racialTraits']) && npc['racialTraits'].length > 0 },
-          { kind: 'background', label: 'Background', visible: Boolean(rec(npc['backgroundFeature'])?.['name']) },
-          { kind: 'spells', label: 'Spells', visible: Boolean(rec(npc['spellcasting']) && Object.keys(rec(npc['spellcasting'])!).length > 0) },
+          { kind: 'saves', label: t('Saving Throw'), visible: Array.isArray(npc['savingThrows']) && npc['savingThrows'].length > 0 },
+          { kind: 'skills', label: t('Skills'), visible: npc['skills'] !== undefined },
+          { kind: 'inventory', label: t('Inventory'), visible: Array.isArray(npc['equipment']) && npc['equipment'].length > 0 },
+          { kind: 'features', label: t('Key Abilities'), visible: Array.isArray(npc['classFeatures']) && npc['classFeatures'].length > 0 },
+          { kind: 'traits', label: t('Racial Traits'), visible: Array.isArray(npc['racialTraits']) && npc['racialTraits'].length > 0 },
+          { kind: 'background', label: t('Background'), visible: Boolean(rec(npc['backgroundFeature'])?.['name']) },
+          { kind: 'spells', label: t('Spells'), visible: Boolean(rec(npc['spellcasting']) && Object.keys(rec(npc['spellcasting'])!).length > 0) },
         ]
         const hpRatio = hpPercent(hp, maxHp)
         const hpClass = hpRatio > 75 ? 'healthy' : hpRatio > 50 ? 'injured' : hpRatio > 25 ? 'bloodied' : 'critical'
@@ -72,23 +83,23 @@ export function NpcsTab({ npcName }: { npcName?: string } = {}) {
               <CharacterChip name={name} displayName={name} variant="party-npc" stats={npc} thumbCandidates={npcThumbCandidates(name)} clickMedia={partyClickMedia(name, 'npc')} onOpenMedia={setMedia} />
               <div className="neq-npc-header-main">
                 <h3 className="neq-npc-name">{name}</h3>
-                <p className="neq-npc-details">{`${str(npc['race'])} ${str(npc['class'])} • Level ${num(npc['level'], 1)} • ${capitalizeWords(str(npc['alignment']))}`}</p>
+                <p className="neq-npc-details">{`${str(npc['race'])} ${v('className', str(npc['class']))} • ${t('Level {level}', { level: num(npc['level'], 1) })} • ${v('alignment', capitalizeWords(str(npc['alignment'])))}`}</p>
               </div>
-              {npc['experience_points'] !== undefined && npc['exp_required_for_next_level'] !== undefined && <div className="neq-npc-header-xp"><div className="neq-xp-label">XP</div><div className="neq-xp-value">{`${num(npc['experience_points'])} / ${num(npc['exp_required_for_next_level'])}`}</div></div>}
-              {npc['currency'] !== undefined && (ember ? <EmberCurrency currency={currency} /> : <div className="neq-npc-header-currency"><div className="neq-npc-currency-grid">{([['GP', currency.gold], ['SP', currency.silver], ['CP', currency.copper]] as const).map(([label, value]) => <div key={label} className="neq-npc-currency-item"><span className="neq-npc-currency-amount">{value}</span><span className="neq-npc-currency-type">{label}</span></div>)}</div></div>)}
+              {npc['experience_points'] !== undefined && npc['exp_required_for_next_level'] !== undefined && <div className="neq-npc-header-xp"><div className="neq-xp-label">{t('XP')}</div><div className="neq-xp-value">{`${num(npc['experience_points'])} / ${num(npc['exp_required_for_next_level'])}`}</div></div>}
+              {npc['currency'] !== undefined && (ember ? <EmberCurrency currency={currency} /> : <div className="neq-npc-header-currency"><div className="neq-npc-currency-grid">{([['GP', currency.gold], ['SP', currency.silver], ['CP', currency.copper]] as const).map(([label, value]) => <div key={label} className="neq-npc-currency-item"><span className="neq-npc-currency-amount">{value}</span><span className="neq-npc-currency-type">{t(label)}</span></div>)}</div></div>)}
             </div>
-            {(['personality_traits', 'ideals', 'bonds', 'flaws'] as const).some((key) => typeof npc[key] === 'string' && npc[key]) && <dl className="ember-npc-biography">{(['personality_traits', 'ideals', 'bonds', 'flaws'] as const).map((key) => typeof npc[key] === 'string' && npc[key] ? <div key={key}><dt>{capitalizeWords(key.replace(/_/g, ' '))}</dt><dd>{str(npc[key])}</dd></div> : null)}</dl>}
+            {(['personality_traits', 'ideals', 'bonds', 'flaws'] as const).some((key) => typeof npc[key] === 'string' && npc[key]) && <dl className="ember-npc-biography">{(['personality_traits', 'ideals', 'bonds', 'flaws'] as const).map((key) => typeof npc[key] === 'string' && npc[key] ? <div key={key}><dt>{t(BIO_LABELS[key])}</dt><dd>{str(npc[key])}</dd></div> : null)}</dl>}
             {npc['abilities'] !== undefined && <div className="neq-npc-abilities">
-              <div className="neq-npc-ability-score neq-npc-combat-stat"><div className="neq-npc-ability-name">HP</div><div className="neq-npc-ability-value">{`${hp}/${maxHp}`}</div><div className="neq-npc-hp-bar"><div className={`neq-npc-hp-fill ${hpClass}`} style={{ width: `${hpRatio}%` }} /></div></div>
-              <div className="neq-npc-ability-score neq-npc-combat-stat neq-npc-no-circle"><div className="neq-npc-ability-name">AC</div><div className="neq-npc-ability-value">{num(npc['armorClass'], 10)}</div></div>
-              <div className="neq-npc-ability-score neq-npc-combat-stat neq-npc-no-circle"><div className="neq-npc-ability-name">INIT</div><div className="neq-npc-ability-value">{formatModifier(num(npc['initiative']))}</div></div>
-              {ABILITIES.map((ability) => <div key={ability} className="neq-npc-ability-score"><div className="neq-npc-ability-name">{ability.slice(0, 3).toUpperCase()}</div><div className="neq-npc-ability-value">{scores[ability]}</div><div className="neq-npc-ability-modifier">{formatModifier(abilityModifier(scores[ability]))}</div></div>)}
+              <div className="neq-npc-ability-score neq-npc-combat-stat"><div className="neq-npc-ability-name">{t('HP')}</div><div className="neq-npc-ability-value">{`${hp}/${maxHp}`}</div><div className="neq-npc-hp-bar"><div className={`neq-npc-hp-fill ${hpClass}`} style={{ width: `${hpRatio}%` }} /></div></div>
+              <div className="neq-npc-ability-score neq-npc-combat-stat neq-npc-no-circle"><div className="neq-npc-ability-name">{t('AC')}</div><div className="neq-npc-ability-value">{num(npc['armorClass'], 10)}</div></div>
+              <div className="neq-npc-ability-score neq-npc-combat-stat neq-npc-no-circle"><div className="neq-npc-ability-name">{t('INIT')}</div><div className="neq-npc-ability-value">{formatModifier(num(npc['initiative']))}</div></div>
+              {ABILITIES.map((ability) => <div key={ability} className="neq-npc-ability-score"><div className="neq-npc-ability-name">{v('ability', ability).slice(0, 3).toUpperCase()}</div><div className="neq-npc-ability-value">{scores[ability]}</div><div className="neq-npc-ability-modifier">{formatModifier(abilityModifier(scores[ability]))}</div></div>)}
             </div>}
             <div className="neq-npc-detail-buttons">
               {actions.filter((action) => action.visible).map((action) => <button key={action.kind} type="button" className="neq-npc-detail-button" onClick={() => { window.dispatchEvent(new CustomEvent('neq:media-request')); setSelected({ identity: npcIdentity(npc), kind: action.kind }) }}>{action.label}</button>)}
               <button type="button" disabled aria-hidden="true" className="neq-npc-detail-button neq-npc-detail-spacer" />
             </div>
-            {(status !== 'alive' || condition !== 'none') && <div className="neq-npc-status"><div className="neq-npc-status-item">Status: <span className={`neq-npc-status-value ${status}`}>{status}</span></div>{condition !== 'none' && <div className="neq-npc-status-item">Condition: <span className="neq-npc-condition-value">{condition}</span></div>}</div>}
+            {(status !== 'alive' || condition !== 'none') && <div className="neq-npc-status"><div className="neq-npc-status-item">{t('Status:')}{' '}<span className={`neq-npc-status-value ${status}`}>{status}</span></div>{condition !== 'none' && <div className="neq-npc-status-item">{t('Condition:')}{' '}<span className="neq-npc-condition-value">{condition}</span></div>}</div>}
           </section>
         )
       })}

@@ -10,6 +10,8 @@
  * displaySpellsAndMagic, displayNPCs, showNPC*).
  */
 
+import { t } from '../../i18n'
+
 // ---------- unknown-narrowing primitives ----------
 
 export function rec(v: unknown): Record<string, unknown> | null {
@@ -261,7 +263,7 @@ function toEquipmentItem(raw: unknown): EquipmentItem | null {
   if (!item) return null
   const charges = rec(item['charges'])
   return {
-    name: str(item['item_name'], 'Unknown item'),
+    name: str(item['item_name'], t('Unknown item')),
     type: str(item['item_type'], 'misc'),
     subtype: str(item['item_subtype']),
     description: str(item['description']),

@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import type { RefObject } from 'react'
 import { useModalLayer } from '../dialogs/useModalLayer'
+import { useT } from '../../i18n'
 import './ember-inspection.css'
 
 const activationEvent = 'neq:inspection-open'
@@ -15,6 +16,7 @@ function InspectionLayer({ target, onClose }: { target: RefObject<HTMLDivElement
 /** Nonmodal inspection: hover/focus previews; activation pins scrollable details.
  * One inspection at a time. No game actions or data fetching are owned here. */
 export function EmberInspection({ label, children, className = '', triggerContent }: { label: string; children: ReactNode; className?: string; triggerContent?: ReactNode }) {
+  const t = useT()
   const id = useId()
   const trigger = useRef<HTMLButtonElement>(null)
   const panel = useRef<HTMLDivElement>(null)
@@ -122,12 +124,12 @@ export function EmberInspection({ label, children, className = '', triggerConten
       onClick={() => { if (pinned) close(true); else { show(true); pinnedOwner = id; setPinned(true) } }}>
       {triggerContent ?? label}
     </button>
-    {open && createPortal(<div ref={panel} id={id} role="dialog" aria-label={`${label} details`} aria-modal="false"
+    {open && createPortal(<div ref={panel} id={id} role="dialog" aria-label={t('{label} details', { label })} aria-modal="false"
       className="ember-inspection" style={position} onMouseEnter={cancelTimer} onMouseLeave={leave}
       onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget) && event.relatedTarget !== trigger.current) close() }}
       onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(true) } }}>
       <InspectionLayer target={panel} onClose={() => close(pinned)} />
-      <header><h3>{label}</h3><button type="button" aria-label={`Close ${label} details`} onClick={() => close(true)}>×</button></header>
+      <header><h3>{label}</h3><button type="button" aria-label={t('Close {label} details', { label })} onClick={() => close(true)}>×</button></header>
       <div className="ember-inspection-body" tabIndex={0}>{children}</div>
     </div>, document.body)}
   </>

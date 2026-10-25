@@ -8,6 +8,7 @@ import { useId, useRef } from 'react'
 import './dialog-parity.css'
 import { useModalLayer } from './useModalLayer'
 import { useEmberViewport } from '../layout/useEmberViewport'
+import { t, useT } from '../../i18n'
 import './journal.css'
 
 type PlotPoint = PlotData['plotPoints'][number]
@@ -25,7 +26,7 @@ function toSideQuests(raw: unknown[] | undefined): SideQuest[] {
     const r = sq as Record<string, unknown>
     return [
       {
-        title: typeof r['title'] === 'string' ? r['title'] : 'Unknown quest',
+        title: typeof r['title'] === 'string' ? r['title'] : t('Unknown quest'),
         description: typeof r['description'] === 'string' ? r['description'] : '',
         status: typeof r['status'] === 'string' ? r['status'] : 'unknown',
       },
@@ -79,28 +80,30 @@ function JournalPage({
 /** Keep the original parchment book, with the shared modal ownership contract. */
 function DesktopJournal({ children, onClose }: { children: ReactNode; onClose: () => void }) {
   const titleId = useId()
+  const t = useT()
   const overlayRef = useRef<HTMLDivElement>(null)
   const topmost = useModalLayer(overlayRef, onClose)
   return createPortal(
     <div ref={overlayRef} className="neq-journal-overlay neq-journal-overlay-parity neq-journal-desktop"
       role="dialog" aria-modal="true" aria-labelledby={titleId}
       onMouseDown={event => { if (event.target === event.currentTarget && topmost()) onClose() }}>
-      <h1 id={titleId} className="sr-only">Adventure Journal</h1>
-      <button type="button" className="neq-journal-close" onClick={onClose} aria-label="Close">×</button>
+      <h1 id={titleId} className="sr-only">{t('Adventure Journal')}</h1>
+      <button type="button" className="neq-journal-close" onClick={onClose} aria-label={t('Close')}>×</button>
       <div className="neq-journal-book">{children}</div>
     </div>, document.body,
   )
 }
 
 function BlankJournalPages({ error = false }: { error?: boolean }) {
+  const t = useT()
   return (
     <>
       <section className="neq-journal-page">
         <div className="neq-journal-page-content">
           {error && (
             <>
-              <h2>Journal</h2>
-              <p>Could not load quest data.</p>
+              <h2>{t('Journal')}</h2>
+              <p>{t('Could not load quest data.')}</p>
             </>
           )}
         </div>
@@ -114,6 +117,7 @@ function BlankJournalPages({ error = false }: { error?: boolean }) {
 
 function JournalModalBody() {
   const ember = useEmberViewport()
+  const t = useT()
   const closeDialog = useDialogs((s) => s.closeDialog)
   const plot = useWorld((s) => s.plot)
   const plotError = useWorld((s) => s.plotError)
@@ -145,10 +149,10 @@ function JournalModalBody() {
 
   const unavailable = !!plotError || plot === null
   if (ember) return <DesktopJournal onClose={closeDialog}>
-    <JournalPage heading="Current Objectives" quests={unavailable ? [] : activeQuests} keyboardScrollable>
-      {plotError ? <p role="alert">Could not load quest data. Close and reopen the journal to retry.</p> : plot === null ? <p role="status">Fetching your journal…</p> : discovered.length === 0 ? <p>No discovered quests have been recorded yet.</p> : null}
+    <JournalPage heading={t('Current Objectives')} quests={unavailable ? [] : activeQuests} keyboardScrollable>
+      {plotError ? <p role="alert">{t('Could not load quest data. Close and reopen the journal to retry.')}</p> : plot === null ? <p role="status">{t('Fetching your journal…')}</p> : discovered.length === 0 ? <p>{t('No discovered quests have been recorded yet.')}</p> : null}
     </JournalPage>
-    <JournalPage heading="A Chronicle of Deeds" quests={unavailable ? [] : completedQuests} keyboardScrollable />
+    <JournalPage heading={t('A Chronicle of Deeds')} quests={unavailable ? [] : completedQuests} keyboardScrollable />
   </DesktopJournal>
   return (
     <div
@@ -160,8 +164,8 @@ function JournalModalBody() {
         if (event.target === event.currentTarget) closeDialog()
       }}
     >
-      <h1 id={titleId} className="sr-only">Adventure Journal</h1>
-      <button type="button" className="neq-journal-close" onClick={closeDialog} aria-label="Close">×</button>
+      <h1 id={titleId} className="sr-only">{t('Adventure Journal')}</h1>
+      <button type="button" className="neq-journal-close" onClick={closeDialog} aria-label={t('Close')}>×</button>
       <div ref={dialogRef} className="neq-journal-book" tabIndex={-1}>
       {plotError ? (
         <BlankJournalPages error />
@@ -170,11 +174,11 @@ function JournalModalBody() {
       ) : (
         <>
           <JournalPage
-            heading="Current Objectives"
+            heading={t('Current Objectives')}
             quests={activeQuests}
           />
           <JournalPage
-            heading="A Chronicle of Deeds"
+            heading={t('A Chronicle of Deeds')}
             quests={completedQuests}
           />
         </>

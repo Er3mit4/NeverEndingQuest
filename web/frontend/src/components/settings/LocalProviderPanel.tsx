@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { emitC } from '../../services/socket'
 import { useDialogs, useLog } from '../../stores'
+import { formatNumber, useT } from '../../i18n'
 import { spendDisclaimer } from '../layout/spendText'
 import {
   GUIDE_FOOTER, GUIDE_HEADING, GUIDE_INTRO, GUIDE_STEPS, KEY_HELP, KEY_NO_KEYCHAIN, KEY_RESTART,
@@ -11,16 +12,16 @@ import type { ClientEvents } from '../../contract/events'
 
 type ProviderValue = ClientEvents['set_model_provider']['provider']
 
-const PROVIDER_OPTIONS: Array<{ value: ProviderValue; label: string }> = [
+const PROVIDER_OPTIONS = [
   { value: 'legacy', label: 'Legacy (GPT-4.1) - Stable baseline' },
   { value: 'openai', label: 'OpenAI API (GPT-6) - Uses an API key' },
   { value: 'codex', label: 'Codex (GPT-6) - Uses your ChatGPT subscription' },
   { value: 'gemini', label: 'Gemini 3.1 - Alternative provider, tested per task' },
   { value: 'opencodego', label: 'OpenCode Go - Low-cost subscription (plan models)' },
   { value: 'lmstudio', label: 'Local / Custom Server (LM Studio, Ollama, OpenRouter...)' },
-]
+] as const satisfies ReadonlyArray<{ value: ProviderValue; label: string }>
 
-const PROVIDER_HINTS: Record<ProviderValue, string> = {
+const PROVIDER_HINTS = {
   legacy: 'Legacy (GPT-4.1): stable baseline, recommended. Uses your OpenAI API key.',
   openai: 'OpenAI API (GPT-6): uses your OpenAI API key and API billing.',
   codex: 'Codex (GPT-6): uses the official Codex login and your ChatGPT service quota.',
@@ -29,7 +30,7 @@ const PROVIDER_HINTS: Record<ProviderValue, string> = {
     'OpenCode Go: low-cost subscription serving the current plan models. Pick one below. Uses your opencode-go key (auto-detected from the OpenCode CLI when present).',
   lmstudio:
     'Local / Custom Server: point at any OpenAI-compatible server below. Zero cost when local.',
-}
+} as const satisfies Record<ProviderValue, string>
 
 const PROVIDER_LOADING = 'Loading provider...'
 
@@ -50,6 +51,7 @@ function isProviderValue(value: string): value is ProviderValue {
 }
 
 function LocalProviderPanelBody() {
+  const t = useT()
   const settings = useDialogs((s) => s.settings)
 
   // Sync all provider state from the server when the panel mounts.
@@ -119,10 +121,10 @@ function LocalProviderPanelBody() {
     const timer = window.setTimeout(() => {
       awaitingTest.current = false
       setTesting(false)
-      setTestStatus({ text: 'No test response received. Check your connection and try again.', tone: 'fail' })
+      setTestStatus({ text: t('No test response received. Check your connection and try again.'), tone: 'fail' })
     }, 30000)
     return () => window.clearTimeout(timer)
-  }, [testing])
+  }, [testing, t])
   useEffect(() => {
     const res = settings.endpointTest
     if (!res || !awaitingTest.current) return
@@ -133,12 +135,12 @@ function LocalProviderPanelBody() {
 
   const runEndpointTest = () => {
     if (!baseUrl.trim()) {
-      setTestStatus({ text: 'Please enter a Server URL first.', tone: 'fail' })
+      setTestStatus({ text: t('Please enter a Server URL first.'), tone: 'fail' })
       return
     }
     setTesting(true)
     awaitingTest.current = true
-    setTestStatus({ text: 'Testing connection...', tone: 'pending' })
+    setTestStatus({ text: t('Testing connection...'), tone: 'pending' })
     emitC('test_local_endpoint', { base_url: baseUrl, model, api_key: localApiKey })
   }
 
@@ -175,24 +177,24 @@ function LocalProviderPanelBody() {
   }
 
   const keyStatusText = (hasKey: boolean | null) =>
-    hasKey === null ? '' : hasKey ? ' (a key is set)' : ' (no key set)'
+    hasKey === null ? '' : hasKey ? t(' (a key is set)') : t(' (no key set)')
 
   const goCatalogue = settings.opencodegoModels
   const goModels = goCatalogue?.models ?? []
   const selectedGoModel = goCatalogue?.selected ?? 'deepseek-v4.1-flash'
   const goModelsStatus = goCatalogue
-    ? ` ${goModels.length} model(s), ${goCatalogue.source}`
-      + (goCatalogue.fetched_at ? ` -- updated ${goCatalogue.fetched_at}` : '')
-    : ' Loading...'
+    ? ' ' + t('{count} model(s), {source}', { count: formatNumber(goModels.length), source: goCatalogue.source })
+      + (goCatalogue.fetched_at ? ' ' + t('-- updated {date}', { date: goCatalogue.fetched_at }) : '')
+    : ' ' + t('Loading...')
   const goModelsError = goCatalogue?.error ?? null
 
   return (
     <div>
       <div className={sectionClass}>
-        <div className={sectionTitleClass}>AI Provider</div>
+        <div className={sectionTitleClass}>{t('AI Provider')}</div>
         <div className="neq-settings-item neq-settings-provider-item-parity">
           <div className="neq-settings-provider-row-parity">
-            <label htmlFor="model-provider-select">Provider</label>
+            <label htmlFor="model-provider-select">{t('Provider')}</label>
             <select
               id="model-provider-select"
               className={inputClass}
@@ -201,9 +203,9 @@ function LocalProviderPanelBody() {
               onChange={(e) => changeProvider(e.target.value)}
             >
               {provider === null
-                ? <option value="">{PROVIDER_LOADING}</option>
+                ? <option value="">{t(PROVIDER_LOADING)}</option>
                 : PROVIDER_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
+                  <option key={o.value} value={o.value}>{t(o.label)}</option>
                 ))}
             </select>
           </div>
@@ -211,8 +213,8 @@ function LocalProviderPanelBody() {
           {provider === null
             ? ''
             : isProviderValue(provider)
-              ? PROVIDER_HINTS[provider]
-              : 'Models are selected per-task based on quality testing.'}
+              ? t(PROVIDER_HINTS[provider])
+              : t('Models are selected per-task based on quality testing.')}
         </p>
         </div>
       </div>
@@ -228,52 +230,51 @@ function LocalProviderPanelBody() {
           {settings.codexStatus?.state === 'connected' ? (
             <>
               <p className="neq-settings-help-parity">
-                GPT-6 available: {settings.codexStatus.models.map((item) => item.model).join(', ') || 'none'}.
+                {t('GPT-6 available: {models}.', { models: settings.codexStatus.models.map((item) => item.model).join(', ') || t('none') })}
               </p>
               {settings.codexStatus.quota?.primary && (
                 <p className="neq-settings-help-parity">
-                  5-hour quota used: {settings.codexStatus.quota.primary.usedPercent ?? '?'}%.
+                  {t('5-hour quota used: {percent}%.', { percent: settings.codexStatus.quota.primary.usedPercent ?? '?' })}
                 </p>
               )}
             </>
           ) : (
             <button type="button" className={smallButtonClass} onClick={() => emitC('start_codex_login', undefined)}>
-              Sign in with ChatGPT
+              {t('Sign in with ChatGPT')}
             </button>
           )}
           {settings.codexLogin?.userCode && settings.codexStatus?.state !== 'connected' && (
             <p className="neq-settings-help-parity" role="status">
-              Open <a href={settings.codexLogin.verificationUrl} target="_blank" rel="noreferrer">
+              {t('Open')} <a href={settings.codexLogin.verificationUrl} target="_blank" rel="noreferrer">
                 {settings.codexLogin.verificationUrl}
-              </a> and enter code <strong>{settings.codexLogin.userCode}</strong>.
+              </a> {t('and enter code')} <strong>{settings.codexLogin.userCode}</strong>.
             </p>
           )}
           {settings.codexLogin?.error && <p role="alert">{settings.codexLogin.error}</p>}
-          <label htmlFor="codex-model-choice">Model choice</label>
+          <label htmlFor="codex-model-choice">{t('Model choice')}</label>
           <select
             id="codex-model-choice"
             className={inputClass}
             value={settings.codexStatus?.model_choice ?? 'auto'}
             onChange={(event) => emitC('set_codex_model', { model: event.target.value as 'auto' | 'gpt-6-astra' })}
           >
-            <option value="auto">Automatic: Luna, with Sol low only for harder tasks</option>
-            <option value="gpt-6-astra">Astra for all tasks (manual choice)</option>
+            <option value="auto">{t('Automatic: Luna, with Sol low only for harder tasks')}</option>
+            <option value="gpt-6-astra">{t('Astra for all tasks (manual choice)')}</option>
           </select>
           <button type="button" className={smallButtonClass} onClick={() => emitC('get_codex_status', undefined)}>
-            Refresh status
+            {t('Refresh status')}
           </button>
         </div>
       )}
 
       {provider === 'lmstudio' && (
         <div className={sectionClass}>
-          <div className={sectionTitleClass}>Local / Custom Server</div>
+          <div className={sectionTitleClass}>{t('Local / Custom Server')}</div>
           <p className="neq-settings-help-parity">
-            Point at any OpenAI-compatible server (LM Studio, Ollama, vLLM, OpenRouter, or a
-            remote host). Leave blank to use the default local server at localhost:1234.
+            {t('Point at any OpenAI-compatible server (LM Studio, Ollama, vLLM, OpenRouter, or a remote host). Leave blank to use the default local server at localhost:1234.')}
           </p>
           <div className="neq-settings-item neq-settings-stack-parity">
-          <label htmlFor="local-base-url">Server URL</label>
+          <label htmlFor="local-base-url">{t('Server URL')}</label>
           <input
             id="local-base-url"
             type="text"
@@ -283,7 +284,7 @@ function LocalProviderPanelBody() {
             placeholder="http://localhost:1234/v1"
           />
           <label htmlFor="local-model">
-            Model name (optional)
+            {t('Model name (optional)')}
           </label>
           <input
             id="local-model"
@@ -291,10 +292,10 @@ function LocalProviderPanelBody() {
             className={inputClass}
             value={model}
             onChange={(e) => setModel(e.target.value)}
-            placeholder="e.g. local-model or an OpenRouter model id"
+            placeholder={t('e.g. local-model or an OpenRouter model id')}
           />
           <label htmlFor="local-api-key">
-            API key (optional)
+            {t('API key (optional)')}
           </label>
           <input
             id="local-api-key"
@@ -304,14 +305,14 @@ function LocalProviderPanelBody() {
             onChange={(e) => setLocalApiKey(e.target.value)}
             placeholder={
               settings.localEndpoint?.has_key
-                ? '(saved - leave blank to keep)'
-                : 'leave blank for local servers'
+                ? t('(saved - leave blank to keep)')
+                : t('leave blank for local servers')
             }
             autoComplete="off"
           />
           <div className="neq-settings-button-row-parity">
             <button type="button" className={smallButtonClass} onClick={saveLocalEndpoint}>
-              Save
+              {t('Save')}
             </button>
             <button
               type="button"
@@ -319,7 +320,7 @@ function LocalProviderPanelBody() {
               onClick={runEndpointTest}
               disabled={testing}
             >
-              Test Connection
+              {t('Test Connection')}
             </button>
           </div>
           {testStatus && (
@@ -339,23 +340,23 @@ function LocalProviderPanelBody() {
       {provider !== 'codex' ? <div className={sectionClass} ref={keySection}>
         {needsOpenaiKey(settings) && (
           <div className="neq-key-guide" role="note">
-            <div className={sectionTitleClass}>{GUIDE_HEADING}</div>
-            <p className="neq-settings-help-parity">{GUIDE_INTRO}</p>
+            <div className={sectionTitleClass}>{t(GUIDE_HEADING)}</div>
+            <p className="neq-settings-help-parity">{t(GUIDE_INTRO)}</p>
             <ol className="neq-settings-help-parity">
-              {GUIDE_STEPS.map((step) => <li key={step}>{step}</li>)}
+              {GUIDE_STEPS.map((step) => <li key={step}>{t(step)}</li>)}
             </ol>
-            <p className="neq-settings-help-parity">{GUIDE_FOOTER}</p>
+            <p className="neq-settings-help-parity">{t(GUIDE_FOOTER)}</p>
           </div>
         )}
-        <div className={sectionTitleClass}>OpenAI API Key</div>
+        <div className={sectionTitleClass}>{t('OpenAI API Key')}</div>
         <p className="neq-settings-help-parity">
-          {KEY_HELP}
+          {t(KEY_HELP)}
           <span>{keyStatusText(settings.openaiHasKey)}</span>
         </p>
         {pricedAt && <p className="neq-settings-help-parity neq-spend-disclaimer">{spendDisclaimer(pricedAt)}</p>}
         <div className="neq-settings-item neq-settings-stack-parity"><input
           type="password"
-          aria-label="OpenAI API key"
+          aria-label={t('OpenAI API key')}
           className={inputClass}
           value={openaiKey}
           onChange={(e) => setOpenaiKey(e.target.value)}
@@ -363,35 +364,34 @@ function LocalProviderPanelBody() {
           autoComplete="off"
         />
         <button type="button" className={smallButtonClass} onClick={saveOpenaiKey} disabled={checking}>
-          Save Key
+          {t('Save Key')}
         </button></div>
         {keyCheck && keyCheckText(keyCheck) && (
           <p className="neq-settings-status-parity neq-key-check" data-result={keyCheck.result} role="status">
             {keyCheckText(keyCheck)}
-            {keyCheck.restart_needed && <> {KEY_RESTART}</>}
+            {keyCheck.restart_needed && <> {t(KEY_RESTART)}</>}
           </p>
         )}
         {settings.openaiKeychain === false && settings.openaiHasKey && (
-          <p className="neq-settings-help-parity neq-key-no-keychain">{KEY_NO_KEYCHAIN}</p>
+          <p className="neq-settings-help-parity neq-key-no-keychain">{t(KEY_NO_KEYCHAIN)}</p>
         )}
         {keyGate && canStartAfter(keyCheck) && (
           <button type="button" className={smallButtonClass} onClick={resumeGatedAction}>
-            {START_ADVENTURE}
+            {t(START_ADVENTURE)}
           </button>
         )}
       </div> : null}
 
       {provider === 'gemini' && (
         <div className={`${sectionClass} neq-settings-gemini-section-parity`}>
-          <div className={sectionTitleClass}>Gemini API Key</div>
+          <div className={sectionTitleClass}>{t('Gemini API Key')}</div>
           <p className="neq-settings-help-parity">
-            Needed for the Gemini provider. Stored locally on this machine. Get a key at
-            https://aistudio.google.com/apikey
+            {t('Needed for the Gemini provider. Stored locally on this machine. Get a key at https://aistudio.google.com/apikey')}
             <span>{keyStatusText(settings.geminiHasKey)}</span>
           </p>
           <div className="neq-settings-item neq-settings-stack-parity"><input
             type="password"
-            aria-label="Gemini API key"
+            aria-label={t('Gemini API key')}
             className={inputClass}
             value={geminiKey}
             onChange={(e) => setGeminiKey(e.target.value)}
@@ -399,23 +399,21 @@ function LocalProviderPanelBody() {
             autoComplete="off"
           />
           <button type="button" className={smallButtonClass} onClick={saveGeminiKey}>
-            Save Key
+            {t('Save Key')}
           </button></div>
         </div>
       )}
 
       {provider === 'opencodego' && (
         <div className={sectionClass}>
-          <div className={sectionTitleClass}>OpenCode Go API Key</div>
+          <div className={sectionTitleClass}>{t('OpenCode Go API Key')}</div>
           <p className="neq-settings-help-parity">
-            Needed for the OpenCode Go provider. If you use the OpenCode CLI with a Go
-            subscription on this machine, your saved key is detected automatically --
-            no need to paste it. Otherwise get a key at https://opencode.ai/auth
+            {t('Needed for the OpenCode Go provider. If you use the OpenCode CLI with a Go subscription on this machine, your saved key is detected automatically -- no need to paste it. Otherwise get a key at https://opencode.ai/auth')}
             <span>{keyStatusText(settings.opencodegoHasKey)}</span>
           </p>
           <div className="neq-settings-item neq-settings-stack-parity"><input
             type="password"
-            aria-label="OpenCode Go API key"
+            aria-label={t('OpenCode Go API key')}
             className={inputClass}
             value={opencodegoKey}
             onChange={(e) => setOpencodegoKey(e.target.value)}
@@ -423,17 +421,16 @@ function LocalProviderPanelBody() {
             autoComplete="off"
           />
           <button type="button" className={smallButtonClass} onClick={saveOpencodegoKey}>
-            Save Key
+            {t('Save Key')}
           </button></div>
 
-          <div className={sectionTitleClass}>Model</div>
+          <div className={sectionTitleClass}>{t('Model')}</div>
           <p className="neq-settings-help-parity">
-            One model serves every task on this subscription. The list is the plan's
-            current catalogue, refreshed when the game starts.
+            {t("One model serves every task on this subscription. The list is the plan's current catalogue, refreshed when the game starts.")}
             {goModelsStatus}
           </p>
           <select
-            aria-label="OpenCode Go model"
+            aria-label={t('OpenCode Go model')}
             className={inputClass}
             value={selectedGoModel}
             onChange={(e) => emitC('set_opencodego_model', { model: e.target.value })}
@@ -443,7 +440,7 @@ function LocalProviderPanelBody() {
             {goModels.map((item) => (
               <option key={item.id} value={item.id} disabled={!item.supported}>
                 {item.label}
-                {item.supported ? '' : ` -- ${item.transport_label} (not supported yet)`}
+                {item.supported ? '' : ` -- ${item.transport_label} ${t('(not supported yet)')}`}
               </option>
             ))}
           </select>
@@ -452,7 +449,7 @@ function LocalProviderPanelBody() {
             className={smallButtonClass}
             onClick={() => emitC('refresh_opencodego_models', undefined)}
           >
-            Refresh list
+            {t('Refresh list')}
           </button>
           {goModelsError && (
             <p className="neq-settings-help-parity" role="status">{goModelsError}</p>

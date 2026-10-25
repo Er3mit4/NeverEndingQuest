@@ -40,28 +40,32 @@ import { EmberIcon } from './EmberIcon'
 import { useEmberViewport } from './useEmberViewport'
 import { invalidateMediaCaches } from '../party/media'
 import { resetNarrationAudio } from '../log/TtsButton'
+import { useT } from '../../i18n'
 import '../../theme/ember-desktop.css'
 import '../../theme/tavern-desktop-review.css'
 
 function FirstRunBanner() {
+  const t = useT()
   const sessionMode = useSession((s) => s.mode)
   const [dismissed, setDismissed] = useState(true)
   useEffect(() => setDismissed(Boolean(localStorage.getItem('neq_bannerDismissed'))), [])
   // Legacy only exposes this first-run guidance before a game starts. A
   // resumed game must not gain a React-only row that shifts the entire log.
   if (dismissed || sessionMode !== 'disconnected') return null
-  return <div className="ember-welcome-banner m-2 flex items-center gap-3 rounded-md border border-[#4a6da7] bg-[#2b3a55] px-3.5 py-2.5 text-[13px] leading-snug text-[#dde6f5]"><span className="flex-1">Welcome to NeverEndingQuest! Before you start, open <strong>Settings</strong> (gear icon, top right) to choose your AI provider. Want local/zero-cost or a custom server? Pick <strong>Local / Custom Server</strong>, paste your endpoint URL, then click <strong>Test Connection</strong>. You can also set your OpenAI API key there -- no file editing needed.</span><button type="button" onClick={() => { localStorage.setItem('neq_bannerDismissed', 'true'); setDismissed(true) }} className="rounded bg-[#4a6da7] px-3 py-1 text-xs text-white">Dismiss</button></div>
+  return <div className="ember-welcome-banner m-2 flex items-center gap-3 rounded-md border border-[#4a6da7] bg-[#2b3a55] px-3.5 py-2.5 text-[13px] leading-snug text-[#dde6f5]"><span className="flex-1">{t('Welcome to NeverEndingQuest! Before you start, open')} <strong>{t('Settings')}</strong> {t('(gear icon, top right) to choose your AI provider. Want local/zero-cost or a custom server? Pick')} <strong>{t('Local / Custom Server')}</strong>{t(', paste your endpoint URL, then click')} <strong>{t('Test Connection')}</strong>{t('. You can also set your OpenAI API key there -- no file editing needed.')}</span><button type="button" onClick={() => { localStorage.setItem('neq_bannerDismissed', 'true'); setDismissed(true) }} className="rounded bg-[#4a6da7] px-3 py-1 text-xs text-white">{t('Dismiss')}</button></div>
 }
 
 
 function ExitOverlay() {
+  const t = useT()
   const result = useDialogs((s) => s.actionResult)
   if (result?.kind !== 'exit') return null
-  return <div className="ember-exit-overlay fixed left-1/2 top-1/2 z-[10000] -translate-x-1/2 -translate-y-1/2 rounded-[10px] border-2 border-[#8b0000] bg-[#2c2c2c] p-[30px] text-center shadow-[0_0_20px_rgba(0,0,0,.5)]"><h2 className="mb-5 text-2xl font-bold text-accent" style={{ lineHeight: 'normal' }}>Thank you for playing!</h2><p className="mb-5" style={{ lineHeight: 'normal' }}>{EXIT_SAFE_MESSAGE}</p><p className="text-sm text-[#888]" style={{ lineHeight: 'normal' }}>Due to browser security, we cannot close this tab automatically.</p></div>
+  return <div className="ember-exit-overlay fixed left-1/2 top-1/2 z-[10000] -translate-x-1/2 -translate-y-1/2 rounded-[10px] border-2 border-[#8b0000] bg-[#2c2c2c] p-[30px] text-center shadow-[0_0_20px_rgba(0,0,0,.5)]"><h2 className="mb-5 text-2xl font-bold text-accent" style={{ lineHeight: 'normal' }}>{t('Thank you for playing!')}</h2><p className="mb-5" style={{ lineHeight: 'normal' }}>{t(EXIT_SAFE_MESSAGE)}</p><p className="text-sm text-[#888]" style={{ lineHeight: 'normal' }}>{t('Due to browser security, we cannot close this tab automatically.')}</p></div>
 }
 
 /** Center column: transcript, dice and command; compact mode retains its party rail. */
 function CenterColumn({ focused, onToggleFocus }: { focused: boolean; onToggleFocus: () => void }) {
+  const t = useT()
   const ember = useEmberDesktop()
   const location = useWorld(state => state.location)
   const dice = useDiceRolls()
@@ -80,7 +84,7 @@ function CenterColumn({ focused, onToggleFocus }: { focused: boolean; onToggleFo
   return (
     <div className="neq-main-panel flex min-h-0 flex-col">
       {!ember && <><div className="neq-game-panel-header flex shrink-0 items-center">
-        {awaitingInitiative && <span className="neq-panel-header-label">Game Output</span>}
+        {awaitingInitiative && <span className="neq-panel-header-label">{t('Game Output')}</span>}
         <AdventureBox />
         <div className="neq-party-scroller min-w-0 flex-1">
           {/* Self-gating pair: PartyStrip out of combat, InitiativeTracker in. */}
@@ -94,8 +98,8 @@ function CenterColumn({ focused, onToggleFocus }: { focused: boolean; onToggleFo
       <FirstRunBanner />
       <ConnectionNotice />
       {ember && <div className="tavern-story-heading">
-        <div><span className="tavern-eyebrow">Your adventure</span><h2>{location?.currentLocation || 'The next chapter awaits'}</h2></div>
-        <button type="button" aria-pressed={focused} onClick={onToggleFocus}>{focused ? 'Show character & party' : 'Focus story'}<span aria-hidden="true">{focused ? ' ↙' : ' ↗'}</span></button>
+        <div><span className="tavern-eyebrow">{t('Your adventure')}</span><h2>{location?.currentLocation || t('The next chapter awaits')}</h2></div>
+        <button type="button" aria-pressed={focused} onClick={onToggleFocus}>{focused ? t('Show character & party') : t('Focus story')}<span aria-hidden="true">{focused ? ' ↙' : ' ↗'}</span></button>
       </div>}
       <div className="min-h-0 flex-1">
         <GameLog />
@@ -108,6 +112,7 @@ function CenterColumn({ focused, onToggleFocus }: { focused: boolean; onToggleFo
 
 /** App shell: CSS grid of header / center column / right panel rail. */
 export function AppShell() {
+  const t = useT()
   const [focused, setFocused] = useState(false)
   const ember = useEmberViewport()
   useEffect(() => { if (!ember) setFocused(false) }, [ember])
@@ -163,8 +168,8 @@ export function AppShell() {
         <aside className="neq-rail-area min-h-0" style={{ gridArea: 'rail' }}>
           <RightPanelTabs />
         </aside>
-        {ember && <aside className="ember-people" style={{ gridArea: 'people' }} aria-label="Party and initiative">
-          <h2><EmberIcon name="people" />{combat ? 'Initiative' : 'Party & nearby'}{!combat && <AdventureBox />}</h2>
+        {ember && <aside className="ember-people" style={{ gridArea: 'people' }} aria-label={t('Party and initiative')}>
+          <h2><EmberIcon name="people" />{combat ? t('Initiative') : t('Party & nearby')}{!combat && <AdventureBox />}</h2>
           {combat && <AdventureBox />}
           <PartyStrip />
           <InitiativeTracker />

@@ -12,6 +12,7 @@ import { createPortal } from 'react-dom'
 import { asArray, asNumber, asRecord, asString } from './media'
 import './party-parity.css'
 import { useEmberDesktop } from '../layout/EmberPresentation'
+import { t as translate, useT, v as vocab } from '../../i18n'
 
 export interface StatsTooltipProps {
   stats: Record<string, unknown>
@@ -24,11 +25,11 @@ function formatSigned(value: number): string {
 }
 
 function spellLevelName(level: string): string {
-  if (level === '0') return 'Cantrips'
-  if (level === '1') return '1st Level'
-  if (level === '2') return '2nd Level'
-  if (level === '3') return '3rd Level'
-  return `${level}th Level`
+  if (level === '0') return translate('Cantrips')
+  if (level === '1') return translate('1st Level')
+  if (level === '2') return translate('2nd Level')
+  if (level === '3') return translate('3rd Level')
+  return translate('{level}th Level', { level })
 }
 
 function capitalize(value: string): string {
@@ -119,10 +120,12 @@ function parseConditions(stats: Record<string, unknown>): string | null {
   const names = conditions
     .map((entry) => asString(entry))
     .filter((entry) => entry !== undefined)
+    .map((entry) => vocab('condition', entry))
   return names.length > 0 ? names.join(', ') : null
 }
 
 export function StatsTooltip({ stats, anchor, inline = false }: StatsTooltipProps) {
+  const t = useT()
   const ember = useEmberDesktop()
   const ref = useRef<HTMLDivElement>(null)
   const [position, setPosition] = useState<{ top: number; left: number } | null>(null)
@@ -150,7 +153,8 @@ export function StatsTooltip({ stats, anchor, inline = false }: StatsTooltipProp
   const name = asString(stats['name']) ?? ''
   const level = asNumber(stats['level']) ?? asString(stats['level'])
   const className = asString(stats['class'])
-  const header = level && className ? `Lvl ${level} ${className}` : name.replace(/_/g, ' ')
+  const displayClass = vocab('className', className)
+  const header = level && displayClass ? t('Lvl {level} {className}', { level, className: displayClass }) : name.replace(/_/g, ' ')
 
   const currentHp = asNumber(stats['currentHp']) ?? asNumber(stats['hitPoints'])
   const maxHp = asNumber(stats['maxHp']) ?? asNumber(stats['maxHitPoints'])
@@ -161,7 +165,7 @@ export function StatsTooltip({ stats, anchor, inline = false }: StatsTooltipProp
   const attack = asRecord(stats['primaryAttack'])
   const attackBonus = attack ? asNumber(attack['bonus']) : undefined
   const attackDamage = attack ? asString(attack['damage']) : undefined
-  const attackName = attack ? asString(attack['name']) ?? 'Attack' : undefined
+  const attackName = attack ? asString(attack['name']) ?? t('Attack') : undefined
 
   const ammunition = parseAmmunition(stats)
   const slotLines = parseSpellSlots(stats)
@@ -188,11 +192,11 @@ export function StatsTooltip({ stats, anchor, inline = false }: StatsTooltipProp
       <div className="neq-stats-tooltip-row-parity" style={{ fontSize: 12 }}>
         {currentHp !== undefined && maxHp !== undefined && (
           <span>
-            {currentHp}/{maxHp} HP
+            {t('{current}/{max} HP', { current: currentHp, max: maxHp })}
           </span>
         )}
-        {ac !== undefined && <span className="ml-2">AC {ac}</span>}
-        {speed !== undefined && <span className="ml-2">{speed}ft</span>}
+        {ac !== undefined && <span className="ml-2">{t('AC {ac}', { ac })}</span>}
+        {speed !== undefined && <span className="ml-2">{t('{speed}ft', { speed })}</span>}
       </div>
 
       {(attackBonus !== undefined || initiative !== undefined) && (
@@ -204,20 +208,20 @@ export function StatsTooltip({ stats, anchor, inline = false }: StatsTooltipProp
             </span>
           )}
           {initiative !== undefined && (
-            <span className="ml-2">Init: {formatSigned(initiative)}</span>
+            <span className="ml-2">{t('Init: {value}', { value: formatSigned(initiative) })}</span>
           )}
         </div>
       )}
 
       {ammunition && (
         <div className="neq-stats-tooltip-row-parity" style={{ fontSize: 11, color: '#FFB6C1' }}>
-          <span>Ammo: </span><span>{ammunition}</span>
+          <span>{t('Ammo:')} </span><span>{ammunition}</span>
         </div>
       )}
 
       {slotLines.length > 0 && (
         <div className="neq-stats-tooltip-row-parity neq-stats-tooltip-section-parity" style={{ fontSize: 11 }}>
-          <span style={{ color: ember ? 'var(--ember-brass)' : '#87CEEB' }}>Spell Slots: </span>
+          <span style={{ color: ember ? 'var(--ember-brass)' : '#87CEEB' }}>{t('Spell Slots:')} </span>
           <span style={{ color: ember ? 'var(--ember-text)' : '#ddd' }}>
             {slotLines.map((slot) => `${slot.label}: ${slot.current}/${slot.max}`).join(' • ')}
           </span>
@@ -226,7 +230,7 @@ export function StatsTooltip({ stats, anchor, inline = false }: StatsTooltipProp
 
       {spellLines.length > 0 && (
         <div className="neq-stats-tooltip-section-parity">
-          <div style={{ fontSize: 11, color: ember ? 'var(--ember-brass)' : '#87CEEB', marginBottom: 2 }}>Spells Known:</div>
+          <div style={{ fontSize: 11, color: ember ? 'var(--ember-brass)' : '#87CEEB', marginBottom: 2 }}>{t('Spells Known:')}</div>
           {spellLines.map((line) => (
             <div key={line.levelName} style={{ marginTop: 3 }}>
               <span className="font-bold" style={{ fontSize: 10, color: ember ? 'var(--ember-brass)' : '#FFA500' }}>
@@ -240,7 +244,7 @@ export function StatsTooltip({ stats, anchor, inline = false }: StatsTooltipProp
 
       {featureLines.length > 0 && (
         <div className="neq-stats-tooltip-section-parity">
-          <div style={{ fontSize: 11, color: ember ? 'var(--ember-brass)' : '#FFD700', marginBottom: 2 }}>Class Features:</div>
+          <div style={{ fontSize: 11, color: ember ? 'var(--ember-brass)' : '#FFD700', marginBottom: 2 }}>{t('Class Features:')}</div>
           {featureLines.map((feature) => (
             <div key={feature.name} style={{ fontSize: 10, color: '#f0f0f0', marginTop: 2 }}>
               {'\u2022'} {feature.name}
@@ -253,7 +257,7 @@ export function StatsTooltip({ stats, anchor, inline = false }: StatsTooltipProp
       {conditions && (
         <div className="neq-stats-tooltip-row-parity neq-stats-tooltip-section-parity" style={{ fontSize: 11 }}>
           <span className="font-bold" style={{ color: '#ff6666' }}>
-            Conditions:{' '}
+            {t('Conditions:')}{' '}
           </span>
           <span style={{ color: '#ffaaaa' }}>{conditions}</span>
         </div>

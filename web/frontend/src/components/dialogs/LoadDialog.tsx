@@ -4,6 +4,7 @@ import { useDialogs, useLog, useSession } from '../../stores'
 import { ConfirmDialog } from './ConfirmDialog'
 import { prepareForServerRestart, reloadWhenServerReady } from '../../services/restart'
 import { useEmberViewport } from '../layout/useEmberViewport'
+import { formatSaveDate, t, useT, useV } from '../../i18n'
 import {
   DialogShell,
   dialogButtonDanger,
@@ -39,9 +40,9 @@ function toSaveEntry(raw: Record<string, unknown>): SaveEntry {
   return {
     folder: asString(raw['save_folder']),
     mode: asString(raw['save_mode']),
-    date: asString(raw['save_date_readable']) || 'Unknown',
-    module: asString(raw['module']) || 'Unknown Module',
-    location: asString(gameState['current_location']) || 'Unknown Location',
+    date: formatSaveDate(asString(raw['save_date_readable'])) || t('Unknown'),
+    module: asString(raw['module']) || t('Unknown Module'),
+    location: asString(gameState['current_location']) || t('Unknown Location'),
     description: asString(raw['description']),
     autoBackup: asString(raw['auto_backup']),
   }
@@ -51,6 +52,8 @@ const saveExists = (folder: string) => useDialogs.getState().saveList?.some(entr
 
 function LoadDialogBody() {
   const ember = useEmberViewport()
+  const t = useT()
+  const v = useV()
   const closeDialog = useDialogs((s) => s.closeDialog)
   const saveList = useDialogs((s) => s.saveList)
   const recoveryRequired = useSession((s) => s.restoreRecoveryRequired)
@@ -101,10 +104,11 @@ function LoadDialogBody() {
       // restore_complete triggers the page reload (see LoadDialog effect below).
     } catch (error) {
       if (ticket !== operation.current) return
-      setRestoreError(`Game restore could not start: ${error instanceof Error ? error.message : String(error)}`)
+      const reason = error instanceof Error ? error.message : String(error)
+      setRestoreError(t('Game restore could not start: {error}', { error: reason }))
       useLog.getState().append({
         type: 'error',
-        content: `Game restore could not start: ${error instanceof Error ? error.message : String(error)}`,
+        content: `Game restore could not start: ${reason}`,
       })
       setRestoring(false)
       busy.current = false
@@ -130,20 +134,20 @@ function LoadDialogBody() {
     if (!selected || busy.current || !useSession.getState().connected || !saveExists(selected)) return
     setRestoreError('')
     if (ember) setConfirmation({ kind, folder: selected })
-    else if (window.confirm(kind === 'load' ? 'Load this save point? Anything that happened after it was saved will be lost.' : 'Delete this save? This cannot be undone.')) {
+    else if (window.confirm(kind === 'load' ? t('Load this save point? Anything that happened after it was saved will be lost.') : t('Delete this save? This cannot be undone.'))) {
       if (kind === 'load') void performLoad(selected)
       else deleteSelected(selected)
     }
   }
 
   return (
-    <DialogShell title="Load Saved Game" onClose={closeDialog} maxWidth="700px" legacy>
+    <DialogShell title={t('Load Saved Game')} onClose={closeDialog} maxWidth="700px" legacy>
       <div>
         <div className="neq-save-list-parity">
           {saveList === null ? (
-            <p className="neq-save-list-empty-parity">Loading...</p>
+            <p className="neq-save-list-empty-parity">{t('Loading...')}</p>
           ) : entries.length === 0 ? (
-            <p className="neq-save-list-empty-parity">No save games found.</p>
+            <p className="neq-save-list-empty-parity">{t('No save games found.')}</p>
           ) : (
             entries.map((entry) => {
               const isSelected = entry.folder === selected
@@ -159,22 +163,22 @@ function LoadDialogBody() {
                     {entry.folder}
                     {entry.mode && (
                       <span className={`neq-save-mode-badge-parity ${entry.mode === 'full' ? 'full' : 'essential'}`}>
-                        {entry.mode}
+                        {v('saveMode', entry.mode)}
                       </span>
                     )}
                     {entry.autoBackup === EFFECTS_BACKUP_KIND && (
-                      <span className="neq-save-mode-badge-parity auto-backup">Auto backup</span>
+                      <span className="neq-save-mode-badge-parity auto-backup">{t('Auto backup')}</span>
                     )}
                   </div>
                   <div>
-                    <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">Date:</span><span className="neq-save-detail-value-parity date">{entry.date}</span></div>
-                    <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">Module:</span><span className="neq-save-detail-value-parity module">{entry.module}</span></div>
-                    <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">Location:</span><span className="neq-save-detail-value-parity location">{entry.location}</span></div>
+                    <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">{t('Date:')}</span><span className="neq-save-detail-value-parity date">{entry.date}</span></div>
+                    <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">{t('Module:')}</span><span className="neq-save-detail-value-parity module">{entry.module}</span></div>
+                    <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">{t('Location:')}</span><span className="neq-save-detail-value-parity location">{entry.location}</span></div>
                     {entry.autoBackup === EFFECTS_BACKUP_KIND && (
-                      <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">Backup:</span><span className="neq-save-detail-value-parity auto-backup">Taken before the effects upgrade. Loading it returns to before that upgrade and its module setup.</span></div>
+                      <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">{t('Backup:')}</span><span className="neq-save-detail-value-parity auto-backup">{t('Taken before the effects upgrade. Loading it returns to before that upgrade and its module setup.')}</span></div>
                     )}
                     {entry.description && (
-                      <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">Notes:</span><span className="neq-save-detail-value-parity description">{entry.description}</span></div>
+                      <div className="neq-save-detail-row-parity"><span className="neq-save-detail-label-parity">{t('Notes:')}</span><span className="neq-save-detail-value-parity description">{entry.description}</span></div>
                     )}
                   </div>
                 </button>
@@ -185,13 +189,13 @@ function LoadDialogBody() {
 
         {restoring && (
           <p className="mt-3 text-center font-log text-xs text-accent">
-            Restoring save... the page will reload when the server is ready.
+            {t('Restoring save... the page will reload when the server is ready.')}
           </p>
         )}
 
         <div className="neq-dialog-buttons-parity">
           <button type="button" className={dialogButtonSecondary} onClick={closeDialog}>
-            Cancel
+            {t('Cancel')}
           </button>
           <button
             type="button"
@@ -199,7 +203,7 @@ function LoadDialogBody() {
             onClick={() => requestConfirmation('delete')}
             disabled={!selected || restoring || recoveryRequired || !connected}
           >
-            Delete
+            {t('Delete')}
           </button>
           <button
             type="button"
@@ -207,13 +211,13 @@ function LoadDialogBody() {
             onClick={() => requestConfirmation('load')}
             disabled={!selected || restoring || !connected}
           >
-            Load Game
+            {t('Load Game')}
           </button>
         </div>
         {confirmation && <ConfirmDialog
-          title={confirmation.kind === 'load' ? 'Restore Saved Game' : 'Delete Saved Game'}
-          message={confirmation.kind === 'load' ? 'Load this save point? Anything that happened after it was saved will be lost.' : 'Delete this save? This cannot be undone.'}
-          confirmLabel={confirmation.kind === 'load' ? 'Restore Game' : 'Delete Save'}
+          title={confirmation.kind === 'load' ? t('Restore Saved Game') : t('Delete Saved Game')}
+          message={confirmation.kind === 'load' ? t('Load this save point? Anything that happened after it was saved will be lost.') : t('Delete this save? This cannot be undone.')}
+          confirmLabel={confirmation.kind === 'load' ? t('Restore Game') : t('Delete Save')}
           pending={restoring} error={restoreError} disabled={!connected} onCancel={cancelConfirmation}
           onConfirm={() => confirmation.kind === 'load' ? void performLoad(confirmation.folder) : deleteSelected(confirmation.folder)}
         />}
