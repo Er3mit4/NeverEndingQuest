@@ -20,6 +20,7 @@ import shutil
 from utils.module_path_manager import ModulePathManager
 from utils.enhanced_logger import debug, info, warning, error, set_script_name
 from utils.file_operations import safe_write_json
+from utils.child_process import STOPPED_EXIT, ChildStopped, run_fenced, stop_file_set
 
 # Set script name for logging
 set_script_name("combat_builder")
@@ -276,6 +277,21 @@ def _roll_initiative(data, sheet_backed):
     return random.randint(1, 20) + bonus
 
 
+# #1529: the parent's stop file (beside --result-file); None when run alone.
+_STOP_FILE = None
+
+
+def stop_requested():
+    """Whether the parent asked this build to stop (stop file, or its result
+    directory already removed)."""
+    return stop_file_set(_STOP_FILE)
+
+
+def _raise_if_stopped():
+    if stop_requested():
+        raise ChildStopped("encounter build stopped by the game")
+
+
 def load_or_create_monster(monster_key, monster_type):
     """The stat block named by monster_key (#293/typed-monster-key); when it
     does not exist yet, one is generated from monster_type (the typed
@@ -303,11 +319,18 @@ def load_or_create_monster(monster_key, monster_type):
         # failure silently falling back to level 1 (bug CH-M3).
         party_level = _get_party_level()
         from utils.encoding_utils import utf8_child_env
-        result = subprocess.run(
-            [sys.executable, monster_builder_path, monster_type,
-             "--party-level", str(party_level), "--key", monster_key],
-            stdin=subprocess.DEVNULL, capture_output=True,
-            encoding="utf-8", errors="replace", env=utf8_child_env())
+        _raise_if_stopped()
+        # #1529: the grandchild is waited on like this process is: a stop ends
+        # the wait inside the parent's grace (2 s here, 5 s there), and the
+        # grandchild checks the same stop file before it saves.
+        argv = [sys.executable, monster_builder_path, monster_type,
+                "--party-level", str(party_level), "--key", monster_key]
+        if _STOP_FILE:
+            argv += ["--stop-file", _STOP_FILE]
+        returncode, stdout, stderr = run_fenced(
+            argv, stop_check=_raise_if_stopped, grace=2.0, env=utf8_child_env())
+        result = subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+        _raise_if_stopped()
         if result.returncode == 0:
             print(f"[COMBAT_BUILDER] Monster creation successful: {monster_type}")
             info(f"SUCCESS: Monster builder ({monster_type}) - PASS", category="combat_builder")
@@ -422,13 +445,15 @@ def load_or_create_npc(npc_name):
         # The builder gets the NPC's name, not its file stem, and reports the
         # file it loaded or saved, which may be under another stem (#884).
         built = None
+        _raise_if_stopped()
         try:
             from core.generators.npc_builder import build_npc_file_with_path, load_schema
             set_script_name("combat_builder")  # importing npc_builder renames the log prefix
             schema = load_schema("schemas/char_schema.json")
             if schema:
                 built = build_npc_file_with_path(
-                    npc_name, schema, npc_level=party_level, path_manager=path_manager
+                    npc_name, schema, npc_level=party_level, path_manager=path_manager,
+                    stop_check=stop_requested,
                 )
         except Exception as e:
             set_script_name("combat_builder")
@@ -616,6 +641,58 @@ def _pending_observer(candidate, present_names):
     }
 
 
+def _proposed_participant(encounter_data, participant_key):
+    """The DM's scene proposal row for this participant key, or None."""
+    scene = encounter_data.get("scene") if isinstance(encounter_data, dict) else None
+    for item in (scene or {}).get("participants") or []:
+        if isinstance(item, dict) and item.get("participantKey") == participant_key:
+            return item
+    return None
+
+
+def _listed_pending_observer(encounter_data, npc_index, npc_name, place_occupants, encounter,
+                             scene_sources, path_manager):
+    """#1469: a listed npc the DM proposes as an observer (not initiative
+    eligible) who has no sheet and is a present person at the place becomes
+    the #1447 pending row under its own ``npc:N`` key: no T035 at the
+    opening; the first intent that targets it builds the sheet. None keeps
+    today's build (an active npc, a sheet, or no occupant to build from)."""
+    own_slot = f"npc:{npc_index}"
+    proposed = _proposed_participant(encounter_data, own_slot) or {}
+    if proposed.get("participation") != "observer" or proposed.get("initiativeEligible") is not False:
+        return None
+    if _load_npc_sheet(npc_name, path_manager):
+        return None
+    declared_ids = encounter_data.get("occupantIds") or {}
+    taken = {v for k, v in declared_ids.items() if isinstance(v, str) and k != own_slot}
+    taken |= {c["occupantId"] for c in encounter["creatures"] if c.get("occupantId")}
+    expected_file = path_manager.get_character_path(format_type_name(npc_name))
+    occupant_id = _listed_npc_occupant(
+        place_occupants, expected_file, npc_name, taken,
+        declared=declared_ids.get(own_slot) if isinstance(declared_ids.get(own_slot), str) else None,
+    )
+    occupant = place_occupants.get(occupant_id) if occupant_id else None
+    if not occupant:
+        return None
+    candidate = {"name": occupant.get("name") or npc_name, "occupantId": occupant_id,
+                 "attitude": occupant.get("attitude"), "atPlace": True}
+    pending = _pending_observer(candidate, {s["displayName"] for s in scene_sources})
+    if pending is None:
+        return None
+    side = proposed.get("side")
+    if side in ("hostile", "party"):
+        pending["faction"] = side
+    info(f"ROSTER: listed observer {candidate['name']} has no sheet; pending until targeted",
+         category="combat_builder")
+    return {
+        "participantKey": own_slot,
+        "creature": pending,
+        "sourceKind": PENDING_SOURCE,
+        "sourceRef": occupant_id,
+        "displayName": candidate["name"],
+    }
+
+
 def _roster_observers(encounter, scene_sources, place_occupants, party_tracker,
                       encounter_data, path_manager):
     """Add each present named person the DM left out of the fight as an
@@ -715,6 +792,9 @@ def generate_encounter(encounter_data):
         path_manager = ModulePathManager(current_module)
     except:
         path_manager = ModulePathManager()  # Fallback to reading from file
+    # #1551: the npc slots that are roster companions, by value.
+    from core.combat.scene import companion_participant_keys
+    companion_keys = companion_participant_keys(encounter_data, party_tracker)
     player_file = player_sheet_path(path_manager, party_tracker, encounter_data['player'])
     logging.debug(f"Attempting to load player data from {player_file}")
     
@@ -825,6 +905,13 @@ def generate_encounter(encounter_data):
     npc_counts = {}
     for npc_index, npc_name in enumerate(encounter_data.get("npcs", [])):
         formatted_npc_type = format_type_name(npc_name)
+        pending_source = _listed_pending_observer(
+            encounter_data, npc_index, npc_name, place_occupants, encounter, scene_sources, path_manager
+        )
+        if pending_source:
+            encounter["creatures"].append(pending_source["creature"])
+            scene_sources.append(pending_source)
+            continue
         loaded_npc = load_or_create_npc(npc_name)
         if not loaded_npc:
             return None
@@ -859,12 +946,15 @@ def generate_encounter(encounter_data):
         )
         if occupant_id:
             npc["occupantId"] = occupant_id
-        # #1449: the DM's typed side for this slot sets the fight's faction;
-        # without one, ensure_combatant_ids keeps today's party default. The
-        # value is validated with the rest of the scene (reconcile_scene_manifest).
+        # #1449: the DM's typed side for this slot sets the fight's faction.
+        # #1551: a fighting npc must state one unless it is a roster companion
+        # (reconcile_scene_manifest refuses it otherwise); a companion with no
+        # side fights beside the party.
         side = _proposed_side(encounter_data, f"npc:{npc_index}")
         if side in ("hostile", "party"):
             npc["faction"] = side
+        elif f"npc:{npc_index}" in companion_keys:
+            npc["faction"] = "party"
         # Add the NPC to the encounter's creatures array
         encounter["creatures"].append(npc)
         scene_sources.append(
@@ -898,7 +988,7 @@ def generate_encounter(encounter_data):
         }
         for item in scene_sources
     ]
-    reconciled = reconcile_scene_manifest(encounter_data, canonical_snapshot)
+    reconciled = reconcile_scene_manifest(encounter_data, canonical_snapshot, companion_keys)
     encounter["sceneFacts"] = reconciled["sceneFacts"]
     for item in roster_sources:
         row = {
@@ -1081,6 +1171,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Build a combat encounter from JSON on stdin.")
     parser.add_argument("--result-file", default=None)
     result_file = parser.parse_args(sys.argv[1:] if argv is None else argv).result_file
+    global _STOP_FILE
+    _STOP_FILE = os.path.join(os.path.dirname(os.path.abspath(result_file)), "stop") if result_file else None
     logging.debug("Starting combat encounter creation")
     
     # Read input from stdin
@@ -1090,8 +1182,11 @@ def main(argv=None):
         # Parse the JSON input
         input_data = json.loads(storyteller_input)
 
-        # Extract the encounter data directly from the input
-        encounter_data = input_data["parameters"]
+        # Extract the encounter data directly from the input; an absent or
+        # null npcs/monsters list reads as empty (#1487).
+        from core.combat.scene import with_empty_rosters
+
+        encounter_data = with_empty_rosters(input_data["parameters"])
 
         if "player" not in encounter_data or "monsters" not in encounter_data:
             print(colored("Error: Invalid encounter data format. 'player' and 'monsters' are required.", "red"))
@@ -1118,6 +1213,7 @@ def main(argv=None):
         os.makedirs("modules/encounters", exist_ok=True)
         encounter_file = f"modules/encounters/encounter_{encounter['encounterId']}.json"
         logging.debug(f"Saving encounter data: {json.dumps(encounter, indent=2)}")
+        _raise_if_stopped()
         if save_json(encounter_file, encounter):
             logging.info(f"Encounter successfully built and saved to {encounter_file}")
             print(colored(f"Encounter successfully built and saved to {encounter_file}", "green"))
@@ -1142,4 +1238,8 @@ def main(argv=None):
         return 1
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except ChildStopped:
+        # #1529: stopped before a write; nothing more is written.
+        sys.exit(STOPPED_EXIT)

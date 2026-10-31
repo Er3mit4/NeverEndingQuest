@@ -90,7 +90,9 @@ from utils.transient_filesystem import raise_if_save_stopped
 from core.ai.atlas_builder import cached_atlas_for_module, format_atlas_for_conversation
 from core.combat.down_scene import (
     DOWN_RULES_MARKER,
+    PRESENT_DOWN_MARKER,
     from_sheets as down_scene_rules_from_sheets,
+    present_down_text,
 )
 
 
@@ -101,6 +103,15 @@ def _effects_runtime_view(character_data):
     except Exception:
         pass
     return character_data
+
+
+def _effect_note(sheet, stat, stored=False, prefix=""):
+    """#1520 item 1: the live effects already counted in a shown value, or ""."""
+    try:
+        from core.effects.effective import effect_note
+        return effect_note(sheet, stat, stored=stored, prefix=prefix)
+    except Exception:
+        return ""
 
 
 
@@ -1022,6 +1033,7 @@ def update_character_data(conversation_history, party_tracker_data):
             and ("Here's the updated character data for" in entry["content"]
                  or "Here's the NPC data for" in entry["content"]
                  or DOWN_RULES_MARKER in entry["content"]
+                 or entry["content"].startswith(PRESENT_DOWN_MARKER)
                  or entry["content"].startswith("SRD spell guidance for "))
         )
     ]
@@ -1096,7 +1108,7 @@ def update_character_data(conversation_history, party_tracker_data):
                     formatted_data = f"""
 CHAR: {member_data['name']}
 TYPE: {member_data['character_type'].capitalize()} | LVL: {member_data['level']} | RACE: {member_data['race']} | CLASS: {member_data['class']} | ALIGN: {str(member_data['alignment']).upper()} | BG: {member_data['background']}
-AC: {member_data['armorClass']} | SPD: {_speed_text(member_data)}
+AC: {member_data['armorClass']}{_effect_note(member_data, 'armorClass')} | SPD: {_speed_text(member_data)}{_effect_note(member_data, 'speed')}
 STATUS: {member_data['status']} | CONDITION: {member_data['condition']} | AFFECTED: {', '.join(member_data['condition_affected'])}
 STATS: STR {member_data['abilities']['strength']}, DEX {member_data['abilities']['dexterity']}, CON {member_data['abilities']['constitution']}, INT {member_data['abilities']['intelligence']}, WIS {member_data['abilities']['wisdom']}, CHA {member_data['abilities']['charisma']}
 SAVES: {_saves_text(member_data)}
@@ -1193,7 +1205,7 @@ FLAWS: {member_data['flaws']}
                     formatted_data = f"""
 NPC: {npc_data['name']}
 ROLE: {npc['role']} | TYPE: {npc_data['character_type'].capitalize()} | LVL: {npc_data['level']} | RACE: {npc_data['race']} | CLASS: {npc_data['class']} | ALIGN: {str(npc_data['alignment']).upper()} | BG: {npc_data['background']}
-AC: {npc_data['armorClass']} | SPD: {_speed_text(npc_data)}
+AC: {npc_data['armorClass']}{_effect_note(npc_data, 'armorClass')} | SPD: {_speed_text(npc_data)}{_effect_note(npc_data, 'speed')}
 STATUS: {npc_data['status']} | CONDITION: {npc_data['condition']} | AFFECTED: {', '.join(npc_data['condition_affected'])}
 STATS: STR {npc_data['abilities']['strength']}, DEX {npc_data['abilities']['dexterity']}, CON {npc_data['abilities']['constitution']}, INT {npc_data['abilities']['intelligence']}, WIS {npc_data['abilities']['wisdom']}, CHA {npc_data['abilities']['charisma']}
 SAVES: {_saves_text(npc_data)}
@@ -1238,6 +1250,14 @@ FLAWS: {npc_data['flaws']}
         down_rules = down_scene_rules_from_sheets(loaded_sheets)
         if down_rules:
             character_data.append({"role": "system", "content": down_rules})
+        # #1469: present people outside the party at 0 HP, refreshed the same way.
+        try:
+            present_down = present_down_text(party_tracker_data, path_manager)
+        except Exception as exc:  # fail forward: the turn goes on without it
+            debug(f"DOWN: present persons unavailable ({exc})", category="conversation_management")
+            present_down = None
+        if present_down:
+            character_data.append({"role": "system", "content": present_down})
 
         # Insert character and NPC data after party tracker data
         party_tracker_index = next((i for i, msg in enumerate(updated_history) if msg["role"] == "system" and "Here's the updated party tracker data:" in msg["content"]), -1)

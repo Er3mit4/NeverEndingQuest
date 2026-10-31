@@ -220,6 +220,16 @@ def has_left_fight(creature):
 
 
 LEFT_FIGHT_DISPLAY = "left the fight"
+LEFT_FIGHT_RESOLUTIONS = ("fled", "yielded")
+
+
+def left_by_resolution(creature):
+    """Return whether the resolver recorded a typed flee or yield (#466).
+
+    The encounter row owns that outcome while the sheet keeps its own
+    status, so the per-loop sheet sync never copies a status over it (#1110).
+    """
+    return isinstance(creature, dict) and creature.get("resolution") in LEFT_FIGHT_RESOLUTIONS
 
 
 _UNSET = object()
@@ -485,6 +495,20 @@ def all_party_resolved(encounter):
     )
 
 
+def active_encounter_is_live(encounter):
+    """Return whether a tracker's active encounter is still a fight (#230).
+
+    An agentic fight is live until its completion closes; a legacy fight is
+    live while neither side is resolved. Unreadable data is not live.
+    """
+    if not isinstance(encounter, dict):
+        return False
+    state = encounter.get("combatState") or {}
+    if state.get("pipelineMode") == "agentic":
+        return (state.get("completion") or {}).get("status") != "closed"
+    return not (all_hostiles_resolved(encounter) or all_party_resolved(encounter))
+
+
 def ensure_combatant_ids(encounter):
     """Upgrade a roster with persisted unique IDs and deterministic tie breaks."""
     if not isinstance(encounter, dict):
@@ -561,6 +585,25 @@ def canonical_initiative_order(encounter):
         ),
     )
     return [creature["combatantId"] for creature in ordered]
+
+
+# #1483: the participation values the T096/T097 prompts explain.
+PACKET_PARTICIPATION = ("active", "observer")
+
+
+def participation_of(encounter, combatant_id):
+    """#1483: the typed sceneFacts participation of ``combatant_id`` for the
+    model packets, "active" or "observer", else None. A pure reader; only a
+    typed encounter has participants. ``join_as_hostile`` sets the row to
+    "active", so a bystander who joins reads "active" from then on.
+    """
+    if combat_provenance(encounter) != "typed" or not combatant_id:
+        return None
+    for row in ((encounter.get("sceneFacts") or {}).get("participants") or []):
+        if isinstance(row, dict) and row.get("combatantId") == combatant_id:
+            value = row.get("participation")
+            return value if value in PACKET_PARTICIPATION else None
+    return None
 
 
 def bystanders_attacked(encounter, event):

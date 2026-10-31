@@ -81,6 +81,7 @@ export const log = {
   'Enter each die as rolled. Your character’s bonuses are added automatically.': 'Informe cada dado como saiu. Os bônus do seu personagem são somados automaticamente.',
   'Die {number}': 'Dado {number}',
   'Use rolls': 'Usar resultados',
+  'Each die is a whole number from 1 to 20.': 'Cada dado é um número inteiro de 1 a 20.',
 
   // Dice strip
   'Clear results': 'Limpar resultados',

@@ -27,6 +27,7 @@ QUOTA_ERROR_CODES = frozenset({
     "codex_quota_exhausted",
     "usage_limit_exceeded",
     "usagelimitexceeded",
+    "credit_balance_exhausted",
 })
 
 _PROVIDER_NAMES = {
@@ -191,6 +192,30 @@ def player_exits_notice():
     )
 
 
+# #1224: the packages whose exceptions carry a provider's typed verdict. Only
+# their exceptions are read for a bare int `code`, a str `status` or a
+# transport class; the game's own exceptions never are.
+_TRANSPORT_PACKAGES = ("openai", "google.genai", "httpx", "httpcore")
+# The live transport's network set (utils/capture/live_provider_call.py).
+_TRANSPORT_CLASSES = frozenset({
+    "APITimeoutError", "APIConnectionError", "TimeoutException",
+    "TransportError", "NetworkError",
+})
+
+
+def _from_transport(exc):
+    """True when exc's class is defined in a provider/transport package."""
+    module = type(exc).__module__ or ""
+    return any(module == package or module.startswith(package + ".")
+               for package in _TRANSPORT_PACKAGES)
+
+
+def _is_transport_failure(exc):
+    """A transport-package exception of the live transport's network set."""
+    return _from_transport(exc) and any(
+        base.__name__ in _TRANSPORT_CLASSES for base in type(exc).__mro__)
+
+
 def _provider_error_chain(exc):
     """Yield exc and the provider errors it wraps (api_client wraps them)."""
     seen = set()
@@ -217,6 +242,11 @@ def _provider_error_status(exc):
     value = getattr(response, "status_code", None)
     if isinstance(value, int):
         return value
+    # google-genai carries the HTTP status as an int `code`.
+    value = getattr(exc, "code", None)
+    if (_from_transport(exc) and isinstance(value, int)
+            and not isinstance(value, bool) and 100 <= value <= 599):
+        return value
     return None
 
 
@@ -235,6 +265,10 @@ def _provider_error_codes(exc):
         value = getattr(exc, attribute, None)
         if isinstance(value, str):
             codes.append(value.lower())
+    # google-genai's str `status` (RESOURCE_EXHAUSTED, UNAUTHENTICATED, ...).
+    value = getattr(exc, "status", None)
+    if _from_transport(exc) and isinstance(value, str):
+        codes.append(value.lower())
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
         detail = body.get("error")
@@ -258,11 +292,14 @@ def classify_provider_error(exc):
                        failure message)
       retry_notice   - text to show the player before backing off, or None
       provider       - the provider id the classification used ('' if none)
+
+    Classifies from exception types/status/codes only; provider prose is
+    never authority (#1224): message text is never read.
     """
     status = None
     codes = []
     names = []
-    texts = []
+    transport = False
     provider = _provider_of(exc)
     name = provider_display_name(provider)
     local = provider.lower() == "lmstudio"
@@ -271,10 +308,9 @@ def classify_provider_error(exc):
             status = _provider_error_status(item)
         names.append(type(item).__name__.lower())
         codes.extend(_provider_error_codes(item))
-        texts.append(str(item).lower())
+        transport = transport or _is_transport_failure(item)
     code_blob = " ".join(codes)
     name_blob = " ".join(names)
-    text_blob = " ".join(texts)
 
     if provider.lower() == "codex":
         if any(code in code_blob for code in ("codex_quota_exhausted", "usagelimitexceeded")):
@@ -291,9 +327,7 @@ def classify_provider_error(exc):
                     "retry_notice": None}
 
     def matches(*needles):
-        return any(
-            needle in code_blob or needle in text_blob for needle in needles
-        )
+        return any(needle in code_blob for needle in needles)
 
     # #1342: a live call that hit its reissue limit, or a turn that hit its
     # generation ceiling. Checked first: the limit envelope can carry the 429
@@ -311,13 +345,7 @@ def classify_provider_error(exc):
     # Out of credit arrives as a 429, exactly like a rate limit, but no number
     # of retries will pay the bill -- the error code separates them, not the
     # status.
-    if matches(
-        "insufficient_quota",
-        "insufficient_credit",
-        "billing_hard_limit_reached",
-        "exceeded your current quota",
-        "check your plan and billing",
-    ):
+    if matches(*sorted(QUOTA_ERROR_CODES)):
         return {
             "category": "insufficient_quota",
             "retryable": False,
@@ -334,7 +362,6 @@ def classify_provider_error(exc):
         or matches(
             "invalid_api_key",
             "invalid_authentication",
-            "incorrect api key",
             "unauthenticated",
         )
     ):
@@ -351,7 +378,7 @@ def classify_provider_error(exc):
     if (
         status == 403
         or "permissiondenied" in name_blob
-        or matches("model_not_found", "permission_denied", "does not have access")
+        or matches("model_not_found", "permission_denied")
     ):
         return {
             "category": "model_access_denied",
@@ -381,7 +408,7 @@ def classify_provider_error(exc):
     if (
         status == 429
         or "ratelimiterror" in name_blob
-        or matches("rate_limit_exceeded", "resource_exhausted", "rate limit")
+        or matches("rate_limit_exceeded", "resource_exhausted")
     ):
         return {
             "category": "rate_limited",
@@ -401,12 +428,8 @@ def classify_provider_error(exc):
         or "apiconnectionerror" in name_blob
         or "apitimeouterror" in name_blob
         or "timeouterror" in name_blob
+        or transport
         or matches(
-            "internal server error",
-            "service unavailable",
-            "bad gateway",
-            "connection error",
-            "timed out",
             # live-provider child envelopes (class names / disposition)
             "apiconnectionerror",
             "apitimeouterror",

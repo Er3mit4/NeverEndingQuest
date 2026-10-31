@@ -23,7 +23,11 @@ from core.ai.srd_reference import (
     normalize_rule_name,
 )
 from core.combat.down_scene import from_encounter as down_scene_rules_from_encounter
-from core.managers.combat_state import combatant_by_id, resolve_creature_controller
+from core.managers.combat_state import (
+    combatant_by_id,
+    participation_of,
+    resolve_creature_controller,
+)
 from utils.capture.multi_model_capture import capture_and_fanout, register_callsite
 from utils.capture.live_provider_call import LiveProviderSuperseded
 from utils.character_sheet_contract import extract_json_object
@@ -34,16 +38,23 @@ register_callsite("T097", "core/ai/combat_agent.py", 220)
 
 
 class CombatAgentContractError(ValueError):
-    """A provider response did not satisfy the combat role contract."""
+    """A provider response did not satisfy the combat role contract.
+
+    ``failure_class`` (#1515) is the typed diagnostic class, set where the
+    error is raised; the orchestrator never reads it from the message.
+    """
+
+    def __init__(self, message, failure_class="response_contract_error"):
+        super().__init__(message)
+        self.failure_class = str(failure_class or "response_contract_error")
 
 
 class CombatNarrationAttemptError(CombatAgentContractError):
     """One T097 call failed before producing lintable narration."""
 
     def __init__(self, message, candidate="", failure_class="response_contract_error"):
-        super().__init__(message)
+        super().__init__(message, failure_class=failure_class)
         self.candidate = str(candidate or "")
-        self.failure_class = str(failure_class or "response_contract_error")
 
 
 def _provider_config(role, attempt=1):
@@ -65,13 +76,16 @@ def combat_role_identity(role):
 def _parse_object(content, label):
     blob = extract_json_object(content)
     if not blob:
-        raise CombatAgentContractError("%s returned no JSON object" % label)
+        raise CombatAgentContractError("%s returned no JSON object" % label,
+                                       failure_class="response_parse_error")
     try:
         value = json.loads(blob)
     except json.JSONDecodeError as exc:
-        raise CombatAgentContractError("%s returned malformed JSON" % label) from exc
+        raise CombatAgentContractError("%s returned malformed JSON" % label,
+                                       failure_class="response_parse_error") from exc
     if not isinstance(value, dict):
-        raise CombatAgentContractError("%s response must be an object" % label)
+        raise CombatAgentContractError("%s response must be an object" % label,
+                                       failure_class="response_parse_error")
     return value
 
 
@@ -294,6 +308,8 @@ An adjudicated intent may contain:
   never a reason to choose another action for them: set requiresPlayerInput
   {kind:'choice', prompt} saying it cannot be used (no slot of that level or
   no use left) and asking what they do instead.
+  A kind 'item' record only spends (delta below 0): an item gained through
+  resources is refused; an item one party member gives another is handOver.
   Every shot from a bow, crossbow, or sling in an adjudicated intent declares
   the ammunition it fires: kind 'ammunition', the ammunition name exactly as
   the shooter's sheet lists it, delta -1 per shot. Every player shot is
@@ -437,6 +453,18 @@ Action's own attack count never includes it.
 
 A healing potion listed in bonusActionItems is a Bonus Action: emit bonusAction {item:{nqlId:the listed equipment id}, targetId:the drinker}, or item:{catalog_id:the listed catalog id} when no nqlId exists. Use only these typed ids, never an item name. It may accompany a leveled spell Action; the engine consumes one potion, rolls its catalog healing and caps HP before resolving the Action. The target must be a present living participant; you rule whether another participant is within reach and omit the potion use with an explanation if not. Represent every part of the turn as its Action or single bonusAction, or ask a choice when incompatible; never narrate a potion as already drunk while a roll is pending. Recorded spell attacks, including Ray of Frost, are scored by code: supply the cast and target, without deciding hit/miss or requesting damage yourself. Narrate only typed operations that resolved.
 
+A party member may also hand ONE item to another party member in the same
+turn, beside its Action and any bonusAction; it costs neither. Put it in the
+intent's handOver {item:{nqlId: the nql_id of the giver's equipment row},
+toId: the receiver's combatantId, quantity}, or item:{catalog_id: the row's
+catalog_id} when it has no nql_id; a row with neither cannot be handed over,
+and a give is never staged as the giver's item spend alone. The actor is
+always the giver and gives from its own sheet; the receiver is another
+present party member (the player or a party NPC). Use only these typed ids,
+never an item name. The rules engine moves the item before the Action
+resolves, so never also list it in resources; worn armor or a shield is
+never handed over in a fight. You rule whether the receiver is within reach.
+
 A player's plain swing with one listed melee weapon at one hostile creature
 is asked for and scored by code: declare action='attack', the weapon row's
 rowRef as abilityRow, its name as ability, and targetId, with targets and
@@ -545,9 +573,28 @@ fairly rather than replacing it with a tactically preferred action. A player's
 attack on any creature in creatures, an ally or a bystander included, is
 honored: declare it with that creature's combatantId as targetId and adjudicate
 it like any attack; never refuse it or ask the player to pick another target.
-Code decides what follows (a bystander joins the fight as a hostile). For NPCs
+Code decides what follows (a bystander joins the fight as a hostile). A creature
+with participation observer is present but not fighting: it takes no turn, it is
+not an ally or an enemy in this fight whatever its faction, and you never choose
+actions for it. A player's attack on it is still honored as above. For NPCs
 and enemies, choose tactically appropriate actions from their actual sheets.
 If an action has no HP/resource/effect change, use empty arrays."""
+
+
+def _packet_creatures(encounter):
+    """#1483: the encounter's creature rows for T096, each a copy with its
+    typed ``participation`` when known; the stored rows are not changed."""
+    rows = []
+    for creature in encounter.get("creatures", []) or []:
+        if not isinstance(creature, dict):
+            rows.append(creature)
+            continue
+        row = dict(creature)
+        participation = participation_of(encounter, creature.get("combatantId"))
+        if participation:
+            row["participation"] = participation
+        rows.append(row)
+    return rows
 
 
 def request_intent_batch(
@@ -573,7 +620,8 @@ def request_intent_batch(
         "round": (encounter.get("combatState") or {}).get("round"),
         "requiredActorIds": pending_turn.get("actorIds", []),
         "playerInput": player_input,
-        "creatures": encounter.get("creatures", []),
+        # #1483: copies carrying each creature's typed participation.
+        "creatures": _packet_creatures(encounter),
         # K1: each listed row carries its rowRef (on copies; P-2), which the
         # reply returns as abilityRow.
         "sheets": with_row_refs({
@@ -685,7 +733,8 @@ def request_intent_batch(
     if type(returned_version) is not int or returned_version != payload["stateVersion"]:
         raise CombatAgentContractError(
             "T096 returned stale stateVersion %r; expected exact value %r"
-            % (returned_version, payload["stateVersion"])
+            % (returned_version, payload["stateVersion"]),
+            failure_class="stale_state_or_actor_order",
         )
     intents = result.get("intents")
     if not isinstance(intents, list):
@@ -695,7 +744,8 @@ def request_intent_batch(
     ]
     if returned_ids != payload["requiredActorIds"]:
         raise CombatAgentContractError(
-            "T096 actor order does not match the claimed turn"
+            "T096 actor order does not match the claimed turn",
+            failure_class="stale_state_or_actor_order",
         )
     return result
 
@@ -741,7 +791,10 @@ T097_SCENE_CONTRACT_SENTENCE = (
     "its exhausted.outcome is destroyed the item is gone (narrate it crumbling, "
     "cracking or burning out), when it is regained the item flared back to life. "
     "A bonusAction with itemName is an item the actor used this turn before the "
-    "Action; narrate the use and its applied hp change."
+    "Action; narrate the use and its applied hp change. A combatant with "
+    "participation observer is present and watching, not fighting: never narrate "
+    "it acting for or against anyone, unless the authoritative facts show it "
+    "joining."
 )
 
 

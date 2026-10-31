@@ -48,7 +48,7 @@ except ImportError:
     from core.generators.area_generator import AreaGenerator, AreaConfig
 
 from utils.module_context import ModuleContext
-from utils.enhanced_logger import debug, info, warning, error, set_script_name
+from utils.enhanced_logger import debug, info, warning, error, set_script_name, file_only
 from utils.npc_reconciler import NpcReconciler
 from utils.file_operations import safe_write_json
 from utils.path_transaction_lock import path_transaction_lock
@@ -344,10 +344,13 @@ def _useful_string(value, field):
 
 # D-COST-5 F2: the one definition of T028's fields. The validator and the
 # strict request schema both read these, so they cannot drift.
+# #1478: the opening conditions ride on T028 but never fail its contract; a
+# missing or empty value is read as absent (_opening_conditions).
+_T028_OPENING_FIELDS = ("openingWeather", "openingPoliticalClimate")
 _T028_ROOT_FIELDS = (
     "plotTitle", "mainObjective", "plotPoints", "activeQuests",
     "completedQuests", "failedQuests", "worldEvents", "dmNotes",
-)
+) + _T028_OPENING_FIELDS
 _T028_PLOT_POINT_FIELDS = (
     "id", "title", "description", "location", "nextPoints", "status",
     "plotImpact", "sideQuests",
@@ -384,6 +387,7 @@ def _t028_schema(area_ids: List[str]) -> Dict[str, Any]:
         "activeQuests": string_list, "completedQuests": string_list,
         "failedQuests": string_list, "worldEvents": string_list,
         "dmNotes": string_list,
+        "openingWeather": text, "openingPoliticalClimate": text,
     })
 
 
@@ -394,8 +398,10 @@ def _validate_unified_plot_contract(
     expected_side_quests: int,
 ) -> Dict[str, Any]:
     """Validate T028 identities/references before the unified plot is saved."""
-    root_fields = set(_T028_ROOT_FIELDS)
-    if not isinstance(value, dict) or set(value) != root_fields:
+    root_fields = set(_T028_ROOT_FIELDS) - set(_T028_OPENING_FIELDS)
+    if not isinstance(value, dict) or not (
+        root_fields <= set(value) <= set(_T028_ROOT_FIELDS)
+    ):
         raise ValueError("T028 requires the exact unified-plot root fields")
     _useful_string(value["plotTitle"], "plotTitle")
     _useful_string(value["mainObjective"], "mainObjective")
@@ -453,6 +459,18 @@ def _validate_unified_plot_contract(
     if side_quest_ids != expected_sq_ids:
         raise ValueError("T028 side-quest IDs/cardinality must be globally sequential")
     return value
+
+
+def _opening_conditions(value: Any) -> Optional[Dict[str, str]]:
+    """T028's opening weather and political climate when both are useful text;
+    otherwise None (never raises), and the first run asks T093 (#1478)."""
+    if not isinstance(value, dict):
+        return None
+    weather = value.get("openingWeather")
+    climate = value.get("openingPoliticalClimate")
+    if not all(isinstance(item, str) and item.strip() for item in (weather, climate)):
+        return None
+    return {"weather": weather.strip(), "politicalClimate": climate.strip()}
 
 
 def _validate_plot_hook_updates(value, area_data, valid_plot_ids):
@@ -522,6 +540,9 @@ class ModuleBuilder:
         # finalization reads its plot-ordered area sequence so the physical
         # route matches the story, instead of alphabetical area-ID order.
         self.unified_plot = None
+        # T028's opening weather and political climate (#1478), set only when
+        # both are useful text; the party tracker falls back to "Clear" / "".
+        self.opening_conditions = None
         self.context = ModuleContext()
         self.progress_callback = None  # For progress reporting
         self.per_area_locations = None  # For custom locations per area
@@ -532,6 +553,10 @@ class ModuleBuilder:
         # they survive publication id normalization; the module declaration
         # is written from them after the stitcher re-prefix.
         self.npc_identity_decisions = []
+        # The (scope, status sink) this build's advisory calls (T104, T123)
+        # bind, set by the build's entry (#204); unset, the builder owns its
+        # scope and logs its status (_provider_binding).
+        self.provider_binding = None
         # How create_party_tracker chose the start: "entry" (the story's typed
         # entry ids) or "first-location" (the first location of the first area).
         self.party_start_source = None
@@ -551,6 +576,16 @@ class ModuleBuilder:
         if self.config.verbose:
             timestamp = datetime.now().strftime("%H:%M:%S")
             print(f"DEBUG: [Module Generator] [{timestamp}] {message}")
+
+    def _provider_binding(self):
+        """The (scope, status sink) for this build's advisory calls (#204): the
+        entry's, else a scope this build owns -- never a player's turn, its
+        Load or its status line -- with its status in the build log."""
+        if self.provider_binding is None:
+            from utils.capture.live_provider_call import LiveTurnScope
+
+            self.provider_binding = (LiveTurnScope(), self.log)
+        return self.provider_binding
     
     def _atomic_save_json(self, relative_filename: str, data: Dict[str, Any]) -> bool:
         """Atomic JSON write to self.config.output_directory/<relative_filename>.
@@ -603,9 +638,15 @@ class ModuleBuilder:
         links, and each link's time (`routes`, one T123 call; left out when the
         call fails). Nothing is read from prose by code. An entry that does not resolve
         against the written files is left out and logged; the module then
-        derives it as before. Never raises: on any failure no file is written
-        and the module derives as before.
+        derives it as before. Never raises, except a stop (the build's turn
+        superseded, or the save gone read-only), which ends the build before
+        publication (#204): on any other failure no file is written and the
+        module derives as before.
         """
+        from core.combat.invocation import InvocationSupersededError
+        from utils.capture.live_provider_call import LiveProviderSuperseded
+        from utils.transient_filesystem import ReadOnlySaveStop
+
         try:
             from utils.file_operations import safe_read_json
             from utils.roster_conversion import slug
@@ -697,11 +738,14 @@ class ModuleBuilder:
             # N5: each link's time, typed by one T123 call over the final ids;
             # none (the travel time table) when the call fails.
             from core.generators.module_declaration import type_routes
-            routes = type_routes(out, self.config.module_name)
+            routes = type_routes(out, self.config.module_name, self._provider_binding())
             if routes:
                 declaration["routes"] = routes
             self._atomic_save_json("module_declaration.json", declaration)
             return True
+        except (LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop):
+            # A stop ends the build before publication (#204).
+            raise
         except Exception as exc:
             self.log(f"Module declaration not written (non-fatal; the module derives "
                      f"as before): {exc}")
@@ -862,9 +906,10 @@ MODULE INDEPENDENCE RULES:
         self.log("Step 4.7: Mandating antagonist placement...")
         self._inject_antagonist_into_climactic_location()
         
-        # Step 5: Generate initial party tracker
+        # Step 5: Generate initial party tracker, starting at the story's
+        # typed opening place when it resolves (#1478)
         self.log("Step 5: Creating party tracker...")
-        self.create_party_tracker()
+        self.create_party_tracker(*self._typed_plot_entry())
         
         # Step 6: Create module summary
         self.log("Step 6: Creating module summary...")
@@ -1645,10 +1690,13 @@ Return a JSON object with this exact structure:
     "completedQuests": [],
     "failedQuests": [],
     "worldEvents": [],
-    "dmNotes": []
+    "dmNotes": [],
+    "openingWeather": "The weather where PP001 opens, in one short phrase",
+    "openingPoliticalClimate": "The political mood where PP001 opens, in one short phrase"
 }}
 
-IMPORTANT: 
+IMPORTANT:
+- openingWeather and openingPoliticalClimate describe the moment the story opens, at PP001's place
 - Use area IDs (like HG001) for location fields, not room IDs (like R01)
 - Renumber plot points sequentially starting from PP001
 - Renumber side quests GLOBALLY and sequentially starting from SQ001 (SQ001, SQ002, SQ003, etc. across ALL plot points)
@@ -1719,6 +1767,12 @@ IMPORTANT:
                     )
             if unified_plot is None:
                 raise ValueError(f"T028 validation exhausted: {last_error}")
+
+            # The opening conditions belong to the party tracker, not the
+            # plot: take them out so module_plot.json keeps its shape (#1478).
+            self.opening_conditions = _opening_conditions(unified_plot)
+            for field in _T028_OPENING_FIELDS:
+                unified_plot.pop(field, None)
 
             # Save the unified plot
             output_path = os.path.join(self.config.output_directory, "module_plot.json")
@@ -2082,6 +2136,31 @@ IMPORTANT:
         except Exception as e:
             self.log(f"Warning: Could not cleanup old backups: {e}")
     
+    def _typed_plot_entry(self):
+        """The story's opening place from typed plot data (#1478): T028's PP001
+        area and that area's first plot location. (None, None) unless both
+        resolve to exactly one area and location, which keeps first-location."""
+        plot_points = (self.unified_plot or {}).get("plotPoints")
+        if not isinstance(plot_points, list) or not plot_points:
+            return None, None
+        first = plot_points[0]
+        area_id = first.get("location") if isinstance(first, dict) else None
+        if not isinstance(area_id, str) or area_id not in self.areas_data:
+            return None, None
+        area_points = (self.plots_data.get(area_id) or {}).get("plotPoints")
+        if not isinstance(area_points, list) or not area_points:
+            return None, None
+        opening = area_points[0]
+        location_id = opening.get("location") if isinstance(opening, dict) else None
+        locations = (self.locations_data.get(area_id) or {}).get("locations") or []
+        matches = [
+            location for location in locations
+            if isinstance(location, dict) and location.get("locationId") == location_id
+        ]
+        if not isinstance(location_id, str) or len(matches) != 1:
+            return None, None
+        return area_id, location_id
+
     def create_party_tracker(self, start_area_id=None, start_location_id=None):
         """Create the initial party tracker file"""
         explicit_start = start_area_id is not None or start_location_id is not None
@@ -2130,6 +2209,7 @@ IMPORTANT:
             else:
                 first_location = locations_list[0]
 
+        opening = self.opening_conditions or {"weather": "Clear", "politicalClimate": ""}
         party_tracker = {
             "module": self.config.module_name.replace("_", " "),
             "partyMembers": [],  # Will be populated when players join
@@ -2139,7 +2219,7 @@ IMPORTANT:
                 "month": "Firstmonth",  # Generic fantasy January equivalent
                 "day": 1,
                 "time": "08:00:00",
-                "weather": "Clear",
+                "weather": opening["weather"],
                 "season": "Winter",
                 "dayNightCycle": "Day",
                 "moonPhase": "New Moon",
@@ -2148,7 +2228,7 @@ IMPORTANT:
                 "currentArea": first_area["areaName"],
                 "currentAreaId": first_area["areaId"],
                 "majorEventsUnderway": [],
-                "politicalClimate": "",
+                "politicalClimate": opening["politicalClimate"],
                 "activeEncounter": "",
                 "activeCombatEncounter": "",
                 "weatherConditions": "",
@@ -2362,10 +2442,14 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     def _apply_npc_coherence(self, context_path):
         """Issue #160: reconcile same-name NPCs recurring across areas via one
         bounded T104 model call (agentic decision) + code-validated fail-closed
-        apply. Enabled by the tip configuration and classic-only. On ANY problem
-        it logs and leaves the module unchanged -- it never aborts the build.
+        apply. Enabled by the tip configuration and classic-only. On any problem
+        it logs and leaves the module unchanged; only a stop (the build's turn
+        superseded, or the save gone read-only) ends the build (#204).
         """
         import config
+        from core.combat.invocation import InvocationSupersededError
+        from utils.capture.live_provider_call import LiveProviderSuperseded
+        from utils.transient_filesystem import ReadOnlySaveStop
         # Older local config.py files may predate this flag. The reviewed tip
         # default is enabled, so a missing setting must inherit True rather than
         # silently disabling T104 for upgraded installations.
@@ -2425,51 +2509,27 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             else:
                 response_format = {"type": "json_object"}
 
-            # Bound the model call with a hard timeout so a slow/hung local model
-            # (e.g. qwen over many groups) can NEVER hang a build. On timeout we
-            # skip (heal-forward: the module is left intact). We do NOT wait on the
-            # orphaned worker (shutdown wait=False), so the build proceeds.
-            import concurrent.futures
-
-            # Issue #134 follow-up: the thread timeout alone ABANDONS the worker
-            # but leaves its HTTP request streaming, so a local model (LM Studio)
-            # kept generating for thousands of tokens after the build had already
-            # moved on. For OpenAI-SDK-routed providers, also pass a per-request
-            # transport deadline: the SDK treats `timeout` as a request OPTION
-            # (never a payload field) and closes the connection on expiry --
-            # the disconnect is what actually stops local inference. The thread
-            # timeout stays as the backstop; timeout still lands on the same
-            # fail-closed skip path (module published unchanged post-T088).
-            # 110 < the 120s thread backstop so the transport reliably closes
-            # (and the worker exits with APITimeoutError -> the normal skip
-            # path) BEFORE the thread is ever abandoned. Connect is bounded per
-            # resolved address, as in live_provider_call._CONNECT_SECONDS: a
-            # bare 110 also bounds each connect, so silent first addresses
-            # outlast the backstop before any request (#667).
-            if provider in ("openai", "legacy", "lmstudio", "opencodego"):
-                import httpx
-
-                extra["timeout"] = httpx.Timeout(110, connect=5.0)
-
-            def _t104_call():
-                return capture_and_fanout(
-                    "T104", api_client.create_completion,
-                    _request_provider=provider,
-                    messages=[
-                        {"role": "system", "content": "You are an expert 5e module editor. "
-                         "Return only the requested strict JSON object."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    model=cfg["model"],
-                    temperature=0.2,
-                    response_format=response_format,
-                    **extra)
-
-            _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                response = _ex.submit(_t104_call).result(timeout=120)
-            finally:
-                _ex.shutdown(wait=False)
+            # #204: one advisory call through the live transport -- a reaped
+            # provider child under the transport deadline, on the build's
+            # binding -- in place of a worker thread abandoned at 120 s. A
+            # failure lands on the same fail-closed skip path (the module is
+            # published unchanged post-T088); a stop ends the build.
+            scope, status = self._provider_binding()
+            response = capture_and_fanout(
+                "T104", api_client.create_completion,
+                _live_selected="advisory",
+                _detached_scope=scope,
+                _detached_status=status,
+                _request_provider=provider,
+                messages=[
+                    {"role": "system", "content": "You are an expert 5e module editor. "
+                     "Return only the requested strict JSON object."},
+                    {"role": "user", "content": prompt},
+                ],
+                model=cfg["model"],
+                temperature=0.2,
+                response_format=response_format,
+                **extra)
 
             content = response.choices[0].message.content.strip()
             if content.startswith("```"):
@@ -2495,6 +2555,8 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             safe_write_json(context_path, self.context.to_dict())
             self.npc_identity_decisions = self._identity_positions(parsed, packet, patched)
             self.log(f"Step 7.5: NPC coherence applied to {n_groups} group(s)")
+        except (LiveProviderSuperseded, InvocationSupersededError, ReadOnlySaveStop):
+            raise
         except Exception as exc:
             self.log(f"Step 7.5: NPC coherence skipped (non-fatal): {exc}")
 
@@ -2568,8 +2630,8 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
     def create_bu_backups(self):
         """Create _BU.json backup files for all generated module files"""
-        import shutil
         import glob
+        from utils.module_lifecycle import copy_file_verified
         
         # Get all JSON files in the module directory (excluding subdirectories first)
         module_files = []
@@ -2600,12 +2662,10 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             # Create backup filename
             backup_file = json_file.replace(".json", "_BU.json")
             
-            try:
-                shutil.copy2(json_file, backup_file)
-                backup_count += 1
-                self.log(f"  Created backup: {os.path.relpath(backup_file, self.config.output_directory)}")
-            except Exception as e:
-                self.log(f"  WARNING: Failed to create backup for {json_file}: {e}")
+            # #143: a reset baseline that did not land fails the build.
+            copy_file_verified(json_file, backup_file)
+            backup_count += 1
+            self.log(f"  Created backup: {os.path.relpath(backup_file, self.config.output_directory)}")
         
         self.log(f"Created {backup_count} _BU.json backup files for reset functionality")
     
@@ -3074,7 +3134,7 @@ Return ONLY the JSON object, no explanations or additional text.""" % (
 
             parsed = _validate_parsed_module_params(json.loads(result), resolved_policy)
 
-            debug(
+            file_only(
                 f"AI_PROCESSING: AI parsed narrative into: {json.dumps(parsed, indent=2)}",
                 category="module_creation",
             )
@@ -3194,6 +3254,18 @@ def _ai_driven_module_creation_impl(
                 "module creation parameters must be an object"
             )
         resolved_policy = get_module_creation_policy(policy)
+        # #204: the scope this build's advisory calls (T104, T123) bind, by
+        # entry. An in-game build binds the live scope its action runs under,
+        # read once here, so a Load that replaces the turn stops the build
+        # instead of moving its later calls onto the next turn. Any other build
+        # owns its scope (ModuleBuilder._provider_binding).
+        provider_binding = None
+        if resolved_policy.name == "game":
+            from utils.capture.live_provider_call import get_live_provider_scope
+
+            live_scope = get_live_provider_scope()
+            if live_scope is not None:
+                provider_binding = (live_scope, None)
 
         # Report progress if callback provided
         if progress_callback:
@@ -3320,6 +3392,7 @@ def _ai_driven_module_creation_impl(
                     }
                 )
             builder = ModuleBuilder(config)
+            builder.provider_binding = provider_binding
             builder_holder["builder"] = builder
             if per_area_locations is not None:
                 builder.per_area_locations = list(per_area_locations)

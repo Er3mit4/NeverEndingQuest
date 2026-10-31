@@ -8,34 +8,45 @@
 > implemented and what is planned. The base game comes from upstream; provider
 > and setup instructions below describe this fork where noted.
 
-## Launch the game: React by default
+## Quickstart (about 10 minutes)
 
-After installation, run these commands from your game folder with its Python
-environment activated:
+You need Python 3.9 or newer, Git, Node.js LTS ([nodejs.org](https://nodejs.org/)),
+and an OpenAI API key ([platform.openai.com/api-keys](https://platform.openai.com/api-keys)).
 
-- **React player (default):** `python run_web.py`
-- **Legacy player (explicit opt-in):** `python run_web.py --ui legacy`
+**Linux / macOS**
+```bash
+git clone https://github.com/MoonlightByte/NeverEndingQuest.git
+cd NeverEndingQuest
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python run_web.py
+```
 
-For Windows installer users, run `launch_game.bat` for React, or
-`launch_game.bat --ui legacy` for legacy.
+**Windows (Command Prompt)**
+```bat
+git clone https://github.com/MoonlightByte/NeverEndingQuest.git
+cd NeverEndingQuest
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+python run_web.py
+```
 
-Both interfaces open in your browser. React is selected automatically; there is
-no interface-selection prompt and no automatic fallback to legacy. If React needs
-setup or repair, follow the launcher's instructions, or explicitly run legacy.
-Node.js/npm are needed to build or rebuild React, not to run an already-current
-build or the legacy player. See [Quick Start](#quick-start) for installation.
+**Your key:** the first `python run_web.py` creates `config.py` for you. Press
+**New Game** and the game opens **Settings** (the gear icon) to ask for your OpenAI
+key, checks it once, and carries on. Optional: put the key on the `OPENAI_API_KEY`
+line of `config.py` instead. Never commit `config.py`. Gemini and local servers
+(LM Studio, Ollama) are chosen in the same Settings panel; see [AI Provider Setup](#ai-provider-setup).
 
-**Version 0.3.5 (Alpha)**
+**First screen:** the first launch builds the browser player (a minute or so),
+then opens `http://localhost:8357/play/`. Press **New Game** at the top. The game says
+*"Welcome! Choose your adventure, then build your character."*, offers the
+adventures, and then walks you through creating your character.
 
-An AI-powered Dungeon Master for running SRD 5.2.1 compatible tabletop RPG campaigns with infinite adventure potential. Experience the world's most popular roleplaying game with an intelligent AI that remembers every decision, adapts to your playstyle, and creates endless adventures tailored to your party.
-
-**🚀 NEW: React Player and Multi-Provider AI** - The component-based React player
-is now the default; the established legacy player remains an explicit launch option.
-Run the game with the economical Codex GPT-6 matrix (**default for new installs**),
-the separately billed OpenAI API GPT-6 matrix, the stable GPT-4.1 baseline,
-Gemini, the OpenCode Go subscription
-(DeepSeek V4.1 Flash — custom fork feature), or an OpenAI-compatible local or
-remote server.
+Next time, run `python run_web.py` again from the same folder, with the venv
+activated. Windows users can instead use the
+[one-click installer](#-one-click-windows-installer-recommended).
 ## Help build NeverEndingQuest
 
 Find current opportunities, offer a hand, and pick up contributor guidance on
@@ -704,7 +715,9 @@ without a special launcher:
 1. Start the server and load a model.
 2. Launch either web player.
 3. Open **Settings → AI Provider** and choose **Local / Custom Server**.
-4. Enter the base URL, normally `http://localhost:1234/v1` for LM Studio.
+4. Enter the base URL, normally `http://localhost:1234/v1` for LM Studio or
+   `http://localhost:11434/v1` for Ollama (pull the model first with
+   `ollama pull <model>` and enter that name as the model identifier).
 5. Optionally enter a model identifier and API key. Local servers commonly need
    neither; hosted compatible services commonly require both.
 6. Select **Save**, then **Test Connection**.
@@ -874,7 +887,8 @@ modules/[module_name]/
 ├── module_plot.json   # Quest progression
 ├── module_items.json  # Typed loot items (optional)
 ├── party_tracker.json # Party state
-└── [name]_module.json # Module metadata
+├── module_context.json     # Index of areas, NPCs and references
+└── module_declaration.json # Start, gateways and routes
 ```
 
 ### Atomic Operations
