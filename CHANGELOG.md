@@ -169,6 +169,7 @@ the new model exposed. Full architecture reference:
 
 ### Fixed
 - Starting a game no longer loads the module toolkit until a toolkit page is opened (#1682).
+- The game can keep your saves, adventures and settings in a separate folder, chosen with --data-dir or NEQ_DATA_DIR; the first start fills it, later starts refresh the shipped prompts and add new adventures without touching anything you played. With neither set, nothing changes (#1681, #1682).
 
 ## [1.0.1] - 2026-10-30
 
