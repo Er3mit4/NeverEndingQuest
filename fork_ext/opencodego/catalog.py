@@ -22,6 +22,8 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timezone
 
+from . import settings
+
 # The relay's model list endpoint (bare ids; same host the calls use).
 MODELS_URL = "https://opencode.ai/zen/go/v1/models"
 CACHE_TTL_SECONDS = 6 * 3600
@@ -235,8 +237,7 @@ def _fresh(fetched_at):
 
 
 def _load_cached():
-    import model_config
-    cached = model_config.get_opencodego_models_cache()
+    cached = settings.get_models_cache()
     rows = normalize_rows(cached.get("models"))
     return rows, cached.get("fetched_at")
 
@@ -246,9 +247,8 @@ def _store(models, source, fetched_at, error):
 
 
 def _persist(models, fetched_at):
-    import model_config
     try:
-        model_config.persist_opencodego_models_cache({"models": models, "fetched_at": fetched_at})
+        settings.persist_models_cache({"models": models, "fetched_at": fetched_at})
     except Exception:
         # A read-only settings file must not break the picker; the in-memory
         # list still serves this session.
@@ -268,8 +268,7 @@ def refresh(force=False, key=None):
         if not force and not _STATE["models"] and rows and _fresh(cached_at):
             _store(rows, "cache", cached_at, None)
             return dict(_STATE)
-        import model_config
-        key = model_config.get_opencodego_key() if key is None else key
+        key = settings.get_key() if key is None else key
         if not key:
             rows = rows or fallback_rows()
             _store(rows, "cache" if cached_at else "fallback", cached_at,
@@ -323,8 +322,7 @@ def state():
 
 
 def selected_model():
-    import model_config
-    return model_config.get_opencodego_model()
+    return settings.get_model()
 
 
 def _due(attempted_at):
@@ -343,8 +341,8 @@ def payload(refresh_if_stale=False):
     selected = selected_model()
     return {
         "models": current["models"],
-        "selected": selected,
         "source": current["source"],
         "fetched_at": current["fetched_at"],
+        "selected": selected,
         "error": current["error"],
     }

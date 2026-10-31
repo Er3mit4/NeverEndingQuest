@@ -59,6 +59,11 @@ publishes for it (Chat Completions, OpenAI Responses or Anthropic Messages).
 - Key resolution: Settings-stored key → OpenCode CLI `auth.json`
   (auto-detected) → `config.py` override.
 - Pricing in the model catalog: $0.15/$0.60 per 1M off-peak, $60/month limit.
+- **Merge-safe layout**: the whole provider lives in `fork_ext/` (declaration,
+  connection, catalogue, settings, Settings events). The game reaches it
+  through five small `# FORK SEAM` hooks; an upstream-only checkout without
+  `fork_ext` runs the built-in providers unchanged. See the architecture
+  reference's "Merge-safe layout" section.
 
 Full architecture reference:
 [docs/architecture/opencode-go-provider.md](docs/architecture/opencode-go-provider.md).

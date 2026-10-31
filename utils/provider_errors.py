@@ -35,14 +35,22 @@ _PROVIDER_NAMES = {
     "legacy": "OpenAI",
     "gemini": "Gemini (Google AI)",
     "lmstudio": "your local model server",
-    "opencodego": "OpenCode Go",
     "codex": "Codex (ChatGPT)",
 }
 
 
 def provider_display_name(provider):
     """Player-facing name for a provider id; unknown ids read as 'the AI provider'."""
-    return _PROVIDER_NAMES.get(str(provider or "").lower(), "the AI provider")
+    key = str(provider or "").lower()
+    name = _PROVIDER_NAMES.get(key)
+    if name:
+        return name
+    # FORK SEAM: local provider bridges name themselves.
+    try:
+        from fork_ext.registry import display_name as _fork_display_name
+    except ImportError:
+        return "the AI provider"
+    return _fork_display_name(key) or "the AI provider"
 
 
 def _sentence(text):

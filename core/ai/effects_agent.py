@@ -36,16 +36,17 @@ def _provider_config():
     from model_config import get_provider, resolve_callsite_config
 
     provider = get_provider()
-    if provider == "codex":
-        return provider, resolve_callsite_config("T078", provider)
     names = {
         "openai": "CHAR_EFFECTS_GPT52_NONE",
         "gemini": "CHAR_EFFECTS_GEMINI_FLASH_HIGH",
         "lmstudio": "CHAR_EFFECTS_LMSTUDIO",
         "legacy": "CHAR_EFFECTS_LEGACY",
-        "opencodego": "CHAR_EFFECTS_OPENCODEGO",
     }
-    return provider, dict(getattr(config, names[provider]))
+    name = names.get(provider)
+    if name is None:
+        # A local provider bridge (fork_ext) resolves its own T078 ladder.
+        return provider, resolve_callsite_config("T078", provider)
+    return provider, dict(getattr(config, name))
 
 
 # The effect contract and its rules: T078's prompt and, word for word, T079's declarative effect rule

@@ -259,13 +259,11 @@ def _config_for_provider(provider: str) -> Dict[str, Any]:
     elif provider == "lmstudio":
         selected = copy.deepcopy(model_config.NPC_PROFILE_T107_LMSTUDIO)
         selected["response_format"] = None
-    elif provider == "opencodego":
-        # OpenCode Go is OpenAI-compatible Chat Completions: plain JSON mode
-        # like the openai path, model pinned to the Go DeepSeek config.
-        selected = copy.deepcopy(model_config.NPC_PROFILE_T107_OPENCODEGO)
-        selected["response_format"] = {"type": "json_object"}
     else:
-        raise ValueError("unsupported T107 provider: %s" % provider)
+        # A local provider bridge (fork_ext): OpenAI-compatible Chat
+        # Completions with plain JSON mode, resolved from its callsite ladder.
+        selected = model_config.resolve_callsite_config("T107", provider)
+        selected["response_format"] = {"type": "json_object"}
     return selected
 
 

@@ -35,16 +35,17 @@ _PROMPT_CONTRACT_VERSION = "first-name-only-v1"
 
 
 def _mini_config_for_provider(provider):
-    if provider in ("codex", "opencodego"):
-        import model_config
-        return model_config.resolve_callsite_config("T087", provider)
     if provider == "openai":
         return config.MINI_UTIL_GPT54MINI_NONE
     if provider == "gemini":
         return config.MINI_UTIL_GEMINI_FLASH_LOW
     if provider == "lmstudio":
         return config.MINI_UTIL_LMSTUDIO
-    return config.MINI_UTIL_LEGACY
+    if provider == "legacy":
+        return config.MINI_UTIL_LEGACY
+    # A local provider bridge (fork_ext) resolves its own T087 ladder.
+    import model_config
+    return model_config.resolve_callsite_config("T087", provider)
 
 
 def _name_cache_key(full_name, provider, model):
@@ -113,16 +114,17 @@ Return ONLY the first name, nothing else. No quotes, no explanation."""
         provider = request_provider or model_config.get_provider()
         # Keep provider-to-config assignments explicit here: the semantic
         # callsite inventory audits the exact four configs feeding T087.
-        if provider in ("codex", "opencodego"):
-            mini_cfg = model_config.resolve_callsite_config("T087", provider)
-        elif provider == "openai":
+        if provider == "openai":
             mini_cfg = config.MINI_UTIL_GPT54MINI_NONE
         elif provider == "gemini":
             mini_cfg = config.MINI_UTIL_GEMINI_FLASH_LOW
         elif provider == "lmstudio":
             mini_cfg = config.MINI_UTIL_LMSTUDIO
-        else:
+        elif provider == "legacy":
             mini_cfg = config.MINI_UTIL_LEGACY
+        else:
+            # A local provider bridge (fork_ext) resolves its own T087 ladder.
+            mini_cfg = model_config.resolve_callsite_config("T087", provider)
 
         response = capture_and_fanout("T087", api_client.create_completion,
             _request_provider=provider,

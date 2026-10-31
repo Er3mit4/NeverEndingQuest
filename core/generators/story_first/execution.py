@@ -229,10 +229,10 @@ def production_completion_gateway(request: StructuredRequest) -> CompletionPaylo
             preserve_required=True,
             preserve_constraints=True,
         )
-    elif request.provider == "opencodego":
-        call_options["response_format"] = {"type": "json_object"}
     else:
-        raise GatewayFailure("provider")
+        # A local provider bridge (fork_ext) is OpenAI-compatible Chat
+        # Completions: plain JSON mode with prompt-enforced schema.
+        call_options["response_format"] = {"type": "json_object"}
     try:
         response = capture_and_fanout(
             request.task_id,

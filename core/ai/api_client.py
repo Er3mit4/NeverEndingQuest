@@ -11,7 +11,11 @@ import time
 from core.ai import history_markers as hm
 from uuid import uuid4
 
-from utils.openai_client import compatible_connection, get_openai_client
+from utils.openai_client import (
+    compatible_connection,
+    get_openai_client,
+    is_compatible_provider,
+)
 
 _UNSET = object()  # sentinel: distinguishes "not provided" from "explicitly None"
 
@@ -385,7 +389,8 @@ def create_completion(messages, model, temperature=None, retry_attempt=0, **kwar
             raw_response = _codex_completion(
                 messages, model, _response_format, _phase_emit, **kwargs,
             )
-        elif request_provider in ("legacy", "openai", "lmstudio", "opencodego"):
+        elif request_provider in ("legacy", "openai", "lmstudio") or \
+                is_compatible_provider(request_provider):
             local_options = (
                 {"local_endpoint": local_endpoint}
                 if request_provider == "lmstudio" and local_endpoint is not None
@@ -605,19 +610,19 @@ def _enforce_provider_constraints(provider, model, temperature, kwargs):
         elif reasoning and str(reasoning).lower() != "none":
             kwargs["_strip_temperature"] = True
 
-    elif provider == "opencodego":
-        # DeepSeek V4.1 Flash (OpenCode Go): supports low|high|max reasoning
-        # only. A stray "none" from a compatibility profile becomes "low";
-        # temperature is accepted at every effort level, so nothing is stripped.
-        model_lower = model.lower() if model else ""
-        if "deepseek" in model_lower:
-            reasoning = kwargs.get("reasoning_effort")
-            if reasoning and str(reasoning).lower() == "none":
-                kwargs["reasoning_effort"] = "low"
-
     elif provider == "gemini":
         # Gemini ignores temperature -- handled in _gemini_completion
         pass
+
+    # FORK SEAM: local provider bridges declare their own hard-API rules.
+    try:
+        from fork_ext.registry import constraints_for as _fork_constraints
+
+        hook = _fork_constraints(provider)
+    except ImportError:
+        hook = None
+    if hook is not None:
+        hook(model, kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -954,14 +959,6 @@ def _compatible_chat_kwargs(messages, model, temperature, response_format,
     return call_kwargs
 
 
-def _opencodego_call_kwargs(messages, model, temperature, response_format, **kwargs):
-    """Compatibility wrapper for callers importing the old Go payload helper."""
-    return _compatible_chat_kwargs(
-        messages, model, temperature, response_format,
-        strip_temp=kwargs.pop("_strip_temperature", False), **kwargs,
-    )
-
-
 def _openai_completion(messages, model, temperature, provider, response_format=_UNSET,
                        phase_emit=None, connection_override=None, output_ceiling=None,
                        local_endpoint=None, **kwargs):
@@ -975,7 +972,7 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
     # callsite's own model string. Scoped to lmstudio only; no other provider or
     # param is affected (create_completion remains a thin router).
     connection = None
-    if provider in ("lmstudio", "opencodego"):
+    if is_compatible_provider(provider):
         connection = compatible_connection(provider, endpoint_override)
         if connection["model"]:
             model = connection["model"]
@@ -994,12 +991,15 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
                 ))):
             response_format = None
 
-    if provider == "opencodego":
-        _open_code_go_model = model
-        kwargs["reasoning_effort"] = _opencodego_effort(
-            _open_code_go_model, kwargs.get("reasoning_effort"))
-        if kwargs["reasoning_effort"] is None:
-            kwargs.pop("reasoning_effort")
+    if connection is not None:
+        # A provider bridge can publish its own effort contract; the router
+        # never hardcodes one provider's model rules.
+        normalizer = connection.get("effort_normalizer")
+        if callable(normalizer):
+            kwargs["reasoning_effort"] = normalizer(
+                model, kwargs.get("reasoning_effort"))
+            if kwargs["reasoning_effort"] is None:
+                kwargs.pop("reasoning_effort")
 
     # Pop internal flags
     strip_temp = kwargs.pop("_strip_temperature", False)
@@ -1026,13 +1026,14 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
         )
 
     transport = (connection or {}).get("transport", "chat")
-    if provider == "opencodego" and transport == "responses":
-        # OpenCode Go serves gpt-*, grok-* and muse-spark* only on /responses.
+    if transport == "responses":
+        # A compatible provider that publishes gpt-*, grok-* and muse-spark*
+        # only on /responses.
         return _responses_stream_completion(
             client, messages, model, temperature, strip_temp, response_format,
             phase_emit, output_ceiling=output_ceiling, **kwargs,
         )
-    if provider == "opencodego" and transport == "anthropic":
+    if transport == "anthropic":
         # ... and claude-*, minimax-* and qwen* only on the Anthropic wire.
         return _anthropic_completion(
             connection, messages, model, temperature, response_format, phase_emit,
@@ -1044,12 +1045,6 @@ def _openai_completion(messages, model, temperature, provider, response_format=_
     )
 
     return _chat_stream_completion(client, call_kwargs, phase_emit, output_ceiling=output_ceiling)
-
-
-def _opencodego_effort(model, effort):
-    """The reasoning level OpenCode Go accepts for this model, or None."""
-    from utils.opencodego_models import adjust_reasoning_effort
-    return adjust_reasoning_effort(model, effort)
 
 
 def _anthropic_completion(connection, messages, model, temperature, response_format,

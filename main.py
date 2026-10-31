@@ -4818,17 +4818,17 @@ def validate_ai_response(
         warning(f"VALIDATION: debug export skipped: {export_error}", category="ai_validation")
     
     # Select per-provider validation model config
-    if _val_provider in ("codex", "opencodego"):
+    validation_profiles = {
+        "openai": config.DM_VALIDATION_GPT52_LOW,
+        "gemini": config.DM_VALIDATION_GEMINI_FLASH_LOW,
+        "lmstudio": config.DM_VALIDATION_LMSTUDIO,
+        "legacy": config.DM_VALIDATION_LEGACY,
+    }
+    validation_config = validation_profiles.get(_val_provider)
+    if validation_config is None:
+        # Local provider bridges resolve through the callsite registry.
         from model_config import resolve_callsite_config
         validation_config = resolve_callsite_config("T065", _val_provider)
-    elif _val_provider == "openai":
-        validation_config = config.DM_VALIDATION_GPT52_LOW
-    elif _val_provider == "gemini":
-        validation_config = config.DM_VALIDATION_GEMINI_FLASH_LOW
-    elif _val_provider == "lmstudio":
-        validation_config = config.DM_VALIDATION_LMSTUDIO
-    else:  # legacy
-        validation_config = config.DM_VALIDATION_LEGACY
 
     validation_config = _t065_response_format(_val_provider, validation_config)
     attempt = 0

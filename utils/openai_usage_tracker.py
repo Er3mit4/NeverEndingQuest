@@ -72,7 +72,7 @@ MODULE_BUILD_OUTCOMES = frozenset(
         "unknown",
     }
 )
-_KNOWN_PROVIDERS = frozenset({"legacy", "openai", "codex", "gemini", "lmstudio", "opencodego"})
+_KNOWN_PROVIDERS = frozenset({"legacy", "openai", "codex", "gemini", "lmstudio"})
 _KNOWN_INTERFACES = frozenset({"web", "terminal", "toolkit"})
 _TELEMETRY_CONTEXT_LIMITS = {
     "endpoint": _GENERAL_METADATA_LIMIT,
@@ -124,7 +124,14 @@ def _sanitize_provider(value, default="unknown"):
         default=default,
         lowercase=True,
     )
-    return normalized if normalized in _KNOWN_PROVIDERS else default
+    if normalized in _KNOWN_PROVIDERS:
+        return normalized
+    # FORK SEAM: local provider bridges are known providers too.
+    try:
+        from fork_ext.registry import provider_names as _fork_provider_names
+    except ImportError:
+        return default
+    return normalized if normalized in _fork_provider_names() else default
 
 
 def _sanitize_outcome(value, default="unknown"):

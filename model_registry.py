@@ -6,12 +6,12 @@ Provider-specific schemas remain in :mod:`model_config`; bindings refer to those
 profiles by compatibility name and the resolver returns a detached deep copy.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Mapping, Optional, Tuple
 
 
-SUPPORTED_PROVIDERS = ("openai", "codex", "gemini", "legacy", "lmstudio", "opencodego")
+SUPPORTED_PROVIDERS = ("openai", "codex", "gemini", "legacy", "lmstudio")
 _GPT6_SPECIAL_LADDERS = {
     "T017": ("GPT6_LUNA_MEDIUM",),
     # Former Luna-high or Terra tasks get Sol-low. Most tasks remain Luna-low.
@@ -24,11 +24,6 @@ _GPT6_SPECIAL_LADDERS = {
 }
 # Frozen from the Go matrix in use on 2026-09-22. This is deliberately
 # independent of the OpenAI names and efforts, which may evolve separately.
-_GO_SPECIAL_LADDERS = {
-    "T017": ("OPENCODEGO_HIGH",),
-    "T026": ("OPENCODEGO_MAX",),
-    "T097": ("OPENCODEGO_LOW", "OPENCODEGO_LOW", "OPENCODEGO_HIGH"),
-}
 SUPPORTED_GPT56_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 EVALUATION_EFFORTS = ("none", "low", "medium", "high")
 
@@ -177,23 +172,25 @@ class CallsiteBinding:
     gemini: Tuple[str, ...]
     legacy: Tuple[str, ...]
     lmstudio: Tuple[str, ...]
-    opencodego: Tuple[str, ...] = ()
     codex: Tuple[str, ...] = ()
+    # Providers added by a local extension (fork_ext): provider id -> ladder.
+    extra: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
     note: str = ""
 
     def profiles_for(self, provider: str) -> Tuple[str, ...]:
+        if provider in self.extra:
+            return self.extra[provider]
         if provider not in SUPPORTED_PROVIDERS:
             raise ValueError("Unknown provider %r" % provider)
         return getattr(self, provider)
 
 
-def _profiles(openai, gemini, legacy, lmstudio, opencodego=None):
+def _profiles(openai, gemini, legacy, lmstudio):
     return {
         "openai": (openai,) if isinstance(openai, str) else tuple(openai),
         "gemini": (gemini,) if isinstance(gemini, str) else tuple(gemini),
         "legacy": (legacy,) if isinstance(legacy, str) else tuple(legacy),
         "lmstudio": (lmstudio,) if isinstance(lmstudio, str) else tuple(lmstudio),
-        "opencodego": (opencodego,) if isinstance(opencodego, str) else tuple(opencodego or ()),
     }
 
 
@@ -775,11 +772,21 @@ def _build_bindings():
             binding.task_id,
             ("GPT6_LUNA_LOW",),
         )
-        go = _GO_SPECIAL_LADDERS.get(binding.task_id, ("OPENCODEGO_LOW",))
         bindings[binding.task_id] = replace(
-            binding, openai=gpt6, codex=gpt6, opencodego=go,
+            binding, openai=gpt6, codex=gpt6,
         )
     return MappingProxyType(bindings)
+
+
+# FORK SEAM: local provider bridges add their providers (names and ladders)
+# before the bindings freeze. An upstream-only checkout has no fork_ext and
+# this block is a no-op.
+try:  # pragma: no cover - exercised whenever fork_ext is installed
+    from fork_ext.registry import extend_model_registry as _fork_extend_registry
+
+    _fork_extend_registry(globals())
+except ImportError:
+    pass
 
 
 CALLSITE_BINDINGS: Mapping[str, CallsiteBinding] = _build_bindings()

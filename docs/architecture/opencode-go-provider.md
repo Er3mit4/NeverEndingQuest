@@ -64,7 +64,7 @@ request without a restart.
 ## Wire protocols per model
 
 The relay publishes three protocols behind one base URL, so the model id
-decides how a request travels (`utils/opencodego_models.transport_for`):
+decides how a request travels (`fork_ext/opencodego/catalog.transport_for`):
 
 | Models | Wire | Base URL |
 |---|---|---|
@@ -85,26 +85,33 @@ level is a 400 on every call for that provider:
 | everything else | omitted — the relay's own default |
 
 `_enforce_provider_constraints` still rewrites a stray
-`reasoning_effort: "none"` to `low` for older compatibility profiles.
+`reasoning_effort: "none"` to `low` for older compatibility profiles; the
+provider's own rule now arrives through the connection's `effort_normalizer`.
 Temperature is accepted at every effort level and passes through like the
 legacy/lmstudio providers. JSON mode follows the same default-ON contract as
 the legacy path (opt-out with `response_format=None`); on the Anthropic wire,
 which has no JSON flag, the contract is stated in the system prompt.
 
-## Key files
+## Merge-safe layout (fork_ext)
 
-| File | Change |
+The provider lives entirely under `fork_ext/`, so `git pull` from upstream only
+touches the small hooks below. An upstream-only checkout (no `fork_ext`) runs
+the built-in providers unchanged.
+
+| File | Role |
 |---|---|
-| `model_registry.py` | `opencodego` in `SUPPORTED_PROVIDERS`, independent `_GO_SPECIAL_LADDERS`, `deepseek-v4.1-flash` catalog entry |
-| `model_config.py` | Go profiles and independent key persistence/detection helpers |
-| `utils/openai_client.py` | Shared Local/Custom and Go compatible endpoint configuration; Go supplies its own URL, credential, JSON policy, headers and the transport for the chosen model |
-| `utils/opencodego_models.py` | Plan catalogue discovery (`/zen/go/v1/models`), per-model transport routing, effort clamp, 6 h cache and the offline floor |
-| `core/ai/anthropic_wire.py` | Anthropic Messages transport for the Go models that only exist on that wire |
-| `utils/conversation_identity.py` | Conversation UUID created by the game owner and propagated to provider children |
-| `core/ai/api_client.py` | Routes `opencodego` per model transport (chat / Responses / Anthropic), none→low effort constraint |
-| `utils/provider_errors.py` | Player-facing display name "OpenCode Go" |
-| `utils/openai_usage_tracker.py` | Known-provider telemetry set |
-| `utils/startup_wizard.py`, `core/ai/effects_agent.py`, `core/npc/voice_service.py`, `core/npc/profile_service.py`, `core/generators/story_first/settings.py`, `core/generators/module_builder.py`, `utils/capture/live_provider_call.py`, `web/web_interface.py` | Explicit provider branches (config selection, key handlers, credentials check, T104/T105/T107 payload shapes) |
+| `fork_ext/providers/opencodego.py` | Declaration: default model `deepseek-v4.1-flash`, named profiles, per-callsite ladders (low / high for T017 and third T097 / max for T026), constraint |
+| `fork_ext/opencodego/connection.py` | Endpoint, key, session header, `User-Agent`, per-model wire and the effort normalizer |
+| `fork_ext/opencodego/catalog.py` | Plan catalogue discovery (`/zen/go/v1/models`), transport routing, effort clamp, 6 h cache and offline floor |
+| `fork_ext/opencodego/settings.py` | Key (UI -> CLI `auth.json` -> `config.py`), model choice and catalogue cache |
+| `fork_ext/opencodego/web.py` | Settings events and credential check |
+| `fork_ext/registry.py` | The hook implementations |
+| `model_registry.py` | `CallsiteBinding.extra` + one `# FORK SEAM` block before bindings freeze |
+| `model_config.py` | One `# FORK SEAM` block that injects profiles, the provider entry and the persisted key |
+| `utils/openai_client.py` | Compatible-connection registry (built-in `lmstudio` plus registered bridges) |
+| `core/ai/api_client.py` | Constraint hook and connection-driven transport/effort |
+| `web/web_interface.py` | Handler registration, credential check and warmup hooks |
+| `utils/provider_errors.py`, `utils/openai_usage_tracker.py` | Display-name and known-provider hooks |
 | `web/templates/game_interface.html`, `web/frontend/src/*` | Provider dropdown option, hint text, API-key section, plan model picker + socket contract (`get/set_opencodego_key`, `get_opencodego_models`, `refresh_opencodego_models`, `set_opencodego_model`) |
 | `config.py` / `config_template.py` | `OPENCODEGO_API_KEY` placeholder |
 

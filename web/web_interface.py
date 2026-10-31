@@ -2577,9 +2577,15 @@ def _provider_credentials_available(provider):
             return get_server().account_status()["state"] == "connected"
         except Exception:
             return False
-    if provider == "opencodego":
-        import model_config
-        return bool(model_config.get_opencodego_key())
+    # FORK SEAM: local provider bridges answer for their own credentials.
+    try:
+        from fork_ext.registry import credentials_available as _fork_credentials
+    except ImportError:
+        _fork_credentials = None
+    if _fork_credentials is not None:
+        available = _fork_credentials(provider)
+        if available is not None:
+            return available
     if provider in ("legacy", "openai"):
         key = getattr(config, "OPENAI_API_KEY", "")
         placeholder = "your_openai_api_key_here"
@@ -2622,23 +2628,18 @@ def promote_to_bestiary():
         Make it sound like an entry from an official monster manual. Do not include stat blocks.
         Use only standard ASCII characters -- no smart quotes, no em-dashes, no Unicode symbols."""
         
-        from model_config import get_provider
+        from model_config import get_provider, resolve_callsite_config
         provider_snapshot = get_provider()
         import config
-        if provider_snapshot == "codex":
-            import model_config
-            mini_cfg = model_config.resolve_callsite_config("T094", "codex")
-        elif provider_snapshot == "openai":
-            mini_cfg = config.MINI_UTIL_GPT54MINI_NONE
-        elif provider_snapshot == "gemini":
-            mini_cfg = config.MINI_UTIL_GEMINI_FLASH_LOW
-        elif provider_snapshot == "lmstudio":
-            mini_cfg = config.MINI_UTIL_LMSTUDIO
-        elif provider_snapshot == "opencodego":
-            mini_cfg = config.MINI_UTIL_OPENCODEGO
-        elif provider_snapshot == "legacy":
-            mini_cfg = config.MINI_UTIL_LEGACY
-        else:
+        profiles = {
+            "openai": config.MINI_UTIL_GPT54MINI_NONE,
+            "gemini": config.MINI_UTIL_GEMINI_FLASH_LOW,
+            "lmstudio": config.MINI_UTIL_LMSTUDIO,
+            "legacy": config.MINI_UTIL_LEGACY,
+        }
+        mini_cfg = profiles.get(provider_snapshot) or \
+            resolve_callsite_config("T094", provider_snapshot)
+        if mini_cfg is None:
             raise ValueError(f"Unsupported model provider: {provider_snapshot}")
 
         response = capture_and_fanout("T094", api_client.create_completion,
@@ -4970,80 +4971,14 @@ def handle_set_gemini_key(data):
         error(f"Error setting gemini key: {e}", exception=e, category="web_interface")
         emit('error', {'message': "Failed to set Gemini API key"})  # generic: no key leak
 
-@socketio.on('get_opencodego_key')
-def handle_get_opencodego_key():
-    """Report ONLY whether an OpenCode Go key is configured. Never sends the secret."""
-    try:
-        import model_config
-        # has_opencodego_key() also sees the OpenCode CLI auth.json key.
-        emit('opencodego_key_status', {'has_key': model_config.has_opencodego_key()})
-    except Exception as e:
-        error(f"Error getting opencodego key status: {e}", exception=e, category="web_interface")
-        emit('opencodego_key_status', {'has_key': False})
+# FORK SEAM: local provider bridges register their Settings events here.
+# An upstream-only checkout has no fork_ext and this block is a no-op.
+try:  # pragma: no cover - exercised whenever fork_ext is installed
+    from fork_ext.registry import register_web_handlers as _fork_register_web
 
-@socketio.on('set_opencodego_key')
-def handle_set_opencodego_key(data):
-    """Set the OpenCode Go key from the UI: update config live AND persist. No echo.
-
-    The OpenAI-compatible client (utils/openai_client.get_openai_client) reads
-    model_config.get_opencodego_key() per call, so a key set in Settings applies
-    to the very next request. Mirrors handle_set_gemini_key.
-    """
-    try:
-        import model_config, config as _cfg
-        api_key = ((data or {}).get('api_key') or '').strip()
-        if not api_key:
-            # Blank submit: do NOT wipe an existing key. Report status only.
-            emit('opencodego_key_status', {'has_key': model_config.has_opencodego_key()})
-            return
-        _cfg.OPENCODEGO_API_KEY = api_key            # live: config readers
-        model_config.persist_opencodego_key(api_key) # survive restart
-        from utils.startup_provider_recovery import notify_configuration_saved
-        notify_configuration_saved('opencodego')
-        debug("OpenCode Go API key updated via web UI", category="web_interface")
-        emit('opencodego_key_status', {'has_key': model_config.has_opencodego_key()}, broadcast=True)
-    except Exception as e:
-        error(f"Error setting opencodego key: {e}", exception=e, category="web_interface")
-        emit('error', {'message': "Failed to set OpenCode Go API key"})  # generic: no key leak
-
-@socketio.on('get_opencodego_models')
-def handle_get_opencodego_models():
-    """List the OpenCode Go plan models: live when the key works, else the cache
-    or the plan's published floor. Refreshes when the cached list is stale."""
-    try:
-        from utils.opencodego_models import payload
-        emit('opencodego_models', payload(refresh_if_stale=True))
-    except Exception as e:
-        error(f"Error listing OpenCode Go models: {e}", exception=e, category="web_interface")
-        emit('opencodego_models', {
-            'models': [], 'selected': '', 'source': 'none', 'fetched_at': None,
-            'error': 'The OpenCode Go model list could not be read.',
-        })
-
-@socketio.on('refresh_opencodego_models')
-def handle_refresh_opencodego_models():
-    """Re-fetch the plan's model list now (the Settings Refresh button)."""
-    try:
-        from utils.opencodego_models import payload, refresh
-        refresh(force=True)
-        emit('opencodego_models', payload(), broadcast=True)
-    except Exception as e:
-        error(f"Error refreshing OpenCode Go models: {e}", exception=e, category="web_interface")
-        emit('error', {'message': 'Failed to refresh the OpenCode Go model list'})
-
-@socketio.on('set_opencodego_model')
-def handle_set_opencodego_model(data):
-    """Save the OpenCode Go model used by every call (plan subscription = one model)."""
-    try:
-        import model_config
-        selected = model_config.persist_opencodego_model((data or {}).get('model'))
-        debug(f"OpenCode Go model set to: {selected}", category="web_interface")
-        emit('opencodego_model_changed', {'model': selected}, broadcast=True)
-    except (ValueError, TypeError) as e:
-        emit('error', {'message': str(e)})
-    except Exception as e:
-        error(f"Error setting OpenCode Go model: {e}", exception=e, category="web_interface")
-        emit('error', {'message': 'Failed to set the OpenCode Go model'})
+    _fork_register_web(socketio, emit)
+except ImportError:
+    pass
 
 @socketio.on('test_local_endpoint')
 def handle_test_local_endpoint(data):
@@ -5895,20 +5830,16 @@ def _run_npc_description_job(
             )
 
         import config
-        if provider_snapshot == "codex":
-            import model_config
-            mini_cfg = model_config.resolve_callsite_config("T095", "codex")
-        elif provider_snapshot == "openai":
-            mini_cfg = config.MINI_UTIL_GPT54MINI_NONE
-        elif provider_snapshot == "gemini":
-            mini_cfg = config.MINI_UTIL_GEMINI_FLASH_LOW
-        elif provider_snapshot == "lmstudio":
-            mini_cfg = config.MINI_UTIL_LMSTUDIO
-        elif provider_snapshot == "opencodego":
-            mini_cfg = config.MINI_UTIL_OPENCODEGO
-        elif provider_snapshot == "legacy":
-            mini_cfg = config.MINI_UTIL_LEGACY
-        else:
+        profiles = {
+            "openai": config.MINI_UTIL_GPT54MINI_NONE,
+            "gemini": config.MINI_UTIL_GEMINI_FLASH_LOW,
+            "lmstudio": config.MINI_UTIL_LMSTUDIO,
+            "legacy": config.MINI_UTIL_LEGACY,
+        }
+        from model_config import resolve_callsite_config
+        mini_cfg = profiles.get(provider_snapshot) or \
+            resolve_callsite_config("T095", provider_snapshot)
+        if mini_cfg is None:
             raise ValueError(f"Unsupported model provider: {provider_snapshot}")
         module_context = extract_module_context_for_npcs(module_name)
 
@@ -7521,12 +7452,12 @@ if __name__ == '__main__':
     start_path = _web_start_path()
     print(f"Opening browser at http://localhost:{port}{start_path}")
 
-    # Warm the OpenCode Go plan catalogue off-thread (no key = no request), so
-    # the Settings picker opens with the current list instead of a placeholder.
+    # FORK SEAM: local provider warmups (no-op without fork_ext).
     try:
-        from utils.opencodego_models import start_background_refresh
-        start_background_refresh()
-    except Exception:
+        from fork_ext.registry import start_background_jobs as _fork_start_jobs
+
+        _fork_start_jobs()
+    except ImportError:
         pass
 
     # Run the Flask app with SocketIO

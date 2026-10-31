@@ -436,15 +436,15 @@ def _t026_request_options(
             preserve_constraints=True,
         )
         response_format = {"type": "json_object"}
-    elif provider == "opencodego":
-        response_format = {"type": "json_object"}
     elif provider == "lmstudio":
         # Local OpenAI-compatible servers disagree on schema-format support.
         # Explicitly use prompt-enforced JSON plus the same fail-closed local
         # validator. This is a capability policy, not an extra semantic retry.
         response_format = None
     else:
-        raise ValueError(f"unsupported T026 provider: {provider}")
+        # A local provider bridge (fork_ext) is OpenAI-compatible Chat
+        # Completions: plain JSON mode with prompt-enforced schema.
+        response_format = {"type": "json_object"}
 
     return response_format, extra_params
 

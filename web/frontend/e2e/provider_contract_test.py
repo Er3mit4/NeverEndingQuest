@@ -50,7 +50,6 @@ def provider_runtime(tmp_path, monkeypatch):
         "handle_get_provider", "handle_set_provider", "handle_get_local_endpoint",
         "handle_set_local_endpoint", "handle_get_openai_key", "handle_set_openai_key",
         "handle_get_gemini_key", "handle_set_gemini_key", "handle_test_local_endpoint",
-        "handle_get_opencodego_key", "handle_set_opencodego_key",
         "handle_set_codex_model",
     }
     functions = [node for node in source.body if isinstance(node, ast.FunctionDef) and node.name in names]
@@ -58,8 +57,9 @@ def provider_runtime(tmp_path, monkeypatch):
     for node in functions:
         node.decorator_list = []
     events = []
+    emit = lambda event, payload, **kwargs: events.append((event, payload))
     namespace = {
-        "emit": lambda event, payload, **kwargs: events.append((event, payload)),
+        "emit": emit,
         "debug": lambda *args, **kwargs: None,
         "error": lambda *args, **kwargs: None,
         "threading": threading,
@@ -67,6 +67,20 @@ def provider_runtime(tmp_path, monkeypatch):
     locks = [node for node in source.body if isinstance(node, ast.Assign)
              and any(isinstance(target, ast.Name) and target.id == "_provider_selection_lock" for target in node.targets)]
     exec(compile(ast.Module(body=locks + functions, type_ignores=[]), "web/web_interface.py", "exec"), namespace)
+
+    # Local provider bridges register their Settings handlers through fork_ext.
+    from fork_ext.opencodego import web as opencodego_web
+    registered = {}
+
+    class _FakeSocketIO:
+        def on(self, event):
+            def decorator(fn):
+                registered[event] = fn
+                return fn
+            return decorator
+
+    opencodego_web.register_socket_handlers(_FakeSocketIO(), emit)
+    namespace.update({fn.__name__: fn for fn in registered.values()})
     return types.SimpleNamespace(module=module, reload=reload_config, handlers=namespace,
                                  events=events, root=tmp_path, secrets=secrets)
 
@@ -159,7 +173,8 @@ def test_opencode_session_survives_child_and_stays_separate_from_local_key(provi
 
     config = provider_runtime.module
     config.persist_local_endpoint("http://127.0.0.1:1234/v1", "fixture-local-key", "local-model")
-    monkeypatch.setattr(config, "get_opencodego_key", lambda: "fixture-go-key")
+    from fork_ext.opencodego import settings as go_settings
+    monkeypatch.setattr(go_settings, "get_key", lambda: "fixture-go-key")
     identity = start_new_conversation()
     go = compatible_connection("opencodego")
     local = compatible_connection("lmstudio")
@@ -219,7 +234,8 @@ def test_key_set_and_blank_submit_report_status_only(provider_runtime, provider,
     synthetic = f"fixture-only-{provider}-key"
     if provider == "opencodego":
         # Isolate the OpenCode Go key path from the developer's real CLI auth file.
-        monkeypatch.setattr(rt.module, "_read_opencode_auth_key", lambda: "")
+        from fork_ext.opencodego import settings as go_settings
+        monkeypatch.setattr(go_settings, "_read_opencode_auth_key", lambda: "")
     rt.handlers[f"handle_set_{provider}_key"]({"api_key": synthetic})
     rt.handlers[f"handle_set_{provider}_key"]({"api_key": ""})
     rt.reload()

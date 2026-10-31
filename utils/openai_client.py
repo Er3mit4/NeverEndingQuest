@@ -41,20 +41,6 @@ def _provider_socket_options():
 PROVIDER_SOCKET_OPTIONS = tuple(_provider_socket_options())
 
 
-# OpenCode Go subscription endpoint (OpenAI-compatible Chat Completions).
-# deepseek-v4.1-flash and the other Go models live at
-# https://opencode.ai/zen/go/v1/chat/completions (Bearer auth).
-DEFAULT_OPENCODEGO_BASE_URL = "https://opencode.ai/zen/go/v1"
-# The same relay serves the Anthropic wire one level up: the SDK appends
-# /v1/messages, so this base must not carry /v1 (OpenCode Go docs, 2026-10-25).
-OPENCODEGO_ANTHROPIC_BASE_URL = "https://opencode.ai/zen/go"
-
-def _opencodego_session_id():
-    """Return the game-owned identity inherited by subprocess generations."""
-    from utils.conversation_identity import current_conversation_id
-    return current_conversation_id()
-
-
 def _provider_http_client():
     """One httpx client shape for every OpenAI-compatible provider."""
     return httpx.Client(
@@ -62,13 +48,39 @@ def _provider_http_client():
     )
 
 
-def compatible_connection(provider, endpoint_override=None, model=None):
-    """Resolve one OpenAI-compatible endpoint without mixing credentials.
+_COMPATIBLE_CONNECTION_FACTORIES = {}
 
-    For OpenCode Go the player's chosen model decides both the model id and the
-    wire transport (Chat Completions, Responses or Anthropic Messages), because
-    the plan serves different protocols per model behind one relay.
+
+def register_compatible_connection(provider, factory):
+    """Register a local bridge's OpenAI-compatible endpoint factory.
+
+    ``factory(endpoint_override=..., model=...)`` returns the connection dict
+    read by ``api_client`` (base_url, api_key, model, headers, transport).
     """
+    _COMPATIBLE_CONNECTION_FACTORIES[str(provider)] = factory
+
+
+def is_compatible_provider(provider):
+    """True when this provider uses the OpenAI-compatible transport."""
+    if provider == "lmstudio" or provider in _COMPATIBLE_CONNECTION_FACTORIES:
+        return True
+    return _fork_connection_factory(provider) is not None
+
+
+def _fork_connection_factory(provider):
+    try:
+        from fork_ext.registry import connection_for
+    except ImportError:
+        return None
+    factory = connection_for(provider)
+    if factory is not None:
+        # Register-on-first-use keeps core import order irrelevant.
+        register_compatible_connection(provider, factory)
+    return factory
+
+
+def compatible_connection(provider, endpoint_override=None, model=None):
+    """Resolve one OpenAI-compatible endpoint without mixing credentials."""
     import model_config
     if provider == "lmstudio":
         ep = endpoint_override if endpoint_override is not None else model_config.get_local_endpoint()
@@ -80,24 +92,11 @@ def compatible_connection(provider, endpoint_override=None, model=None):
             "headers": {},
             "transport": "chat",
         }
-    if provider == "opencodego":
-        from utils.opencodego_models import transport_for
-        selected = (model or "").strip()
-        if not selected:
-            selected = model_config.get_opencodego_model() or model_config.DEFAULT_OPENCODEGO_MODEL
-        transport = transport_for(selected)
-        return {
-            "base_url": (OPENCODEGO_ANTHROPIC_BASE_URL if transport == "anthropic"
-                         else DEFAULT_OPENCODEGO_BASE_URL),
-            "api_key": model_config.get_opencodego_key() or "not-needed",
-            "model": selected,
-            "json_object": transport != "anthropic",
-            "headers": {
-                "x-opencode-session": _opencodego_session_id(),
-                "User-Agent": "NeverEndingQuest/1.0",
-            },
-            "transport": transport,
-        }
+    factory = _COMPATIBLE_CONNECTION_FACTORIES.get(provider)
+    if factory is None:
+        factory = _fork_connection_factory(provider)
+    if factory is not None:
+        return factory(endpoint_override=endpoint_override, model=model)
     raise ValueError("Unsupported compatible endpoint: %s" % provider)
 
 
@@ -110,7 +109,7 @@ def get_openai_client(provider=None, endpoint_override=None):
 
     Behavior:
         - If MODEL_PROVIDER == "lmstudio": Connects to localhost:1234 (local LM Studio)
-        - If MODEL_PROVIDER == "opencodego": Connects to opencode.ai/zen/go (DeepSeek)
+        - A local bridge provider (fork_ext): Connects to its registered endpoint
         - Otherwise: Connects to OpenAI API (requires config.OPENAI_API_KEY)
 
     Usage:
@@ -122,7 +121,7 @@ def get_openai_client(provider=None, endpoint_override=None):
         import model_config
         provider = model_config.get_provider()
 
-    if provider in ("lmstudio", "opencodego"):
+    if is_compatible_provider(provider) or _fork_connection_factory(provider) is not None:
         ep = compatible_connection(provider, endpoint_override)
         return OpenAI(
             base_url=ep["base_url"],

@@ -181,18 +181,8 @@ DM_MINI_MODEL_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 DM_FULL_MODEL_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 DM_MINI_MODEL_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
-# OpenCode Go (https://opencode.ai/zen/go/v1) -- OpenAI-compatible endpoint
-# serving open models (DeepSeek V4.1 Flash et al.) behind a Go subscription.
-# Transport: Chat Completions streaming via the standard OpenAI client
-# (api_client routes opencodego like legacy/lmstudio, NOT the Responses path).
-# Model: deepseek-v4.1-flash ($0.15/$0.60 per 1M in/out; efforts low|high|max;
-# "none" unsupported -- reasoning_effort is mapped to "low" at the adapter for
-# parity with the game's reasoning-off callsites).
-DM_FULL_MODEL_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
-DM_MINI_MODEL_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
-OPENCODEGO_LOW = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
-OPENCODEGO_HIGH = {"model": "deepseek-v4.1-flash", "reasoning_effort": "high"}
-OPENCODEGO_MAX = {"model": "deepseek-v4.1-flash", "reasoning_effort": "max"}
+# OpenCode Go profiles are provided by the local provider bridge
+# (fork_ext/providers/opencodego.py) and injected below.
 GPT6_LUNA_LOW = {"model": "gpt-6-luna", "reasoning_effort": "low"}
 GPT6_LUNA_MEDIUM = {"model": "gpt-6-luna", "reasoning_effort": "medium"}
 GPT6_SOL_LOW = {"model": "gpt-6-sol", "reasoning_effort": "low"}
@@ -382,10 +372,7 @@ CHAR_EFFECTS_LEGACY = {"model": "gpt-4.1-2025-04-14"}
 # LM Studio (local passthrough)
 CHAR_EFFECTS_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
-# OpenCode Go (DeepSeek V4.1 Flash). T078 is an analytical classification
-# task; the cheapest supported reasoning rung (low) is the initial selection.
-CHAR_EFFECTS_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
-
+# OpenCode Go (DeepSeek V4.1 Flash): profile injected by fork_ext.
 # ----- T040 Combat Validation -----
 # Validates AI combat responses for D&D rules compliance.
 # Full-tier callsite, temperature=0.3, JSON output.
@@ -808,11 +795,8 @@ MINI_UTIL_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 # default), so the shared Local config must not inject a second value.
 MINI_UTIL_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
 
-# OpenCode Go variant of the shared mini-utility tier (DeepSeek V4.1 Flash via
-# the Go gateway). Accepts temperature at every effort; reasoning_effort "low"
-# is the cheapest supported rung (no "none" on this model).
-MINI_UTIL_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
-
+# OpenCode Go variants of the shared mini-utility and DM_MAIN tiers are
+# injected by fork_ext.
 # --- T031+: DM_MAIN_MODEL callsites (module generation, DM narration, transitions) ---
 # First DM_MAIN_MODEL migration (T031). These dicts will be reused by all 12 DM_MAIN_MODEL callsites.
 # Full-tier. gpt-5.2|none: best creative generation. gemini-pro|low: highest quality at higher cost.
@@ -821,7 +805,6 @@ DM_MAIN_GPT52_NONE = {"model": "gpt-5.2", "reasoning_effort": "none"}
 DM_MAIN_GEMINI_PRO_LOW = {"model": "gemini-3.1-pro-preview", "thinking_level": "low"}
 DM_MAIN_LEGACY = {"model": "gpt-4.1-2025-04-14"}
 DM_MAIN_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
-DM_MAIN_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
 
 # T026 (location batch generation) -- per-callsite selection from the 2026-08-15
 # blind 3-reviewer quality + cost eval (docs/audits/2026-08-15-t026-model-quality-eval.md).
@@ -904,13 +887,11 @@ NPC_VOICE_T105_OPENAI_LUNA_NONE = copy.deepcopy(OPENAI_GPT56_LUNA_NONE)
 NPC_VOICE_T105_GEMINI_FLASHLITE_LOW = {"model": "gemini-3.1-flash-lite-preview", "thinking_level": "low"}
 NPC_VOICE_T105_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 NPC_VOICE_T105_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
-NPC_VOICE_T105_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
 
 NPC_PROFILE_T107_OPENAI_LUNA_NONE = copy.deepcopy(OPENAI_GPT56_LUNA_NONE)
 NPC_PROFILE_T107_GEMINI_FLASHLITE_LOW = {"model": "gemini-3.1-flash-lite-preview", "thinking_level": "low"}
 NPC_PROFILE_T107_LEGACY = {"model": "gpt-4.1-mini-2025-04-14"}
 NPC_PROFILE_T107_LMSTUDIO = {"model": "local-model", "reasoning_effort": "none"}
-NPC_PROFILE_T107_OPENCODEGO = {"model": "deepseek-v4.1-flash", "reasoning_effort": "low"}
 
 # T108: companion EPISODE extraction (attributed salient facts from full-fidelity
 # encounter text -> canonical episode ledger). Runs at per-location close and at
@@ -1016,10 +997,7 @@ PROVIDER_MODELS = {
         "full": "local-model",
         "mini": "local-model",
     },
-    "opencodego": {
-        "full": "deepseek-v4.1-flash",
-        "mini": "deepseek-v4.1-flash",
-    },
+    # Local providers (fork_ext) add their entry at install time.
 }
 
 # Per-callsite model variable overrides by provider.
@@ -1346,133 +1324,7 @@ def persist_gemini_key(api_key):
         _forget_credential("gemini_api_key")
 
 
-# --- OpenCode Go (DeepSeek V4.1 Flash) key management ---
-# Mirrors the Gemini key helpers. Two key sources, in priority order:
-# 1. A key set in the web UI (stored via the OS credential store / JSON fallback)
-# 2. The opencode-go key the OpenCode CLI persists at
-#    %USERPROFILE%/.local/share/opencode/auth.json (POSIX: ~/.local/share/...)
-_OPENCODAGO_KEY_PLACEHOLDER = "your_opencodego_api_key_here"
-_OPENCODE_AUTH_FILE = os.path.join(
-    os.environ.get("USERPROFILE")
-    or os.environ.get("HOME")
-    or os.path.expanduser("~"),
-    ".local", "share", "opencode", "auth.json",
-)
-
-
-def _read_opencode_auth_key():
-    """Best-effort read of the opencode-go key from the OpenCode CLI auth file.
-
-    Returns "" when absent/unreadable -- never raises. The file is JSON whose
-    top-level keys are provider ids; the "opencode-go" entry carries {"key": ...}.
-    """
-    try:
-        with open(_OPENCODE_AUTH_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        entry = data.get("opencode-go") or {}
-        key = entry.get("key") if isinstance(entry, dict) else None
-        return key.strip() if isinstance(key, str) else ""
-    except Exception:
-        return ""
-
-
-def persist_opencodego_key(api_key):
-    """Store the OpenCode Go key durably: OS credential store when one exists."""
-    _migrate_plaintext_secrets(_load_user_settings())
-    if api_key:
-        _store_credential("opencodego_api_key", api_key)
-    else:
-        _forget_credential("opencodego_api_key")
-
-
-def has_opencodego_key():
-    """True if a real OpenCode Go key is available (UI-stored or CLI auth file)."""
-    if _read_credential("opencodego_api_key"):
-        return True
-    return bool(_read_opencode_auth_key())
-
-
-def get_opencodego_key():
-    """Return the OpenCode Go key to authenticate with, or "" when none.
-
-    Priority: OS-credential-store/UI key -> OpenCode CLI auth.json entry ->
-    a live config.OPENCODEGO_API_KEY override (skipping the placeholder).
-    """
-    key = _read_credential("opencodego_api_key")
-    if key:
-        return key
-    key = _read_opencode_auth_key()
-    if key:
-        return key
-    import sys
-    config_mod = sys.modules.get("config")
-    if config_mod is not None:
-        value = getattr(config_mod, "OPENCODEGO_API_KEY", "")
-        if isinstance(value, str) and value.strip() and \
-                value.strip() != _OPENCODAGO_KEY_PLACEHOLDER:
-            return value.strip()
-    return ""
-
-
-def apply_persisted_opencodego_key():
-    """Push a stored OpenCode Go key into the live config module so every
-    reader of config.OPENCODEGO_API_KEY uses it with ZERO reader edits.
-    No-op when no key is available (config.py value wins)."""
-    key = get_opencodego_key()
-    if not key:
-        return
-    import sys
-    if "config" in sys.modules:
-        setattr(sys.modules["config"], "OPENCODEGO_API_KEY", key)
-
-
-DEFAULT_OPENCODEGO_MODEL = "deepseek-v4.1-flash"
-
-
-def get_opencodego_model():
-    """The OpenCode Go model every call uses (player choice, else the default).
-
-    One model serves every callsite: the relay's plan is a subscription, so the
-    player picks the model once in Settings -> AI Provider instead of per task.
-    """
-    value = _load_user_settings().get("opencodego_model")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return DEFAULT_OPENCODEGO_MODEL
-
-
-def persist_opencodego_model(model_id):
-    """Save the OpenCode Go model choice; returns the value now in effect."""
-    value = model_id.strip() if isinstance(model_id, str) else ""
-    if not value:
-        raise ValueError("Choose an OpenCode Go model.")
-    if len(value) > 80 or not all(ch.isalnum() or ch in "._:-/" for ch in value):
-        raise ValueError("That is not a valid OpenCode Go model id.")
-    settings = _load_user_settings()
-    if value == DEFAULT_OPENCODEGO_MODEL:
-        settings.pop("opencodego_model", None)
-    else:
-        settings["opencodego_model"] = value
-    _save_user_settings(settings)
-    return value
-
-
-def get_opencodego_models_cache():
-    """The last catalogue fetched from the relay ({"models", "fetched_at"})."""
-    cache = _load_user_settings().get("opencodego_models_cache")
-    return cache if isinstance(cache, dict) else {}
-
-
-def persist_opencodego_models_cache(cache):
-    """Store the catalogue so the picker is filled before the first fetch."""
-    if not isinstance(cache, dict):
-        raise TypeError("OpenCode Go model cache must be a dict")
-    settings = _load_user_settings()
-    settings["opencodego_models_cache"] = {
-        "models": cache.get("models") if isinstance(cache.get("models"), list) else [],
-        "fetched_at": cache.get("fetched_at"),
-    }
-    _save_user_settings(settings)
+# OpenCode Go key/model/catalogue settings live in fork_ext/opencodego/settings.py.
 
 
 def has_gemini_key():
@@ -1497,6 +1349,16 @@ def apply_persisted_gemini_key():
         setattr(sys.modules["config"], "GEMINI_API_KEY", key)
 
 
+# FORK SEAM: local provider bridges (fork_ext) inject their profile dicts,
+# PROVIDER_MODELS entries and persisted credentials. An upstream-only checkout
+# has no fork_ext and this block is a no-op.
+try:  # pragma: no cover - exercised whenever fork_ext is installed
+    from fork_ext.registry import install_model_extensions as _fork_install_extensions
+
+    _fork_install_extensions(globals())
+except ImportError:
+    pass
+
 # Load persisted provider on import
 load_persisted_provider()
 # Best-effort: apply a stored OpenAI key if config is already loaded. The
@@ -1504,7 +1366,6 @@ load_persisted_provider()
 # config_template.py (after config.py defines its default). No-op otherwise.
 apply_persisted_openai_key()
 apply_persisted_gemini_key()
-apply_persisted_opencodego_key()
 
 
 # --- Canonical callsite resolver and capture compatibility view ---
@@ -1570,7 +1431,9 @@ def resolve_callsite_config(task_id, provider=None, attempt=0):
         raise ValueError("attempt must be a non-negative integer")
     profile_name = ladder[min(attempt_index, len(ladder) - 1)]
     selected = copy.deepcopy(globals()[profile_name])
-    if provider in ("opencodego", "openai", "codex") and task_id in _PLAIN_TEXT_TASKS:
+    if task_id in _PLAIN_TEXT_TASKS and provider not in (
+            "legacy", "gemini", "lmstudio"):
+        # OpenAI/Codex and every local provider bridge keep T046 plain text.
         selected["response_format"] = None
     return selected
 
@@ -1644,20 +1507,26 @@ def get_capture_variants_for_task(task_id):
             variant["response_format"] = gemini_cfg["response_format"]
         variants.append(variant)
 
-    # Get OpenCode Go variant (DeepSeek V4.1 Flash, Chat Completions transport).
-    opencodego_cfg = resolve_callsite_config(task_id, "opencodego")
-    if opencodego_cfg:
+    # Local provider bridges (fork_ext) add their capture variant.
+    try:
+        from fork_ext.registry import provider_names as _fork_provider_names
+    except ImportError:
+        _fork_provider_names = lambda: ()
+    for provider_name in _fork_provider_names():
+        cfg = resolve_callsite_config(task_id, provider_name)
+        if not cfg:
+            continue
         variant = {
-            "provider": "opencodego",
-            "model": opencodego_cfg.get("model"),
-            "label": f"{opencodego_cfg.get('model')}|effort={opencodego_cfg.get('reasoning_effort', 'low')}",
-            # DeepSeek V4.1 Flash accepts temperature at every effort level.
+            "provider": provider_name,
+            "model": cfg.get("model"),
+            "label": f"{cfg.get('model')}|effort={cfg.get('reasoning_effort', 'low')}",
+            # The compatible transports accept temperature at every effort.
             "use_caller_temp": True,
         }
-        if "reasoning_effort" in opencodego_cfg:
-            variant["reasoning_effort"] = opencodego_cfg["reasoning_effort"]
-        if "response_format" in opencodego_cfg:
-            variant["response_format"] = opencodego_cfg["response_format"]
+        if "reasoning_effort" in cfg:
+            variant["reasoning_effort"] = cfg["reasoning_effort"]
+        if "response_format" in cfg:
+            variant["response_format"] = cfg["response_format"]
         variants.append(variant)
 
     return variants if variants else None

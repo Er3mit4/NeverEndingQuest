@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Custom Fork: OpenCode Go provider isolated as a local bridge (2026-10-31)
+
+- Moved the whole OpenCode Go implementation out of upstream files and into
+  `fork_ext/`: provider declaration and callsite ladders, connection (endpoint,
+  key, session header, per-model wire, effort normalizer), plan catalogue,
+  settings persistence and the Settings Socket.IO events.
+- Added a small provider-bridge registry (`fork_ext/registry.py`) used through
+  five marked `# FORK SEAM` hooks (`model_registry`, `model_config`,
+  `utils/openai_client`, `core/ai/api_client`, `web/web_interface`). An
+  upstream checkout without `fork_ext` runs the built-in providers unchanged.
+- The model stays `deepseek-v4.1-flash` and the per-callsite effort ladder is
+  unchanged: low by default, high for T017 and the third T097 attempt, max for
+  T026.
+- Replaced the remaining provider-name branches in `main.py`, the NPC voice and
+  profile services, effects agent, location generator, story-first gateway,
+  name canonicalizer and usage tracker with a generic "resolve from the callsite
+  registry" fallback, so upstream merges stop colliding on fork provider names.
+
 ### Custom Fork: Brazilian Portuguese player UI (2026-10-25)
 
 - The React player (`/play/`) can now render its whole interface in Brazilian
